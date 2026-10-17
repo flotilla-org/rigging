@@ -1,0 +1,14 @@
+# The absolute_paths lint checks crate-relative paths only: external crates are
+# allowed, as in flotilla. self:: and super:: are not checked by Clippy.
+absolute-paths-max-segments = 3
+absolute-paths-allowed-crates = [
+    "alloc",
+    "cbor2",
+    "core",
+    "flotilla_cbor",
+    "serde",
+    "serde_core",
+    "serde_json",
+    "std",
+    "thiserror",
+]
