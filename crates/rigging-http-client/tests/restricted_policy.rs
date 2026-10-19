@@ -1,8 +1,8 @@
 use rigging_http_client::{HttpClient, ReqwestHttpClient, http_channel_label};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-// Real HTTP proxy stand-in: provider requests use the supervisor transport and
-// a redirect remains a response, rather than silently making another vendor call.
+// Real HTTP proxy stand-in: client requests use the supervisor transport and
+// a redirect remains a response, rather than silently making another upstream call.
 #[tokio::test]
 async fn supervisor_proxy_and_no_redirects() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -19,16 +19,18 @@ async fn supervisor_proxy_and_no_redirects() {
             }
             head.push_str(&line);
         }
-        io.write_all(b"HTTP/1.1 302 Found\r\nLocation: http://vendor.invalid/elsewhere\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-            .await
-            .unwrap();
+        io.write_all(
+            b"HTTP/1.1 302 Found\r\nLocation: http://upstream.invalid/elsewhere\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )
+        .await
+        .unwrap();
         head
     });
     let client = ReqwestHttpClient::restricted(Some(&format!("http://{address}")), None).unwrap();
-    let request = reqwest::Request::new(reqwest::Method::GET, "http://vendor.invalid/resource".parse().unwrap());
-    let response = client.execute(request, &http_channel_label("GET", "http://vendor.invalid/resource")).await.unwrap();
+    let request = reqwest::Request::new(reqwest::Method::GET, "http://upstream.invalid/resource".parse().unwrap());
+    let response = client.execute(request, &http_channel_label("GET", "http://upstream.invalid/resource")).await.unwrap();
     assert_eq!(response.status(), 302);
-    assert!(server.await.unwrap().starts_with("GET http://vendor.invalid/resource HTTP/1.1\r\n"));
+    assert!(server.await.unwrap().starts_with("GET http://upstream.invalid/resource HTTP/1.1\r\n"));
 }
 
 // Invalid transport configuration is refused without including input contents.
@@ -51,9 +53,9 @@ fn valid_and_empty_ca_bundles() {
 }
 
 // A connection closed without a response produces one failure, with no second
-// connection. This stand-in is the failing upstream network seam.
+// connection within the 200ms observation window. This stand-in is the failing upstream network seam.
 #[tokio::test]
-async fn failed_upstream_is_not_retried() {
+async fn failed_upstream_has_no_immediate_retry() {
     use std::time::Duration;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
