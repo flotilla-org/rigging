@@ -23,3 +23,14 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Test
         run: cargo test --workspace --locked
+
+  # Compile gate for the non-Unix paths (sysinfo, Windows volume APIs, the
+  # child-kill branch); the process scenarios themselves run on Linux.
+  windows-check:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: Compile Windows implementations and tests
+        run: cargo check --workspace --all-targets --locked
