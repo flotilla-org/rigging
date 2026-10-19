@@ -15,6 +15,12 @@ jobs:
       - uses: actions/checkout@v4
       - name: No project dependencies
         run: python3 ci/no_project_deps.py
+      # rigging-ssh's contract tests start a disposable loopback sshd.
+      - name: Install SSH test prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openssh-client openssh-server
+          sudo mkdir -p /run/sshd
       - name: Install the pinned toolchain
         run: rustup show active-toolchain || rustup toolchain install
       - name: Format
