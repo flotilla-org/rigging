@@ -30,7 +30,13 @@ transports. The closure receives kernel UID, GID and optional PID. It must be
 cheap and synchronous. Applications enforce their own authorization using that
 identity; Unix peers are not filtered by UID beyond filesystem permissions.
 
+`TcpServer::serve` cannot infer the custom identity type from an untyped axum
+router. Use `tcp.serve::<(), _>(...)` with the default `Caller`, or specify the
+same custom type as the Unix router (`serve::<MyIdentity, _>`). TCP produces
+bearer/cookie variants of that type; custom variants are mapped on Unix.
+
 TCP accepts `Authorization: Bearer <token>` or `Cookie: rigging_token=<token>`.
+The bearer scheme is ASCII case-insensitive; the token remains case-sensitive.
 An Authorization header takes precedence: an invalid bearer cannot fall back to
 a cookie. Duplicate credentials are refused. The token is 64 lowercase hex
 characters with no newline, generated from 256 random bits. Its SHA-256 digest
@@ -38,7 +44,9 @@ is compared with `subtle` in constant time. Hashing time depends on submitted
 length, not secret contents. Every successful TCP bind atomically replaces the
 token file with a fresh 0600 file, including replacing a symlink rather than
 following it. Use a distinct token path per listener; rotating a shared path does
-not revoke an already running listener's in-memory token.
+not revoke an already running listener's in-memory token. If token replacement
+fails, bind returns an error and drops the new listener; the previous token file
+remains until a successful replacement.
 
 Host must exactly match the bound numeric IP and port, including brackets for
 IPv6. Origin may be absent; if present it must be exactly `http://<Host>`.
@@ -63,3 +71,9 @@ implementation; PID is optional and must never be assumed available. This crate
 currently exposes its serving interface on Unix only. Windows named pipes,
 blocking runtimes, HTTP clients, and project-specific authorization remain
 outside this crate.
+
+Connection timeouts and configurable HTTP header limits are not exposed by this
+crate; it uses axum/hyper defaults. Consumers can add request/body limits in router
+middleware. Router middleware cannot limit idle connections or header reads;
+consumers needing transport-specific limits must currently supply their own
+serving adapter. No connection deadline or admission limit is promised here.

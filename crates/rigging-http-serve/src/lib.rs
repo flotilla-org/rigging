@@ -85,7 +85,8 @@ pub struct UnixServer {
 impl UnixServer {
     /// Refuses live sockets, symlinks and non-sockets. Only a connection-refused
     /// socket in a private parent is considered stale. Mode is set before serving;
-    /// the private parent prevents access during bind/chmod.
+    /// the private parent prevents access during bind/chmod. The stale-check/unlink
+    /// sequence assumes the owning user does not replace the path concurrently.
     pub async fn bind(path: impl AsRef<Path>, mode: u32) -> io::Result<Self> {
         let path = path.as_ref();
         private_parent(path)?;
@@ -155,10 +156,14 @@ impl Listener for PeerListener {
             {
                 return (stream, PeerCredentials { uid: cred.uid(), gid: cred.gid(), pid: cred.pid() });
             }
+            // Retry transient accept/credential failures, including EMFILE, with
+            // backoff rather than failing the server or admitting an unknown peer.
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
     fn local_addr(&self) -> io::Result<Self::Addr> {
+        // axum 0.8 serving does not require local_addr; Addr here describes peers,
+        // not the bound socket. Revisit this assumption when upgrading axum.
         Err(io::Error::new(io::ErrorKind::Unsupported, "listener has no peer credentials"))
     }
 }
@@ -177,6 +182,8 @@ pub struct TcpServer {
     authority: String,
 }
 impl TcpServer {
+    /// If token replacement fails, the listener is dropped and the previous
+    /// token file remains; it is replaced on the next successful bind.
     pub async fn bind(address: SocketAddr, token_path: impl AsRef<Path>) -> io::Result<Self> {
         if !address.ip().is_loopback() {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "TCP address must be loopback"));
@@ -224,7 +231,12 @@ impl TcpServer {
                 }
                 let valid = |token: &str| bool::from(token_hash.ct_eq(&Sha256::digest(token.as_bytes())));
                 let caller = if headers.contains_key(header::AUTHORIZATION) {
-                    single(header::AUTHORIZATION).and_then(|v| v.strip_prefix("Bearer ")).filter(|v| valid(v)).map(|_| Caller::<C>::Bearer)
+                    single(header::AUTHORIZATION)
+                        .and_then(|v| v.split_once(' '))
+                        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("Bearer"))
+                        .map(|(_, token)| token)
+                        .filter(|v| valid(v))
+                        .map(|_| Caller::<C>::Bearer)
                 } else {
                     let mut tokens = headers
                         .get_all(header::COOKIE)

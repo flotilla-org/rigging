@@ -59,6 +59,13 @@ async fn one_router_two_real_listeners() {
     assert!(response.contains(&format!("pid: Some({})", std::process::id())));
     let credentials = [
         (format!("Authorization: Bearer {token}\r\n"), 200, "Bearer"),
+        (format!("Authorization: bearer {token}\r\n"), 200, "Bearer"),
+        (format!("Authorization: bEaReR {token}\r\n"), 200, "Bearer"),
+        (format!("Authorization: Basic {token}\r\n"), 401, ""),
+        (format!("Authorization: Bearer  {token}\r\n"), 401, ""),
+        (format!("Authorization: Bearer {token}\r\nAuthorization: Bearer wrong\r\n"), 401, ""),
+        (format!("Cookie: rigging_token={token}\r\nCookie: rigging_token=wrong\r\n"), 401, ""),
+        (format!("Authorization: Bearer wrong\r\nCookie: rigging_token={token}\r\n"), 401, ""),
         (format!("Cookie: other=x; rigging_token={token}\r\n"), 200, "Cookie"),
         ("Authorization: Bearer wrong\r\n".into(), 401, ""),
         ("Cookie: rigging_token=wrong\r\n".into(), 401, ""),
@@ -76,6 +83,8 @@ async fn one_router_two_real_listeners() {
             ("evil.example".into(), String::new(), false),
             (address.to_string(), "Origin: https://evil.example\r\n".into(), false),
             (address.to_string(), "Origin: null\r\n".into(), false),
+            (format!("{address}\r\nHost: evil.example"), String::new(), false),
+            (address.to_string(), format!("Origin: http://{address}\r\nOrigin: http://evil.example\r\n"), false),
             (address.to_string(), format!("Origin: http://{address}\r\nOrigin: http://{address}\r\n"), false),
         ] {
             let response = exchange(TcpStream::connect(address).await.unwrap(), &format!("Host: {host}\r\n{origin}{auth}")).await;
@@ -103,6 +112,13 @@ async fn socket_hygiene_and_custom_identity() {
     let dir = tempfile::tempdir().unwrap();
     fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let path = dir.path().join("http.sock");
+    // Invalid modes must fail before creating or removing an endpoint.
+    for mode in [0o1000, 0o1777, u32::MAX] {
+        let error = UnixServer::bind(&path, mode).await.err().unwrap();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(!path.exists());
+    }
+    assert!(TcpServer::bind("0.0.0.0:0".parse().unwrap(), dir.path().join("token")).await.is_err());
     drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
     let server = UnixServer::bind(&path, 0o600).await.unwrap();
     assert!(UnixServer::bind(&path, 0o600).await.is_err());
