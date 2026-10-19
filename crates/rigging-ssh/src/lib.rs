@@ -37,7 +37,9 @@ pub trait SshListener: Send + Sync {
 #[async_trait]
 pub trait SshSession: Send + Sync {
     /// A remote shell command, with no PTY and closed stdin. Output is buffered;
-    /// callers bound execution with their own timeout/cancellation policy.
+    /// there is no implicit execution deadline. Callers can wrap this future in
+    /// `tokio::time::timeout`; cancellation kills the local exec client without
+    /// closing the session. Remote termination depends on SSH and the command.
     async fn exec(&self, command: &str) -> io::Result<Output>;
     async fn open_unix(&self, path: &Path) -> io::Result<ByteStream>;
     /// Returns only after the server acknowledges the remote forward.

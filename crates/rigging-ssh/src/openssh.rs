@@ -61,7 +61,9 @@ impl OpenSsh {
                 }
                 let host_key = validate_host_key(&host_key)?;
                 // OpenSSH ignores a nonexistent -i path and may try default
-                // identities instead. Fail here to preserve exact identity policy.
+                // identities instead. Fail fast here; this is not a TOCTOU
+                // guarantee, because ssh reopens the file. The caller must keep
+                // the configured identity path stable through authentication.
                 if !tokio::fs::metadata(&identity_file).await?.is_file() {
                     return Err(invalid("SSH identity must be a regular file"));
                 }

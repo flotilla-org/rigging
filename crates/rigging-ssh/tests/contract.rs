@@ -483,3 +483,35 @@ fn listener_drop_after_runtime_shutdown() {
         std::thread::sleep(Duration::from_millis(10));
     }
 }
+
+// Exec has no implicit deadline. A caller's timeout cancels its local client
+// while leaving the shared session available for independent commands.
+#[tokio::test]
+async fn hanging_exec_can_be_cancelled_without_closing_session() {
+    let f = Fixture::new().await;
+    let s = f.session().await;
+    assert!(tokio::time::timeout(Duration::from_millis(100), s.exec("sleep 2")).await.is_err());
+    let output = tokio::time::timeout(Duration::from_secs(1), s.exec("printf alive")).await.unwrap().unwrap();
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"alive");
+}
+
+// Cached local forwards redial the remote Unix path on every connection. A new
+// listener at the same remote path receives fresh streams without invalidation.
+#[tokio::test]
+async fn cached_forward_redials_replaced_remote_socket() {
+    tokio::time::timeout(BUDGET, async {
+        let f = Fixture::new().await;
+        let s = f.session().await;
+        let path = f.path("replaceable");
+        for payload in [b"original".as_slice(), b"replacement".as_slice()] {
+            let listener = UnixListener::bind(&path).unwrap();
+            let out = s.open_unix(&path).await.unwrap();
+            transfer(out, Box::new(listener.accept().await.unwrap().0), payload).await;
+            drop(listener);
+            tokio::fs::remove_file(&path).await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+}
