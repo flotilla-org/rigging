@@ -17,12 +17,25 @@ impl Drop for SetupGuard {
     fn drop(&mut self) {
         let stderr = self.stderr.take();
         if let (Some(mut child), Some(dir)) = (self.child.take(), self.dir.take()) {
-            tokio::spawn(async move {
-                let _ = child.kill().await;
-                let _ = child.wait().await;
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn(async move {
+                    let _ = child.kill().await;
+                    let _ = child.wait().await;
+                    drop(stderr);
+                    let _ = tokio::task::spawn_blocking(move || drop(dir)).await;
+                });
+            } else {
+                let _ = child.start_kill();
                 drop(stderr);
-                let _ = tokio::task::spawn_blocking(move || drop(dir)).await;
-            });
+                // try_wait uses the OS process handle, without needing a Tokio
+                // reactor. Retain the directory until the child has been reaped.
+                let _ = std::thread::Builder::new().name("ssh-setup-cleanup".into()).spawn(move || {
+                    while matches!(child.try_wait(), Ok(None)) {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    drop(dir);
+                });
+            }
         }
     }
 }
@@ -62,7 +75,7 @@ impl Drop for StderrTail {
     }
 }
 
-pub(crate) fn validate_host_key(key: &str) -> io::Result<()> {
+pub(crate) fn validate_host_key(key: &str) -> io::Result<String> {
     let mut fields = key.split_whitespace();
     let kind = fields.next().unwrap_or_default();
     let supported = matches!(kind, "ssh-ed25519" | "ssh-rsa" | "ecdsa-sha2-nistp256" | "ecdsa-sha2-nistp384" | "ecdsa-sha2-nistp521");
@@ -77,7 +90,7 @@ pub(crate) fn validate_host_key(key: &str) -> io::Result<()> {
             "SSH reach requires a raw OpenSSH host public key, not known-hosts options or markers",
         ));
     }
-    Ok(())
+    Ok(format!("{kind} {blob}"))
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -103,6 +116,34 @@ mod tests {
         .unwrap();
         assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists(), "child must be reaped before its directory disappears");
     }
+    // A setup guard can outlive the runtime during caller unwinding. It must
+    // still kill/reap its child before removing its directory, without panicking.
+    #[test]
+    fn setup_drop_after_runtime_shutdown() {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let (guard, path, pid) = runtime.block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().to_owned();
+            let child = Command::new("sleep").arg("60").kill_on_drop(true).spawn().unwrap();
+            let pid = child.id().unwrap();
+            (SetupGuard { child: Some(child), dir: Some(dir), stderr: None }, path, pid)
+        });
+        drop(runtime);
+        drop(guard);
+        let started = std::time::Instant::now();
+        while path.exists() {
+            assert!(started.elapsed() < Duration::from_secs(2), "setup cleanup must finish");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists(), "child must be reaped before directory removal");
+    }
+
+    // Host-key comments do not participate in pinning or the known-hosts record.
+    #[test]
+    fn host_key_comments_are_normalized() {
+        assert_eq!(validate_host_key("ssh-ed25519 AAAA operator comment").unwrap(), "ssh-ed25519 AAAA");
+    }
+
     // Long-lived SSH diagnostics must drain without pipe backpressure or disk
     // growth, retaining only the documented 8 KiB suffix for error reporting.
     #[tokio::test]

@@ -369,25 +369,30 @@ async fn ambient_operator_configuration() {
         assert_eq!(output.stdout, b"ambient");
         return;
     }
-    use std::os::unix::fs::PermissionsExt;
     let f = Fixture::new().await;
+    isolated_child(&f, "ambient_operator_configuration", "").await;
+}
+
+async fn isolated_child(f: &Fixture, test: &str, shim: &str) {
+    use std::os::unix::fs::PermissionsExt;
     let Target::Pinned { host, port, user, host_key, identity_file } = &f.target else { unreachable!() };
     let known_hosts = f.path("operator_known_hosts");
     std::fs::write(&known_hosts, format!("[{host}]:{port} {host_key}\n")).unwrap();
     let config = f.path("operator_config");
-    std::fs::write(&config, format!("Host rigging-contract-alias\n HostName {host}\n Port {port}\n User {user}\n IdentityFile {}\n IdentitiesOnly yes\n StrictHostKeyChecking yes\n UserKnownHostsFile {}\n", identity_file.display(), known_hosts.display())).unwrap();
+    std::fs::write(&config, format!("Host rigging-contract-alias\n HostName {host}\n Port {port}\n User {user}\n IdentityFile {}\n IdentitiesOnly yes\n StrictHostKeyChecking yes\n UserKnownHostsFile {}\n ForkAfterAuthentication yes\n", identity_file.display(), known_hosts.display())).unwrap();
     let bin = f.path("bin");
     std::fs::create_dir(&bin).unwrap();
     // Process boundary shim supplies an isolated operator config to the real
     // OpenSSH executable; all authentication, multiplexing and exec remain real.
     let ssh = bin.join("ssh");
-    std::fs::write(&ssh, "#!/bin/sh\nexec /usr/bin/ssh -F \"$RIGGING_TEST_OPERATOR_CONFIG\" \"$@\"\n").unwrap();
+    std::fs::write(&ssh, format!("#!/bin/sh\n{shim}\nexec /usr/bin/ssh -F \"$RIGGING_TEST_OPERATOR_CONFIG\" \"$@\"\n")).unwrap();
     std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o700)).unwrap();
     let mut paths = vec![bin];
     paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
     let output = tokio::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "ambient_operator_configuration", "--nocapture"])
+        .args(["--exact", test, "--nocapture"])
         .env("RIGGING_AMBIENT_CHILD", "1")
+        .env("RIGGING_TEST_FIXTURE", f.dir.path())
         .env("RIGGING_TEST_OPERATOR_CONFIG", &config)
         .env("PATH", std::env::join_paths(paths).unwrap())
         .kill_on_drop(true)
@@ -400,4 +405,81 @@ async fn ambient_operator_configuration() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+// A stalled setup for one path must not block the first open of another path.
+// The process boundary shim pauses only the slow forwarding request, while real
+// OpenSSH and sshd establish and transfer data through the independent fast one.
+#[tokio::test]
+async fn concurrent_first_opens_are_independent() {
+    if std::env::var_os("RIGGING_AMBIENT_CHILD").is_some() {
+        let dir = PathBuf::from(std::env::var_os("RIGGING_TEST_FIXTURE").unwrap());
+        let session: Arc<dyn SshSession> =
+            Arc::new(OpenSsh::connect(Target::Ambient { destination: "rigging-contract-alias".into() }, BUDGET).await.unwrap());
+        let slow_path = dir.join("slow-target");
+        let fast_path = dir.join("fast-target");
+        let slow_listener = UnixListener::bind(&slow_path).unwrap();
+        let fast_listener = UnixListener::bind(&fast_path).unwrap();
+        let slow_session = session.clone();
+        let slow = tokio::spawn(async move { slow_session.open_unix(&slow_path).await });
+        tokio::time::timeout(BUDGET, async {
+            while !tokio::fs::try_exists(dir.join("entered")).await.unwrap() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let fast = tokio::time::timeout(Duration::from_secs(1), session.open_unix(&fast_path)).await;
+        // Release the stalled process even if the assertion below fails.
+        tokio::fs::write(dir.join("release"), b"").await.unwrap();
+        transfer(
+            fast.expect("unrelated first-open must not wait for slow setup").unwrap(),
+            Box::new(fast_listener.accept().await.unwrap().0),
+            b"fast",
+        )
+        .await;
+        transfer(slow.await.unwrap().unwrap(), Box::new(slow_listener.accept().await.unwrap().0), b"slow").await;
+        return;
+    }
+    let f = Fixture::new().await;
+    isolated_child(
+        &f,
+        "concurrent_first_opens_are_independent",
+        r#"
+for argument do
+    case "$argument" in
+        *slow-target*)
+            touch "$RIGGING_TEST_FIXTURE/entered"
+            count=0
+            while [ ! -f "$RIGGING_TEST_FIXTURE/release" ] && [ "$count" -lt 100 ]; do
+                sleep 0.05
+                count=$((count + 1))
+            done
+            ;;
+    esac
+done
+"#,
+    )
+    .await;
+}
+
+// Public session/listener values may outlive the runtime. Dropping them then
+// must not panic; best-effort cleanup still closes the remote forwarding socket.
+#[test]
+fn listener_drop_after_runtime_shutdown() {
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let (fixture, session, listener) = runtime.block_on(async {
+        let f = Fixture::new().await;
+        let s = f.session().await;
+        let listener = s.listen_unix(&f.path("reverse")).await.unwrap();
+        (f, s, listener)
+    });
+    drop(runtime);
+    drop(listener);
+    drop(session);
+    let started = std::time::Instant::now();
+    while std::os::unix::net::UnixStream::connect(fixture.path("reverse")).is_ok() {
+        assert!(started.elapsed() < BUDGET, "remote listener must close after runtime shutdown");
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }

@@ -5,7 +5,12 @@ on a remote Unix listener, and session closure. `SshListener` is the accept port
 Both are object-safe async traits. `rigging-stream` owns the shared byte types.
 PTY attach remains native `ssh -tt` in the consumer.
 
-The Unix `OpenSsh` backend is seeded from drydock-transport at
+The Unix `OpenSsh` backend requires OpenSSH 8.7 or newer
+([release notes](https://www.openssh.org/txt/release-8.7)). It explicitly sets
+`ForkAfterAuthentication=no` so ambient configuration cannot daemonize the owned
+master, and `ControlPersist=no` so it cannot survive session ownership.
+
+The backend is seeded from drydock-transport at
 `b076dbea24883af99356410c14cff40f44b9fd8a` (drydock#12). It retains its private
 socket directory, bounded 8 KiB diagnostic tail, authenticated forward
 acknowledgement, and kill/reap-before-directory-removal lifecycle. Routing,
@@ -48,7 +53,9 @@ remote target is observed as stream EOF/reset. Socket paths must be absolute and
 contain no colon, whitespace, or NUL. Remote listener paths must be unique to the
 caller; replacing stale sockets is the server/operator's `StreamLocalBindUnlink`
 policy. Listener creation waits for remote acknowledgement. Listener drop cancels
-the forward asynchronously, preserving accepted streams. Session drop closes all
+the forward asynchronously, preserving accepted streams. Outside a Tokio runtime,
+destructors use a best-effort background thread to kill/reap a setup process or
+cancel a forward; dropping values after runtime shutdown does not panic. Session drop closes all
 channels and reaps the master asynchronously; keep Tokio running for teardown.
 There is no automatic reconnect. `closed()` completes for all observers when the
 master exits. The port compiles on other platforms, but this backend needs Unix
@@ -58,7 +65,8 @@ sockets and OpenSSH on PATH.
 
 `tests/contract.rs` lifts drydock#12's routing, conservation, half-close,
 concurrency, stall isolation, key refusal, forward refusal and drop scenarios,
-then adds exec status/stderr, listener lifetime and closing notification. Routing
+then adds exec status/stderr, listener lifetime and closing notification. Additional regressions delay one first-open while another completes, and drop
+setup/listener values after their runtime shuts down. Routing
 uses two socket destinations in place of drydock's project-specific purposes.
 The generated scenario draws direction, destination, binary payload and length
 for every operation and checks the invariant after each step. Assertions exercise
