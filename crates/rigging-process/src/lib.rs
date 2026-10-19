@@ -1,7 +1,7 @@
-//! Provider invocation infrastructure shared by adapters and their test doubles.
-//! This crate owns command/HTTP execution, channel labels and host probes,
-//! including injected free-space measurement;
-//! provider traits, discovery assembly and resource stores live elsewhere.
+//! Generic command execution and host probes shared by programs and test doubles.
+//! This crate owns process supervision, channel labels, environment variables,
+//! bounded filesystem probes, scan caching and free-space measurement. Consumer
+//! policy is injected through `CommandGuard`; no project-specific scripts run here.
 
 pub mod available_space;
 pub mod probe;
@@ -1178,3 +1178,53 @@ impl EnvVars for ProcessEnvVars {
 }
 
 pub mod discovery;
+
+#[cfg(test)]
+mod guard_tests {
+    use super::*;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    // The guard is a fake at the subprocess boundary. A rejected command must
+    // never spawn, regardless of which execution entry point the caller uses.
+    struct Reject(Arc<AtomicUsize>);
+    #[async_trait]
+    impl CommandGuard for Reject {
+        fn scratch_namespace(&self) -> &str {
+            "consumer"
+        }
+        async fn check(&self, _: &str, _: &[&str], _: &Path) -> Result<(), String> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Err("policy refusal".into())
+        }
+    }
+
+    // Every spawn seam consults the same consumer policy, including deadlines,
+    // streaming input/output, long-lived processes and existence probes.
+    #[tokio::test]
+    async fn every_process_spawn_obeys_the_guard() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let runner = ProcessRunner::new(Reject(calls.clone()));
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path();
+        let label = ChannelLabel::Default;
+        let cmd = "a-command-that-must-never-be-spawned";
+        let timeout = Duration::from_secs(1);
+        assert_eq!(runner.run(cmd, &[], cwd, &label).await.unwrap_err(), "policy refusal");
+        assert_eq!(runner.run_with_timeout(cmd, &[], cwd, &label, timeout).await.unwrap_err(), "policy refusal");
+        assert_eq!(runner.run_output(cmd, &[], cwd, &label).await.err().unwrap(), "policy refusal");
+        assert_eq!(runner.run_output_with_grace(cmd, &[], cwd, &label, timeout).await.err().unwrap(), "policy refusal");
+        assert_eq!(runner.spawn_long_lived(cmd, &[], cwd, &label).await.err().unwrap(), "policy refusal");
+        assert_eq!(runner.run_with_input(cmd, &[], cwd, &label, b"secret").await.unwrap_err(), "policy refusal");
+        let path = cwd.join("file");
+        assert_eq!(runner.run_to_file(cmd, &[], cwd, &path).await.unwrap_err(), "policy refusal");
+        assert_eq!(runner.run_from_file(cmd, &[], cwd, &path).await.unwrap_err(), "policy refusal");
+        assert!(!runner.exists(cmd, &[]).await);
+        assert_eq!(calls.load(Ordering::SeqCst), 9);
+        assert!(!path.exists());
+        assert_eq!(runner.writable_scratch_base(Some(cwd), &path).await.unwrap(), path);
+        assert_eq!(runner.scratch_namespace(), "consumer");
+    }
+}

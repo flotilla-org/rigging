@@ -25,6 +25,7 @@ pub async fn command_version(
 pub async fn resolve_binary_path(runner: &dyn CommandRunner, command: &str) -> Option<PathBuf> {
     // Resolve inside the runner's environment: provisioned and remote runners
     // intentionally do not share the daemon process's PATH.
+    // Keep the historical shell $0 marker so existing command fixtures replay unchanged.
     let output = match runner
         .run("sh", &["-c", "command -v \"$1\"", "flotilla-binary-discovery", command], Path::new("/"), &crate::ChannelLabel::Default)
         .await

@@ -1,3 +1,5 @@
+//! Injectable HTTP execution over reqwest requests and standard HTTP responses.
+
 use async_trait::async_trait;
 pub use rigging_process::{
     http_channel_label, http_channel_label_with, ChannelLabel, ChannelLabeler, ChannelRequest, DefaultLabeler, TaskId,

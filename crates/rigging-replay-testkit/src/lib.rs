@@ -1,3 +1,7 @@
+//! Dev-only record/replay sessions with per-channel FIFO queues, round barriers,
+//! payload masking and consumer-owned extension channels. Existing command/HTTP
+//! YAML layouts remain readable; extensions supply their own serde wire shape.
+
 pub mod http_contract;
 pub mod testing;
 use std::{
@@ -886,3 +890,6 @@ impl ExtraChannel for NoExtra {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod extension_tests;

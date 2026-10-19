@@ -25,6 +25,46 @@ jackstay, wheelhouse, binnacle and the rest. The rules and their reasons are in
 | Crate | What it is |
 |---|---|
 | `flotilla-cbor` | The stack's CBOR profile: deterministic writers, safe readers, limits and framing |
+| `rigging-tls` | Rustls provider selection and reqwest builders with a default User-Agent |
+| `rigging-process` | Command execution, environment variables, bounded filesystem probes, scan cache and binary/version probes |
+| `rigging-http-client` | Injectable HTTP execution with a streaming reqwest implementation |
+| `rigging-replay-testkit` | Dev-only record/replay sessions, masks, YAML fixtures, mock runners and axum HTTP stand-ins |
+
+## Runtime and replay seams
+
+`ProcessCommandRunner` executes local processes without project policy. A consumer
+that needs a pre-spawn check constructs `ProcessRunner::new(guard)` with a
+`CommandGuard`. The guard runs before every subprocess spawn, including streams,
+existence probes, deadlines and long-lived commands. Flotilla keeps its Git
+configuration guard and helper/atomic-write shell scripts in its own runtime
+crate. The guard can supply the consumer's runtime-directory namespace; the
+unconfigured runner uses `rigging`.
+
+Command and HTTP replay use the same `ChannelLabel` types (reexported by the HTTP
+crate). `ChannelRequest::Extra { namespace, key }` and
+`ChannelLabel::Extra(namespace, label)` reserve independent FIFO queues for
+consumer-defined channels. HTTP clients use reqwest requests and return standard
+`http::Response<bytes::Bytes>` values.
+
+Use `rigging-replay-testkit` only in `[dev-dependencies]`; its HTTP stand-in starts
+a loopback listener and is test infrastructure. `Session` defaults to command and
+HTTP channels. A consumer can use `Session<MyChannel>` by implementing
+`ExtraChannel`: serde owns the channel's existing YAML fields, `channel_label`
+defines its queue, and `transform` masks/unmasks payload values. Implement the
+extension as a serde internally tagged enum with a `channel` discriminator;
+`Interaction::Extra(value)` is untagged so it adds no YAML wrapper. Labels stay
+stable during masking. This lets Flotilla keep its `gh_api` schema and adapters
+outside rigging while replaying the existing fixtures unchanged.
+
+Sessions preserve flat and multi-round fixture formats, default command exit
+status, per-channel FIFO order, barriers and completion checks. Extra-channel
+adapters use the public `Session::next` and `Session::record` operations; command
+and HTTP wrappers accept the same extended session. Call `finish()` to save a
+recording or reject unconsumed replay interactions. `MockRunner` and
+`http_contract::StandIn` are reusable process/network boundary collaborators.
+
+The Flotilla migration and boundary/build-graph reanchoring are tracked in
+[flotilla#3518](https://github.com/flotilla-org/flotilla/issues/3518).
 
 ## Gates
 

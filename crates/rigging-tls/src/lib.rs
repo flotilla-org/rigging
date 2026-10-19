@@ -1,3 +1,5 @@
+//! Shared Rustls provider selection and reqwest client builders.
+
 use std::sync::OnceLock;
 
 use rustls::crypto::{CryptoProvider, WebPkiSupportedAlgorithms};
@@ -57,11 +59,13 @@ pub fn client() -> reqwest::Client {
 fn crypto_provider() -> CryptoProvider {
     #[cfg(feature = "aws-lc-provider")]
     {
-        rustls::crypto::aws_lc_rs::default_provider()
+        use rustls::crypto::aws_lc_rs;
+        aws_lc_rs::default_provider()
     }
     #[cfg(not(feature = "aws-lc-provider"))]
     {
-        rustls::crypto::ring::default_provider()
+        use rustls::crypto::ring;
+        ring::default_provider()
     }
 }
 
