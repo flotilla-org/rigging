@@ -248,6 +248,8 @@ type Authenticate<C> = dyn Fn(&Request) -> Option<Authentication<C>> + Send + Sy
 
 /// Reusable TCP request policy, independent of listener ownership.
 /// Authorities are exact Host values, including ports and IPv6 brackets.
+/// Origin is intentionally limited to `http://{Host}` for direct loopback HTTP;
+/// TLS termination and HTTPS origins are not supported.
 #[derive(Clone)]
 pub struct TcpPolicy<C = ()> {
     authorities: Vec<String>,
@@ -256,8 +258,14 @@ pub struct TcpPolicy<C = ()> {
 
 impl<C: Clone + Send + Sync + 'static> TcpPolicy<C> {
     /// Supply consumer authentication, returning None to refuse with 401.
-    /// The callback receives the URI and headers, so it can implement a login
-    /// exchange as well as session authentication. It must be cheap and synchronous.
+    /// The callback borrows the full request immutably, including method, URI,
+    /// headers and extensions, so it can implement login exchanges and session
+    /// authentication without splitting and rebuilding the request. It cannot
+    /// consume the body. It must be cheap and synchronous.
+    ///
+    /// Security-critical: return `uses_cookie: true` whenever admission depends
+    /// on a cookie, including with `Caller::Custom`. Incorrectly reporting false
+    /// bypasses the cookie-dependent Origin requirement.
     pub fn new(
         authorities: impl IntoIterator<Item = String>,
         authenticate: impl Fn(&Request) -> Option<Authentication<C>> + Send + Sync + 'static,
@@ -323,6 +331,7 @@ impl<C: Clone + Send + Sync + 'static> TcpPolicy<C> {
                 let Some(authentication) = (policy.authenticate)(&request) else {
                     return refusal(StatusCode::UNAUTHORIZED);
                 };
+                // Only known safe methods are exempt; unknown methods fail closed.
                 let unsafe_method = !matches!(
                     *request.method(),
                     axum::http::Method::GET | axum::http::Method::HEAD | axum::http::Method::OPTIONS | axum::http::Method::TRACE
@@ -338,6 +347,8 @@ impl<C: Clone + Send + Sync + 'static> TcpPolicy<C> {
 
     /// Serve one accepted connection, including WebSocket upgrades. The stream
     /// may wrap a socket to replay bytes consumed by a protocol multiplexer.
+    /// Accept only from a loopback listener: this entry point cannot inspect
+    /// the underlying socket address and does not enforce loopback binding.
     pub async fn serve_connection<I, F>(self, stream: I, router: Router, shutdown: F) -> io::Result<()>
     where
         I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,

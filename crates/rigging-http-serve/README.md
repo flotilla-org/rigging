@@ -105,15 +105,19 @@ tcp.serve_with_policy(app, policy, std::future::pending()).await
 
 `tcp.policy::<C>()` instead keeps default token-or-cookie authentication.
 Clone either policy to call `policy.serve_connection(stream, router, shutdown)`
-for accepted TCP streams or buffered wrappers. Both entry points enforce the
+for accepted TCP streams or buffered wrappers. Only supply connections accepted
+from a loopback listener: this entry point does not enforce the socket's bind
+address. Origin validation intentionally supports direct HTTP loopback serving
+only; TLS termination and HTTPS origins are not supported. Both entry points enforce the
 same checks on routes and fallbacks, preserve upgrades, and drain HTTP requests
 on shutdown. Applications own upgraded sessions and shutdown deadlines.
 
 For consumer-owned authentication, construct `TcpPolicy::new(authorities,
-callback)`. The synchronous callback receives `&axum::extract::Request` and
+callback)`. The synchronous callback borrows the full `&axum::extract::Request` immutably
+(method, URI, headers and extensions; it cannot consume the body) and
 returns `Option<Authentication<C>>`: None yields 401; Some installs its `caller`.
-Set `uses_cookie: true` whenever admission depends on a browser cookie, even
-when returning `Caller::Custom`. This flag enforces the Origin requirement.
+Security-critical: set `uses_cookie: true` whenever admission depends on a browser cookie, even
+when returning `Caller::Custom`. This flag enforces the Origin requirement; falsely reporting it bypasses that protection.
 Host and any supplied Origin are checked before the callback runs. A login
 exchange may explicitly admit its login URI and let the route validate the
 one-time code and issue a session. The consumer owns session validation, expiry,
