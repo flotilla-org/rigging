@@ -13,3 +13,8 @@
 repo = "flotilla-org/drydock"
 rev = "9379d92f722dc121d32eac9abd284ce57b1bff47"
 crates = ["rigging-http-serve", "rigging-tls"]
+
+[[consumer]]
+repo = "flotilla-org/flotilla"
+rev = "bf71f7d840b14e50dd12e7bfc58e2654f51692c2"
+crates = ["rigging-tls", "rigging-process", "rigging-http-client", "rigging-replay-testkit"]
