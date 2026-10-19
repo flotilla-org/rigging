@@ -48,10 +48,13 @@ not revoke an already running listener's in-memory token. If token replacement
 fails, bind returns an error and drops the new listener; the previous token file
 remains until a successful replacement.
 
-Host must exactly match the bound numeric IP and port, including brackets for
-IPv6. Origin may be absent; if present it must be exactly `http://<Host>`.
-`localhost`, alternate ports, HTTPS origins, `null`, and duplicate Host/Origin
-headers are refused. The crate does not issue cookies, enable CORS, or provide
+By default Host must exactly match the bound numeric IP and port, including
+brackets for IPv6. Missing, duplicate or unlisted Host values receive 421.
+Origin, if present, must be exactly `http://<Host>`; mismatches and duplicate
+Origins receive 403. Cookie-authenticated unsafe methods (anything other than
+GET, HEAD, OPTIONS or TRACE) and upgrades require Origin, also returning 403
+when absent. Ordinary cookie GET requests and bearer requests may omit Origin.
+HTTPS origins and `null` are refused. The crate does not issue cookies, enable CORS, or provide
 a login endpoint. A browser-facing consumer must deliver its cookie through a
 trusted mechanism and should set HttpOnly, SameSite=Strict and Path=/.
 
@@ -77,3 +80,50 @@ crate; it uses axum/hyper defaults. Consumers can add request/body limits in rou
 middleware. Router middleware cannot limit idle connections or header reads;
 consumers needing transport-specific limits must currently supply their own
 serving adapter. No connection deadline or admission limit is promised here.
+
+## Accepted connections and policies
+
+`serve_unix_connection(stream, router, identity, shutdown)` serves one accepted
+Unix stream using the same kernel credential mapping as `UnixServer::serve`.
+For protocol sniffing, capture `UnixConnectionPolicy::new(&stream, identity)`
+first, then call its `serve_connection` with a buffered wrapper for that same
+stream. For example, `tokio::io::BufStream` retains inspected bytes when using
+`AsyncBufReadExt::fill_buf` without consuming them. Never discard sniffed bytes.
+
+TCP policies are independent of listener ownership:
+
+```rust,no_run
+# use rigging_http_serve::TcpServer;
+# async fn example(tcp: TcpServer, app: axum::Router) -> std::io::Result<()> {
+let policy = tcp.bearer_only_policy::<()>().with_authorities([
+    tcp.local_addr()?.to_string(),
+    format!("localhost:{}", tcp.local_addr()?.port()),
+]);
+tcp.serve_with_policy(app, policy, std::future::pending()).await
+# }
+```
+
+`tcp.policy::<C>()` instead keeps default token-or-cookie authentication.
+Clone either policy to call `policy.serve_connection(stream, router, shutdown)`
+for accepted TCP streams or buffered wrappers. Only supply connections accepted
+from a loopback listener: this entry point does not enforce the socket's bind
+address. Origin validation intentionally supports direct HTTP loopback serving
+only; TLS termination and HTTPS origins are not supported. Both entry points enforce the
+same checks on routes and fallbacks, preserve upgrades, and drain HTTP requests
+on shutdown. Applications own upgraded sessions and shutdown deadlines.
+
+For consumer-owned authentication, construct `TcpPolicy::new(authorities,
+callback)`. The synchronous callback borrows the full `&axum::extract::Request` immutably
+(method, URI, headers and extensions; it cannot consume the body) and
+returns `Option<Authentication<C>>`: None yields 401; Some installs its `caller`.
+Security-critical: set `uses_cookie: true` whenever admission depends on a browser cookie, even
+when returning `Caller::Custom`. This flag enforces the Origin requirement; falsely reporting it bypasses that protection.
+Host and any supplied Origin are checked before the callback runs. A login
+exchange may explicitly admit its login URI and let the route validate the
+one-time code and issue a session. The consumer owns session validation, expiry,
+and cookie attributes. An empty authority list denies all requests.
+
+Standalone policies can also use `TcpPolicy::token_or_cookie` or `bearer_only`
+with the SHA-256 digest of a consumer-managed token; no token file or listener
+binding is required. Authority comparison is exact and case-sensitive, with no
+normalization or wildcard support.

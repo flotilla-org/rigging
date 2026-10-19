@@ -17,6 +17,7 @@ use axum::{
     response::Response,
     serve::{IncomingStream, Listener},
 };
+use hyper::server::conn::http1;
 use sha2::{Digest, Sha256};
 use std::{
     fs,
@@ -206,56 +207,218 @@ impl TcpServer {
         self.listener.local_addr()
     }
 
-    /// Accept a bearer token or `rigging_token` cookie. Host must equal the bound
-    /// numeric authority (including port); Origin may be absent, otherwise it
-    /// must equal `http://{authority}`. No CORS or cookie issuance is provided.
+    /// Construct the default token-or-cookie policy for this listener.
+    pub fn policy<C: Clone + Send + Sync + 'static>(&self) -> TcpPolicy<C> {
+        TcpPolicy::token_or_cookie([self.authority.clone()], self.token_hash)
+    }
+
+    /// Construct a bearer-only policy using this listener's generated token.
+    pub fn bearer_only_policy<C: Clone + Send + Sync + 'static>(&self) -> TcpPolicy<C> {
+        TcpPolicy::bearer_only([self.authority.clone()], self.token_hash)
+    }
+
+    /// Serve with the default token-or-cookie policy.
     pub async fn serve<C, F>(self, router: Router, shutdown: F) -> io::Result<()>
     where
         C: Clone + Send + Sync + 'static,
         F: Future<Output = ()> + Send + 'static,
     {
-        let Self { listener, token_hash, authority } = self;
-        let router = router.layer(middleware::from_fn(move |mut request: Request, next: Next| {
-            let authority = authority.clone();
+        let policy = self.policy::<C>();
+        self.serve_with_policy(router, policy, shutdown).await
+    }
+
+    /// Serve using an explicitly configured Host and authentication policy.
+    pub async fn serve_with_policy<C, F>(self, router: Router, policy: TcpPolicy<C>, shutdown: F) -> io::Result<()>
+    where
+        C: Clone + Send + Sync + 'static,
+        F: Future<Output = ()> + Send + 'static,
+    {
+        axum::serve(self.listener, policy.protect(router)).with_graceful_shutdown(shutdown).await
+    }
+}
+
+/// Authentication result. Set `uses_cookie` whenever admission relies on a
+/// browser cookie, including consumer-owned session cookies.
+pub struct Authentication<C = ()> {
+    pub caller: Caller<C>,
+    pub uses_cookie: bool,
+}
+
+type Authenticate<C> = dyn Fn(&Request) -> Option<Authentication<C>> + Send + Sync;
+
+/// Reusable TCP request policy, independent of listener ownership.
+/// Authorities are exact Host values, including ports and IPv6 brackets.
+/// Origin is intentionally limited to `http://{Host}` for direct loopback HTTP;
+/// TLS termination and HTTPS origins are not supported.
+#[derive(Clone)]
+pub struct TcpPolicy<C = ()> {
+    authorities: Vec<String>,
+    authenticate: std::sync::Arc<Authenticate<C>>,
+}
+
+impl<C: Clone + Send + Sync + 'static> TcpPolicy<C> {
+    /// Supply consumer authentication, returning None to refuse with 401.
+    /// The callback borrows the full request immutably, including method, URI,
+    /// headers and extensions, so it can implement login exchanges and session
+    /// authentication without splitting and rebuilding the request. It cannot
+    /// consume the body. It must be cheap and synchronous.
+    ///
+    /// Security-critical: return `uses_cookie: true` whenever admission depends
+    /// on a cookie, including with `Caller::Custom`. Incorrectly reporting false
+    /// bypasses the cookie-dependent Origin requirement.
+    pub fn new(
+        authorities: impl IntoIterator<Item = String>,
+        authenticate: impl Fn(&Request) -> Option<Authentication<C>> + Send + Sync + 'static,
+    ) -> Self {
+        Self { authorities: authorities.into_iter().collect(), authenticate: std::sync::Arc::new(authenticate) }
+    }
+
+    /// Replace the exact accepted Host authorities. An empty list refuses all requests.
+    pub fn with_authorities(mut self, authorities: impl IntoIterator<Item = String>) -> Self {
+        self.authorities = authorities.into_iter().collect();
+        self
+    }
+
+    /// Default token-or-cookie authentication using a SHA-256 token digest.
+    pub fn token_or_cookie(authorities: impl IntoIterator<Item = String>, token_hash: [u8; 32]) -> Self {
+        Self::tokens(authorities, token_hash, true)
+    }
+
+    /// Only Authorization: Bearer is accepted; cookies never grant admission.
+    pub fn bearer_only(authorities: impl IntoIterator<Item = String>, token_hash: [u8; 32]) -> Self {
+        Self::tokens(authorities, token_hash, false)
+    }
+
+    fn tokens(authorities: impl IntoIterator<Item = String>, token_hash: [u8; 32], cookies: bool) -> Self {
+        Self::new(authorities, move |request| {
+            let headers = request.headers();
+            let valid = |token: &str| bool::from(token_hash.ct_eq(&Sha256::digest(token.as_bytes())));
+            if headers.contains_key(header::AUTHORIZATION) {
+                single(headers, header::AUTHORIZATION)
+                    .and_then(|v| v.split_once(' '))
+                    .filter(|(scheme, token)| scheme.eq_ignore_ascii_case("Bearer") && valid(token))
+                    .map(|_| Authentication { caller: Caller::Bearer, uses_cookie: false })
+            } else if cookies {
+                let mut tokens = headers
+                    .get_all(header::COOKIE)
+                    .iter()
+                    .filter_map(|v| v.to_str().ok())
+                    .flat_map(|v| v.split(';'))
+                    .filter_map(|v| v.trim().strip_prefix("rigging_token="));
+                let first = tokens.next();
+                if tokens.next().is_some() {
+                    return None;
+                }
+                first.filter(|v| valid(v)).map(|_| Authentication { caller: Caller::Cookie, uses_cookie: true })
+            } else {
+                None
+            }
+        })
+    }
+
+    fn protect(self, router: Router) -> Router {
+        router.layer(middleware::from_fn(move |mut request: Request, next: Next| {
+            let policy = self.clone();
             async move {
                 let headers = request.headers();
-                let single = |name| {
-                    let mut values = headers.get_all(name).iter();
-                    let value = values.next()?.to_str().ok()?;
-                    if values.next().is_some() { None } else { Some(value) }
+                let Some(host) = single(headers, header::HOST).filter(|h| policy.authorities.iter().any(|a| a == h)) else {
+                    return refusal(StatusCode::MISDIRECTED_REQUEST);
                 };
-                if single(header::HOST) != Some(authority.as_str())
-                    || (headers.contains_key(header::ORIGIN) && single(header::ORIGIN) != Some(format!("http://{authority}").as_str()))
-                {
-                    return Response::builder().status(StatusCode::FORBIDDEN).body(axum::body::Body::empty()).unwrap();
+                let origin_present = headers.contains_key(header::ORIGIN);
+                if origin_present && single(headers, header::ORIGIN) != Some(format!("http://{host}").as_str()) {
+                    return refusal(StatusCode::FORBIDDEN);
                 }
-                let valid = |token: &str| bool::from(token_hash.ct_eq(&Sha256::digest(token.as_bytes())));
-                let caller = if headers.contains_key(header::AUTHORIZATION) {
-                    single(header::AUTHORIZATION)
-                        .and_then(|v| v.split_once(' '))
-                        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("Bearer"))
-                        .map(|(_, token)| token)
-                        .filter(|v| valid(v))
-                        .map(|_| Caller::<C>::Bearer)
-                } else {
-                    let mut tokens = headers
-                        .get_all(header::COOKIE)
-                        .iter()
-                        .filter_map(|v| v.to_str().ok())
-                        .flat_map(|v| v.split(';'))
-                        .filter_map(|v| v.trim().strip_prefix("rigging_token="));
-                    let first = tokens.next();
-                    if tokens.next().is_none() { first.filter(|v| valid(v)).map(|_| Caller::<C>::Cookie) } else { None }
+                let Some(authentication) = (policy.authenticate)(&request) else {
+                    return refusal(StatusCode::UNAUTHORIZED);
                 };
-                match caller {
-                    Some(caller) => {
-                        request.extensions_mut().insert(caller);
-                        next.run(request).await
-                    }
-                    None => Response::builder().status(StatusCode::UNAUTHORIZED).body(axum::body::Body::empty()).unwrap(),
+                // Only known safe methods are exempt; unknown methods fail closed.
+                let unsafe_method = !matches!(
+                    *request.method(),
+                    axum::http::Method::GET | axum::http::Method::HEAD | axum::http::Method::OPTIONS | axum::http::Method::TRACE
+                );
+                if authentication.uses_cookie && !origin_present && (unsafe_method || headers.contains_key(header::UPGRADE)) {
+                    return refusal(StatusCode::FORBIDDEN);
                 }
+                request.extensions_mut().insert(authentication.caller);
+                next.run(request).await
             }
-        }));
-        axum::serve(listener, router).with_graceful_shutdown(shutdown).await
+        }))
+    }
+
+    /// Serve one accepted connection, including WebSocket upgrades. The stream
+    /// may wrap a socket to replay bytes consumed by a protocol multiplexer.
+    /// Accept only from a loopback listener: this entry point cannot inspect
+    /// the underlying socket address and does not enforce loopback binding.
+    pub async fn serve_connection<I, F>(self, stream: I, router: Router, shutdown: F) -> io::Result<()>
+    where
+        I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+        F: Future<Output = ()> + Send,
+    {
+        serve_connection(stream, self.protect(router), shutdown).await
+    }
+}
+
+fn single(headers: &axum::http::HeaderMap, name: header::HeaderName) -> Option<&str> {
+    let mut values = headers.get_all(name).iter();
+    let value = values.next()?.to_str().ok()?;
+    if values.next().is_some() { None } else { Some(value) }
+}
+
+fn refusal(status: StatusCode) -> Response {
+    Response::builder().status(status).body(axum::body::Body::empty()).unwrap()
+}
+
+/// Serve an accepted Unix stream with the listener API's kernel identity mapping.
+/// Obtain credentials before wrapping or consuming the stream for protocol sniffing.
+pub async fn serve_unix_connection<C, M, F>(stream: UnixStream, router: Router, identity: M, shutdown: F) -> io::Result<()>
+where
+    C: Clone + Send + Sync + 'static,
+    M: Fn(PeerCredentials) -> Caller<C> + Clone + Send + Sync + 'static,
+    F: Future<Output = ()> + Send,
+{
+    let policy = UnixConnectionPolicy::new(&stream, identity)?;
+    policy.serve_connection(stream, router, shutdown).await
+}
+
+/// Capture a Unix peer's kernel identity before wrapping its stream to replay
+/// bytes consumed by a protocol multiplexer. Use only with that same connection.
+pub struct UnixConnectionPolicy<C = ()> {
+    caller: Caller<C>,
+}
+
+impl<C: Clone + Send + Sync + 'static> UnixConnectionPolicy<C> {
+    pub fn new(stream: &UnixStream, identity: impl FnOnce(PeerCredentials) -> Caller<C>) -> io::Result<Self> {
+        let cred = stream.peer_cred()?;
+        Ok(Self { caller: identity(PeerCredentials { uid: cred.uid(), gid: cred.gid(), pid: cred.pid() }) })
+    }
+
+    /// Serve the connection whose credentials were captured by `new`, optionally
+    /// wrapped in an application-owned buffered stream. Shutdown drains requests;
+    /// the consumer owns upgraded sessions.
+    pub async fn serve_connection<I, F>(self, stream: I, router: Router, shutdown: F) -> io::Result<()>
+    where
+        I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+        F: Future<Output = ()> + Send,
+    {
+        serve_connection(stream, router.layer(axum::Extension(self.caller)), shutdown).await
+    }
+}
+
+async fn serve_connection<I, F>(stream: I, router: Router, shutdown: F) -> io::Result<()>
+where
+    I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    F: Future<Output = ()> + Send,
+{
+    let connection = http1::Builder::new()
+        .serve_connection(hyper_util::rt::TokioIo::new(stream), hyper_util::service::TowerToHyperService::new(router))
+        .with_upgrades();
+    tokio::pin!(connection);
+    tokio::pin!(shutdown);
+    tokio::select! {
+        result = &mut connection => result.map_err(io::Error::other),
+        () = &mut shutdown => {
+            connection.as_mut().graceful_shutdown();
+            connection.await.map_err(io::Error::other)
+        }
     }
 }

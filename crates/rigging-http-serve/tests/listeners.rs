@@ -88,7 +88,13 @@ async fn one_router_two_real_listeners() {
             (address.to_string(), format!("Origin: http://{address}\r\nOrigin: http://{address}\r\n"), false),
         ] {
             let response = exchange(TcpStream::connect(address).await.unwrap(), &format!("Host: {host}\r\n{origin}{auth}")).await;
-            let expected = if allowed { authenticated_status } else { 403 };
+            let expected = if host != address.to_string() {
+                421
+            } else if allowed {
+                authenticated_status
+            } else {
+                403
+            };
             assert!(response.starts_with(&format!("HTTP/1.1 {expected}")), "{response}");
             if expected == 200 {
                 assert!(response.ends_with(identity), "{response}");
@@ -211,9 +217,9 @@ async fn ipv6_and_token_symlink_replacement() {
     }));
     for (headers, expected) in [
         (format!("Host: {address}\r\nOrigin: http://{address}\r\n"), 200),
-        (format!("Host: {address}\r\nHost: {address}\r\n"), 403),
-        (String::new(), 403),
-        ("Host: localhost\r\n".into(), 403),
+        (format!("Host: {address}\r\nHost: {address}\r\n"), 421),
+        (String::new(), 421),
+        ("Host: localhost\r\n".into(), 421),
         (format!("Host: {address}\r\nOrigin: https://{address}\r\n"), 403),
     ] {
         let response = exchange(TcpStream::connect(address).await.unwrap(), &format!("{headers}Authorization: Bearer {token}\r\n")).await;
