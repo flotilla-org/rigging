@@ -66,6 +66,30 @@ pub struct ReqwestHttpClient {
 }
 
 impl ReqwestHttpClient {
+    /// Provider transport policy: no ambient proxies, redirects or retries, and a
+    /// 30-second request deadline. A supervisor may supply a proxy and PEM CA bundle.
+    /// Credential values and authorization headers stay with the caller.
+    pub fn for_provider(proxy_url: Option<&str>, ca_pem: Option<&[u8]>) -> Result<Self, String> {
+        let mut builder = rigging_tls::client_builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
+            .timeout(std::time::Duration::from_secs(30));
+        if let Some(proxy) = proxy_url {
+            builder = builder.proxy(reqwest::Proxy::all(proxy).map_err(|_| "invalid provider proxy URL")?);
+        }
+        if let Some(pem) = ca_pem {
+            let certificates = reqwest::Certificate::from_pem_bundle(pem).map_err(|_| "invalid provider CA")?;
+            if certificates.is_empty() {
+                return Err("provider CA contains no certificates".into());
+            }
+            for certificate in certificates {
+                builder = builder.add_root_certificate(certificate);
+            }
+        }
+        Ok(Self { client: builder.build().map_err(|_| "cannot construct provider HTTP client")? })
+    }
+
     /// Construct a client with the selected TLS provider and a 30-second timeout.
     ///
     /// # Panics

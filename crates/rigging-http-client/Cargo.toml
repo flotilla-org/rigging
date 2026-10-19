@@ -17,3 +17,6 @@ rigging-tls = { path = "../rigging-tls" }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "io-util"] }
