@@ -7,6 +7,8 @@ pub use rigging_process::{
 };
 use std::path::Path;
 
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Execute an HTTP request with an automatically derived channel label.
 #[macro_export]
 macro_rules! http_execute {
@@ -66,6 +68,32 @@ pub struct ReqwestHttpClient {
 }
 
 impl ReqwestHttpClient {
+    /// Explicit transport policy: no ambient proxies, redirects or retries, and a
+    /// 30-second request deadline. Accepts an explicit proxy and additional PEM CA
+    /// roots; built-in trust roots remain enabled. Authorization stays with callers.
+    /// Construction errors redact configuration values. Execution errors retain the
+    /// HttpClient String port and can contain request URLs; callers must sanitize them.
+    pub fn restricted(proxy_url: Option<&str>, ca_pem: Option<&[u8]>) -> Result<Self, String> {
+        let mut builder = rigging_tls::client_builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
+            .timeout(REQUEST_TIMEOUT);
+        if let Some(proxy) = proxy_url {
+            builder = builder.proxy(reqwest::Proxy::all(proxy).map_err(|_| "invalid proxy URL")?);
+        }
+        if let Some(pem) = ca_pem {
+            let certificates = reqwest::Certificate::from_pem_bundle(pem).map_err(|_| "invalid CA")?;
+            if certificates.is_empty() {
+                return Err("CA contains no certificates".into());
+            }
+            for certificate in certificates {
+                builder = builder.add_root_certificate(certificate);
+            }
+        }
+        Ok(Self { client: builder.build().map_err(|_| "cannot construct HTTP client")? })
+    }
+
     /// Construct a client with the selected TLS provider and a 30-second timeout.
     ///
     /// # Panics
@@ -73,7 +101,6 @@ impl ReqwestHttpClient {
     /// See [`rigging_tls::install_default_provider`] for the process-wide provider
     /// initialization requirements.
     pub fn new() -> Self {
-        const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
         let client = rigging_tls::client_builder().timeout(REQUEST_TIMEOUT).build().expect("build HTTP client");
         Self { client }
     }
