@@ -24,6 +24,7 @@ jackstay, wheelhouse, binnacle and the rest. The rules and their reasons are in
 
 | Crate | What it is |
 |---|---|
+| `rigging-http-serve` | Local axum serving on Unix sockets and loopback TCP with typed callers and authentication |
 | `flotilla-cbor` | The stack's CBOR profile: deterministic writers, safe readers, limits and framing |
 
 ## Gates

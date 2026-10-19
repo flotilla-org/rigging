@@ -1,0 +1,21 @@
+[package]
+name = "rigging-http-serve"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+axum = "0.8"
+tokio = { version = "1", features = ["net", "rt", "time"] }
+sha2 = "0.10"
+subtle = "2"
+getrandom = "0.3"
+tempfile = "3"
+libc = "0.2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-util", "sync"] }
+
+[lints]
+workspace = true
