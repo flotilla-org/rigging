@@ -13,9 +13,8 @@ jackstay, wheelhouse, binnacle and the rest. The rules and their reasons are in
   the project that owns it.
 - **Each consumer pins rigging once,** in its workspace `Cargo.toml`
   `[workspace.dependencies]`, with a single `rev`. Its crates use
-  `workspace = true`.
-- **`consumers.toml` lists every consumer and the revision it pins.** Update it
-  in the same change that bumps a consumer.
+  `workspace = true`. That pin is the only record of it: rigging keeps no list
+  of its consumers.
 - **HTTP serving uses axum** (hyper 1, tower 0.5) in every tokio project, and
   HTTP clients use reqwest.
 - Publishing to a Cargo registry with semver versions comes later.
