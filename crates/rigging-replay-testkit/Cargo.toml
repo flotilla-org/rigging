@@ -1,0 +1,33 @@
+[package]
+name = "rigging-replay-testkit"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+publish = false
+
+[dependencies]
+rigging-process = { path = "../rigging-process" }
+rigging-http-client = { path = "../rigging-http-client" }
+rigging-tls = { path = "../rigging-tls" }
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json"] }
+tokio = { workspace = true }
+serde = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+reqwest = { workspace = true, features = ["charset", "http2", "json", "system-proxy"] }
+http = { workspace = true }
+bytes = { workspace = true }
+serde_yml = "0.0.12"
+url = { workspace = true }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+hegeltest = "=0.48.1"
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
+
+[target.'cfg(unix)'.dev-dependencies]
+libc = { workspace = true }

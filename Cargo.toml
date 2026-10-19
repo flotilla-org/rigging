@@ -9,3 +9,18 @@ repository = "https://github.com/flotilla-org/rigging"
 
 [workspace.lints.clippy]
 absolute_paths = "warn"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+async-trait = "0.1"
+tracing = "0.1.44"
+sha2 = "0.10"
+reqwest = { version = "0.13.2", default-features = false, features = ["rustls-no-provider"] }
+http = "1"
+bytes = "1"
+uuid = "1"
+libc = "0.2"
+tempfile = "3"
+url = "2"
+rustls = { version = "0.23.37", default-features = false, features = ["ring"] }

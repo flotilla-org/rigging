@@ -1,0 +1,16 @@
+[package]
+name = "rigging-tls"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+[features]
+default = []
+aws-lc-provider = ["rustls/aws_lc_rs"]
+[dependencies]
+reqwest = { workspace = true }
+rustls = { workspace = true }
+[lints]
+workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
