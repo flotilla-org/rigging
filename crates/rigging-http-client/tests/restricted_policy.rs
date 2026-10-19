@@ -53,7 +53,8 @@ fn valid_and_empty_ca_bundles() {
 }
 
 // A connection closed without a response produces one failure, with no second
-// connection within the 200ms observation window. This stand-in is the failing upstream network seam.
+// connection within the 200ms observation window. This stand-in is the failing
+// upstream network seam.
 #[tokio::test]
 async fn failed_upstream_has_no_immediate_retry() {
     use std::time::Duration;

@@ -30,7 +30,7 @@ jackstay, wheelhouse, binnacle and the rest. The rules and their reasons are in
 | `flotilla-cbor` | The stack's CBOR profile: deterministic writers, safe readers, limits and framing |
 | `rigging-tls` | Rustls provider selection and reqwest builders with a default User-Agent |
 | `rigging-process` | Command execution, environment variables, bounded filesystem probes, scan cache and binary/version probes |
-| `rigging-http-client` | Injectable HTTP execution with a streaming reqwest implementation; `restricted` selects explicit proxy/CA, no redirects/retries or ambient proxy. |
+| `rigging-http-client` | Streaming HTTP execution; `restricted` for explicit proxy/CA without redirects, retries or ambient proxy |
 | `rigging-replay-testkit` | Dev-only record/replay sessions, masks, YAML fixtures, mock runners and axum HTTP stand-ins |
 
 ## Runtime and replay seams
