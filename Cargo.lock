@@ -1072,6 +1072,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "rigging-ssh"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "hegeltest",
+ "rigging-stream",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "rigging-stream"
+version = "0.1.0"
+dependencies = [
+ "tokio",
+]
+
+[[package]]
 name = "rigging-tls"
 version = "0.1.0"
 dependencies = [
