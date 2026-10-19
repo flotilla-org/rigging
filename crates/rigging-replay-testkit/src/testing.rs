@@ -136,11 +136,7 @@ impl MockRunner {
 impl CommandRunner for MockRunner {
     async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<String, String> {
         let output = self.run_output(cmd, args, cwd, label).await?;
-        if output.success() {
-            Ok(output.stdout)
-        } else {
-            Err(output.stderr)
-        }
+        if output.success() { Ok(output.stdout) } else { Err(output.stderr) }
     }
 
     async fn run_output(&self, cmd: &str, args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<CommandOutput, String> {

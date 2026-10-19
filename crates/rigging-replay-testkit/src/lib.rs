@@ -128,10 +128,11 @@ fn load_rounds_from_str<E: ExtraChannel>(yaml: &str) -> Vec<Round<E>> {
     // If present, parse as RoundLog<E> and propagate errors directly
     // (don't fall through to flat format, which gives misleading errors).
     if yaml.trim_start().starts_with("rounds:") {
-        let round_log: RoundLog<E> = serde_yml::from_str(yaml).unwrap_or_else(|e| panic!("Failed to parse multi-round fixture YAML: {e}"));
+        let round_log: RoundLog<E> =
+            serde_norway::from_str(yaml).unwrap_or_else(|e| panic!("Failed to parse multi-round fixture YAML: {e}"));
         return round_log.rounds.into_iter().map(|log| Round::from_interactions(log.interactions)).collect();
     }
-    let log: InteractionLog<E> = serde_yml::from_str(yaml).unwrap_or_else(|e| panic!("Failed to parse fixture YAML: {e}"));
+    let log: InteractionLog<E> = serde_norway::from_str(yaml).unwrap_or_else(|e| panic!("Failed to parse fixture YAML: {e}"));
     vec![Round::from_interactions(log.interactions)]
 }
 
@@ -295,7 +296,7 @@ impl<E: ExtraChannel> Recorder<E> {
         let round_log =
             RoundLog { rounds: inner.rounds.iter().map(|interactions| InteractionLog { interactions: interactions.clone() }).collect() };
 
-        let yaml = serde_yml::to_string(&round_log).expect("Failed to serialize recorded interactions");
+        let yaml = serde_norway::to_string(&round_log).expect("Failed to serialize recorded interactions");
         if let Some(parent) = inner.file_path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
@@ -481,11 +482,7 @@ impl<E: ExtraChannel> CommandRunner for ReplayRunner<E> {
         if let Some(error) = error {
             return Err(error);
         }
-        if exit_code == Some(0) {
-            Ok(stdout.unwrap_or_default())
-        } else {
-            Err(stderr.unwrap_or_default())
-        }
+        if exit_code == Some(0) { Ok(stdout.unwrap_or_default()) } else { Err(stderr.unwrap_or_default()) }
     }
 
     async fn run_with_timeout(

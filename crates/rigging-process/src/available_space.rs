@@ -118,20 +118,18 @@ mod tests {
             let mut touched = Vec::new();
             let result = target_available_space(&path, |candidate| {
                 touched.push(candidate.to_path_buf());
-                if candidate == Path::new("/workspace") {
-                    Ok(123)
-                } else {
-                    Err(std::io::Error::from(std::io::ErrorKind::NotFound))
-                }
+                if candidate == Path::new("/workspace") { Ok(123) } else { Err(std::io::Error::from(std::io::ErrorKind::NotFound)) }
             });
             assert_eq!(result.expect("existing ancestor"), 123);
             assert_eq!(touched, path.ancestors().take(depth + 1).map(Path::to_path_buf).collect::<Vec<_>>());
             let mut calls = 0;
-            assert!(target_available_space(&path, |_| {
-                calls += 1;
-                Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
-            })
-            .is_err());
+            assert!(
+                target_available_space(&path, |_| {
+                    calls += 1;
+                    Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+                })
+                .is_err()
+            );
             assert_eq!(calls, 1, "permission denial must not fall back to a different filesystem");
         }
     }

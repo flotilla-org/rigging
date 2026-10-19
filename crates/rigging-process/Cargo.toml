@@ -1,8 +1,10 @@
 [package]
 name = "rigging-process"
 version = "0.1.0"
-edition = "2021"
+edition.workspace = true
 license.workspace = true
+repository.workspace = true
+publish = false
 
 [dependencies]
 tokio = { workspace = true }
@@ -14,10 +16,10 @@ uuid = { workspace = true, features = ["v4"] }
 libc = { workspace = true }
 
 [target.'cfg(not(unix))'.dependencies]
-sysinfo = "0.38.4"
+sysinfo.workspace = true
 
 [dev-dependencies]
-hegeltest = "=0.48.1"
+hegeltest.workspace = true
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 

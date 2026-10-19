@@ -11,11 +11,7 @@ pub enum TlsProvider {
 }
 
 pub const fn selected_provider() -> TlsProvider {
-    if cfg!(feature = "aws-lc-provider") {
-        TlsProvider::AwsLc
-    } else {
-        TlsProvider::Ring
-    }
+    if cfg!(feature = "aws-lc-provider") { TlsProvider::AwsLc } else { TlsProvider::Ring }
 }
 
 /// Installs the workspace-selected Rustls provider as this process's default.
@@ -23,6 +19,13 @@ pub const fn selected_provider() -> TlsProvider {
 /// Ring is the normal provider so clean development and CI builds avoid
 /// aws-lc-sys. Production builds can opt back into AWS-LC with the
 /// `aws-lc-provider` Cargo feature.
+///
+/// # Panics
+/// Panics if a different provider is already installed, or another installer
+/// wins the process-wide initialization race. Provider identity is conservative:
+/// trait-object pointer comparisons include vtables, which may differ across
+/// codegen units even for equivalent implementations. Such a false mismatch also
+/// panics; install the provider once through this crate before constructing clients.
 pub fn install_default_provider() {
     static INSTALLED: OnceLock<()> = OnceLock::new();
 
@@ -43,15 +46,24 @@ pub fn install_default_provider() {
 
 /// Returns a Reqwest client builder after installing the selected provider.
 ///
-/// A User-Agent is always set: api.github.com rejects requests without one
-/// as 403 Forbidden, which presents as an opaque authorization failure at
-/// call sites like the GitHub App installation-token mint.
+/// Sets `User-Agent: rigging/<version>` for services requiring client identity.
+/// Consumers can override it with `ClientBuilder::user_agent` on this builder
+/// or with a `User-Agent` header on an individual request.
+///
+/// # Panics
+/// Panics under the provider initialization conditions documented on
+/// [`install_default_provider`].
 pub fn client_builder() -> reqwest::ClientBuilder {
     install_default_provider();
     reqwest::Client::builder().user_agent(concat!("rigging/", env!("CARGO_PKG_VERSION")))
 }
 
 /// Builds a Reqwest client with the selected provider installed.
+///
+/// # Panics
+/// Panics if provider initialization or reqwest client construction fails.
+/// For fallible client construction, use [`client_builder`] and call `build()`;
+/// provider initialization still has the process-wide requirements above.
 pub fn client() -> reqwest::Client {
     client_builder().build().expect("build Reqwest client with Rigging's TLS provider")
 }
@@ -69,6 +81,8 @@ fn crypto_provider() -> CryptoProvider {
     }
 }
 
+// Identity comparisons intentionally include trait-object vtables; see the
+// initialization documentation for the cross-codegen-unit limitation.
 fn providers_match(actual: &CryptoProvider, expected: &CryptoProvider) -> bool {
     actual.cipher_suites == expected.cipher_suites
         && same_dyn_items(&actual.kx_groups, &expected.kx_groups)

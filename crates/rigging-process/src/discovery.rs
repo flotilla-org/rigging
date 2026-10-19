@@ -23,16 +23,20 @@ pub async fn command_version(
 /// the daemon host: the runner may be remote or provisioned, so the daemon's
 /// own `PATH` can name a different binary or none.
 pub async fn resolve_binary_path(runner: &dyn CommandRunner, command: &str) -> Option<PathBuf> {
+    resolve_binary_path_with_marker(runner, command, "rigging-binary-discovery").await
+}
+
+/// Resolve in the runner environment, supplying the shell's `$0` marker.
+/// Consumers can retain their historical argv marker so recorded fixtures replay
+/// unchanged. The marker is a separate argument, never shell-interpolated.
+pub async fn resolve_binary_path_with_marker(runner: &dyn CommandRunner, command: &str, marker: &str) -> Option<PathBuf> {
     // Resolve inside the runner's environment: provisioned and remote runners
     // intentionally do not share the daemon process's PATH.
-    // Keep the historical shell $0 marker so existing command fixtures replay unchanged.
-    let output = match runner
-        .run("sh", &["-c", "command -v \"$1\"", "flotilla-binary-discovery", command], Path::new("/"), &crate::ChannelLabel::Default)
-        .await
+    let output = match runner.run("sh", &["-c", "command -v \"$1\"", marker, command], Path::new("/"), &crate::ChannelLabel::Default).await
     {
         Ok(output) => output,
         Err(error) => {
-            warn!(binary = command, %error, "agent adapter binary path resolution failed after successful version probe");
+            warn!(binary = command, %error, "binary path resolution failed after successful version probe");
             return None;
         }
     };
@@ -40,7 +44,7 @@ pub async fn resolve_binary_path(runner: &dyn CommandRunner, command: &str) -> O
     if path.is_absolute() {
         Some(path)
     } else {
-        warn!(binary = command, resolved_path = %path.display(), "agent adapter binary path resolution returned a relative path after successful version probe");
+        warn!(binary = command, resolved_path = %path.display(), "binary path resolution returned a relative path after successful version probe");
         None
     }
 }
@@ -80,10 +84,11 @@ pub fn parse_first_dotted_version(output: &str) -> Option<String> {
         saw_digit = ch.is_ascii_digit();
     }
 
-    if let Some(start) = start {
-        if dot_count > 0 && saw_digit {
-            return Some(output[start..].trim().to_string());
-        }
+    if let Some(start) = start
+        && dot_count > 0
+        && saw_digit
+    {
+        return Some(output[start..].trim().to_string());
     }
 
     None

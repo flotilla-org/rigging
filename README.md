@@ -66,6 +66,35 @@ recording or reject unconsumed replay interactions. `MockRunner` and
 The Flotilla migration and boundary/build-graph reanchoring are tracked in
 [flotilla#3518](https://github.com/flotilla-org/flotilla/issues/3518).
 
+### Runtime limits and packaging
+
+The four runtime/testkit crates inherit the workspace's Rust 2024 edition and
+repository metadata and are `publish = false`: consumers use pinned Git revisions
+until registry publication and versioning are introduced. Older crates may retain
+their original edition independently.
+
+On Unix, process deadlines terminate a process group, allow
+`COMMAND_TERMINATION_GRACE` for SIGTERM cleanup, then escalate to SIGKILL and reap
+the leader. On non-Unix platforms, timeout cancellation kills only the child
+leader immediately; descendants are not supervised as a group. The non-Unix
+`sysinfo` free-space implementation is selected by the target platform. Unix
+subprocess scenarios do not validate Windows behavior.
+
+HTTP `execute` buffers an unlimited body and returns non-2xx responses normally.
+`execute_to_file` streams successful bodies, leaves existing destinations alone
+on non-2xx responses, and can leave a truncated/partial destination on I/O or
+stream errors. Use a temporary destination and publish it after success when an
+atomic file is required. Constructors document their TLS/client initialization
+panics. Transport errors retain the extracted `String` signatures for consumer
+and replay compatibility.
+
+The replay testkit uses `serde_norway` for YAML (rather than the source project's
+`serde_yml` 0.0.12, affected by
+[RUSTSEC-2025-0068](https://rustsec.org/advisories/RUSTSEC-2025-0068)). Existing
+fixture fields and flat/multi-round formats remain readable. The binary-resolution
+probe has a neutral shell marker by default; `resolve_binary_path_with_marker`
+lets consumers preserve their recorded argv marker without editing fixtures.
+
 ## Gates
 
 ```bash

@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use rigging_http_client::http_execute;
-use rigging_process::{run, run_output, ChannelLabel, TaskId};
+use rigging_process::{ChannelLabel, TaskId, run, run_output};
 
 // In-memory invocation boundary: return the label sent by each macro.
 struct Invocation;

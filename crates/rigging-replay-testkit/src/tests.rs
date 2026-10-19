@@ -51,7 +51,7 @@ fn replay_session_serves_in_order() {
         }],
     };
 
-    let yaml = serde_yml::to_string(&log).unwrap();
+    let yaml = serde_norway::to_string(&log).unwrap();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("test.yaml");
     std::fs::write(&path, &yaml).unwrap();
@@ -250,7 +250,7 @@ fn recorder_saves_single_round() {
     recorder.save();
 
     let content = std::fs::read_to_string(&path).expect("read fixture");
-    let round_log: RoundLog = serde_yml::from_str(&content).expect("parse fixture");
+    let round_log: RoundLog = serde_norway::from_str(&content).expect("parse fixture");
     assert_eq!(round_log.rounds.len(), 1);
     assert_eq!(round_log.rounds[0].interactions.len(), 1);
 }
@@ -424,7 +424,7 @@ fn command_exit_status_survives_record_replay(tc: hegel::TestCase) {
 
     use super::testing::MockRunner;
 
-    let label = rigging_process::command_channel_label("pgrep", &["-x", "flotillad"]);
+    let label = rigging_process::command_channel_label("pgrep", &["-x", "example-daemon"]);
     let generated = tc.draw(gs::integers::<i32>());
     tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime").block_on(async {
         let temp = tempfile::tempdir().expect("recording directory");
@@ -437,11 +437,11 @@ fn command_exit_status_survives_record_replay(tc: hegel::TestCase) {
                 exit_code,
             })]));
             let recording = RecordingRunner::new(session.clone(), inner);
-            let live = recording.run_output("pgrep", &["-x", "flotillad"], Path::new("/"), &label).await.expect("live");
+            let live = recording.run_output("pgrep", &["-x", "example-daemon"], Path::new("/"), &label).await.expect("live");
             session.finish();
             let session = Session::replaying(&path, Masks::new());
             let replay = ReplayRunner::new(session.clone());
-            let output = replay.run_output("pgrep", &["-x", "flotillad"], Path::new("/"), &label).await.expect("replay");
+            let output = replay.run_output("pgrep", &["-x", "example-daemon"], Path::new("/"), &label).await.expect("replay");
             assert_eq!(output.exit_code, exit_code);
             assert_eq!(output.success(), exit_code == Some(0));
             assert_eq!((output.stdout, output.stderr), (live.stdout, live.stderr));
@@ -449,7 +449,7 @@ fn command_exit_status_survives_record_replay(tc: hegel::TestCase) {
             // The string convenience API selects stderr for every failure,
             // including explicit null/no-code termination, and stdout for zero.
             let session = Session::replaying(&path, Masks::new());
-            let output = ReplayRunner::new(session.clone()).run("pgrep", &["-x", "flotillad"], Path::new("/"), &label).await;
+            let output = ReplayRunner::new(session.clone()).run("pgrep", &["-x", "example-daemon"], Path::new("/"), &label).await;
             let expected = if exit_code == Some(0) { Ok("output\n".to_string()) } else { Err("diagnostic\n".to_string()) };
             assert_eq!(output, expected);
             session.finish();
@@ -463,7 +463,7 @@ fn command_exit_status_survives_record_replay(tc: hegel::TestCase) {
 fn legacy_command_exit_status_is_readable() {
     for (field, expected) in [("", Some(0)), ("exit_code: 42\n", Some(42)), ("exit_code: null\n", None)] {
         let yaml = format!("channel: command\ncmd: pgrep\nargs: []\ncwd: /\n{field}");
-        let interaction: Interaction = serde_yml::from_str(&yaml).expect("decode command");
+        let interaction: Interaction = serde_norway::from_str(&yaml).expect("decode command");
         let Interaction::Command { exit_code, .. } = interaction else { panic!("command") };
         assert_eq!(exit_code, expected);
     }
@@ -476,17 +476,17 @@ async fn command_execution_error_survives_record_replay() {
     use super::testing::MockRunner;
     let temp = tempfile::tempdir().expect("recording directory");
     let path = temp.path().join("failure.yaml");
-    let label = rigging_process::command_channel_label("pgrep", &["-x", "flotillad"]);
+    let label = rigging_process::command_channel_label("pgrep", &["-x", "example-daemon"]);
     let mut masks = Masks::new();
     masks.add("/private/runtime", "{runtime}");
     let session = Session::recording(&path, masks.clone());
     let inner = Arc::new(MockRunner::with_outputs(vec![Err("cannot execute in /private/runtime".into())]));
     let expected =
-        RecordingRunner::new(session.clone(), inner).run_output("pgrep", &["-x", "flotillad"], Path::new("/"), &label).await.err();
+        RecordingRunner::new(session.clone(), inner).run_output("pgrep", &["-x", "example-daemon"], Path::new("/"), &label).await.err();
     session.finish();
     assert!(!std::fs::read_to_string(&path).expect("recording").contains("/private/runtime"));
     let session = Session::replaying(&path, masks);
-    let actual = ReplayRunner::new(session.clone()).run_output("pgrep", &["-x", "flotillad"], Path::new("/"), &label).await.err();
+    let actual = ReplayRunner::new(session.clone()).run_output("pgrep", &["-x", "example-daemon"], Path::new("/"), &label).await.err();
     assert_eq!(actual, expected);
     assert_eq!(actual.as_deref(), Some("cannot execute in /private/runtime"));
     session.finish();

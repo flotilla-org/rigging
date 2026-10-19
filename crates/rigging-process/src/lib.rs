@@ -3,6 +3,12 @@
 //! bounded filesystem probes, scan caching and free-space measurement. Consumer
 //! policy is injected through `CommandGuard`; no project-specific scripts run here.
 
+/// Grace allowed for Unix SIGTERM cleanup before timeout escalation to SIGKILL.
+#[cfg(unix)]
+pub const COMMAND_TERMINATION_GRACE: Duration = Duration::from_secs(5);
+/// Maximum time to drain inherited pipes after the command leader has exited.
+pub const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
 pub mod available_space;
 pub mod probe;
 pub mod scan_cache;
@@ -325,11 +331,7 @@ pub fn command_timeout_message(cmd: &str, timeout: Duration) -> String {
 }
 
 pub fn rename_command_timeout(error: String, from: &str, to: &str, timeout: Duration) -> String {
-    if error == command_timeout_message(from, timeout) {
-        command_timeout_message(to, timeout)
-    } else {
-        error
-    }
+    if error == command_timeout_message(from, timeout) { command_timeout_message(to, timeout) } else { error }
 }
 
 /// Production implementation that delegates to `tokio::process::Command`.
@@ -372,6 +374,7 @@ struct ProcessGroupGuard(i32);
 #[cfg(unix)]
 impl ProcessGroupGuard {
     fn for_child(child: &tokio::process::Child) -> Result<Self, String> {
+        // Called immediately after successful spawn, before any wait/reap.
         let pid = child.id().expect("spawned child has pid");
         let pgid = i32::try_from(pid).map_err(|_| format!("child PID {pid} exceeds pid_t range"))?;
         Ok(Self(pgid))
@@ -560,6 +563,7 @@ impl<G: CommandGuard> CommandRunner for ProcessRunner<G> {
             let mut bytes = Vec::new();
             pipe.read_to_end(&mut bytes).await.map(|_| bytes)
         }
+        // Spawn above explicitly requested both pipes; neither has been taken.
         let stdout = child.stdout.take().expect("piped stdout");
         let stderr = child.stderr.take().expect("piped stderr");
         // JoinSet owns the pipe readers, so cancellation or an error aborts
@@ -581,7 +585,7 @@ impl<G: CommandGuard> CommandRunner for ProcessRunner<G> {
                     // its PID/group cannot be reused even if it exits before a
                     // helper which ignores TERM. Then stop the entire group
                     // before reaping and releasing the writer's exclusion.
-                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    tokio::time::sleep(COMMAND_TERMINATION_GRACE).await;
                     unsafe { libc::killpg(guard.0, libc::SIGKILL) };
                     child.wait().await.map_err(|error| error.to_string())?
                 }
@@ -613,7 +617,7 @@ impl<G: CommandGuard> CommandRunner for ProcessRunner<G> {
         // A daemonising helper may retain a pipe after the leader exits. Do
         // not signal the old process group after reaping (its ID may have been
         // reused). Bound collection separately and close our readers instead.
-        let (stdout, stderr) = match tokio::time::timeout(Duration::from_secs(5), collect).await {
+        let (stdout, stderr) = match tokio::time::timeout(OUTPUT_DRAIN_TIMEOUT, collect).await {
             Ok(result) => result?,
             Err(_) => {
                 drains.shutdown().await;
@@ -669,6 +673,7 @@ impl<G: CommandGuard> CommandRunner for ProcessRunner<G> {
             let mut bytes = Vec::new();
             pipe.read_to_end(&mut bytes).await.map(|_| bytes)
         }
+        // Both pipes were requested at spawn and have not been taken.
         let stdout = tokio::spawn(drain(child.stdout.take().expect("piped stdout")));
         let stderr = tokio::spawn(drain(child.stderr.take().expect("piped stderr")));
         let mut guard = GracefulTermination { child: Some(child), grace };
@@ -714,6 +719,7 @@ impl<G: CommandGuard> CommandRunner for ProcessRunner<G> {
             .map_err(|e| e.to_string())?;
         #[cfg(unix)]
         let mut guard = ProcessGroupGuard::for_child(&child)?;
+        // Stdin was requested as piped at spawn and has not been taken.
         let mut stdin = child.stdin.take().expect("piped stdin should be available");
         let write_input = async move {
             stdin.write_all(input).await.map_err(|e| e.to_string())?;
@@ -745,11 +751,7 @@ impl<G: CommandGuard> CommandRunner for ProcessRunner<G> {
         let mut output = tokio::fs::File::create(destination).await.map_err(|error| error.to_string())?;
         tokio::io::copy(&mut child.stdout.take().expect("piped stdout"), &mut output).await.map_err(|error| error.to_string())?;
         let status = child.wait().await.map_err(|error| error.to_string())?;
-        if status.success() {
-            Ok(())
-        } else {
-            Err(format!("{cmd} exited with {status}"))
-        }
+        if status.success() { Ok(()) } else { Err(format!("{cmd} exited with {status}")) }
     }
 
     async fn run_from_file(&self, cmd: &str, args: &[&str], cwd: &Path, source: &Path) -> Result<(), String> {
@@ -764,16 +766,13 @@ impl<G: CommandGuard> CommandRunner for ProcessRunner<G> {
             .spawn()
             .map_err(|error| error.to_string())?;
         let mut input = tokio::fs::File::open(source).await.map_err(|error| error.to_string())?;
+        // Stdin was requested as piped at spawn and has not been taken.
         let mut stdin = child.stdin.take().expect("piped stdin");
         tokio::io::copy(&mut input, &mut stdin).await.map_err(|error| error.to_string())?;
         stdin.shutdown().await.map_err(|error| error.to_string())?;
         drop(stdin);
         let status = child.wait().await.map_err(|error| error.to_string())?;
-        if status.success() {
-            Ok(())
-        } else {
-            Err(format!("{cmd} exited with {status}"))
-        }
+        if status.success() { Ok(()) } else { Err(format!("{cmd} exited with {status}")) }
     }
 
     async fn read_file_to(&self, source: &Path, destination: &Path) -> Result<(), String> {
@@ -1183,8 +1182,8 @@ pub mod discovery;
 mod guard_tests {
     use super::*;
     use std::sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicUsize, Ordering},
     };
 
     // The guard is a fake at the subprocess boundary. A rejected command must

@@ -126,7 +126,10 @@ fn extension_obeys_round_barriers_and_completion_checks() {
 // each exercises generic inference and public collaborators across crate seams.
 #[tokio::test]
 async fn extended_session_drives_builtin_wrappers() {
-    let replay: Session<Rpc> = Session::replaying_from_str("interactions:\n- {channel: command, cmd: tool, args: [], cwd: /, stdout: ok}\n- {channel: http, method: GET, url: 'https://example.com/', status: 204, response_body: ''}\n", Masks::new());
+    let replay: Session<Rpc> = Session::replaying_from_str(
+        "interactions:\n- {channel: command, cmd: tool, args: [], cwd: /, stdout: ok}\n- {channel: http, method: GET, url: 'https://example.com/', status: 204, response_body: ''}\n",
+        Masks::new(),
+    );
     let runner = test_runner(&replay);
     assert_eq!(rigging_process::run!(runner, "tool", &[], Path::new("/")).unwrap(), "ok");
     let client = test_http_client(&replay);
@@ -141,14 +144,20 @@ async fn extended_session_drives_builtin_wrappers() {
 #[tokio::test]
 async fn discovery_uses_injected_environment_and_parses_versions() {
     use crate::testing::MockRunner;
-    use rigging_process::discovery::{command_version, parse_first_dotted_version, resolve_binary_path};
+    use rigging_process::discovery::{command_version, parse_first_dotted_version, resolve_binary_path, resolve_binary_path_with_marker};
     for (output, expected) in [("/tools/tool\n", Some("/tools/tool")), ("relative/tool", None), ("", None)] {
         let runner = MockRunner::new(vec![Ok(output.into())]);
         assert_eq!(resolve_binary_path(&runner, "tool").await, expected.map(PathBuf::from));
         assert_eq!(
             runner.calls(),
-            vec![("sh".into(), vec!["-c".into(), "command -v \"$1\"".into(), "flotilla-binary-discovery".into(), "tool".into()])]
+            vec![("sh".into(), vec!["-c".into(), "command -v \"$1\"".into(), "rigging-binary-discovery".into(), "tool".into()])]
         );
+    }
+    // Glue: caller markers are opaque argv data, including empty and shell syntax.
+    for marker in ["", "legacy-binary-discovery", "marker; '$0' \"quoted\""] {
+        let runner = MockRunner::new(vec![Ok("/tools/tool\n".into())]);
+        assert_eq!(resolve_binary_path_with_marker(&runner, "tool", marker).await, Some(PathBuf::from("/tools/tool")));
+        assert_eq!(runner.calls()[0].1[2], marker);
     }
     let runner = MockRunner::new(vec![Err("missing".into())]);
     assert!(resolve_binary_path(&runner, "tool").await.is_none());
@@ -175,11 +184,11 @@ async fn discovery_uses_injected_environment_and_parses_versions() {
 async fn http_executor_and_standin_preserve_the_request_and_response() {
     use crate::http_contract::StandIn;
     use axum::{
+        Router,
         body::Bytes,
         http::Uri,
         http::{HeaderMap, StatusCode},
         routing::post,
-        Router,
     };
     use rigging_http_client::{HttpClient, ReqwestHttpClient};
     let router = Router::new()
@@ -191,7 +200,7 @@ async fn http_executor_and_standin_preserve_the_request_and_response() {
                 (StatusCode::CREATED, [("x-response", "present")], body)
             }),
         )
-        .route("/fail", axum::routing::get(|| async { StatusCode::FORBIDDEN }));
+        .route("/fail", axum::routing::get(|| async { (StatusCode::FORBIDDEN, "denied") }));
     let standin = StandIn::start("https://service.example", router).await;
     let payload = vec![0, 128, 255, 1];
     let request = rigging_tls::client()
@@ -215,6 +224,10 @@ async fn http_executor_and_standin_preserve_the_request_and_response() {
         .unwrap();
     assert_eq!(client.execute_to_file(request, &ChannelLabel::Default, &path).await.unwrap(), 201);
     assert_eq!(std::fs::read(&path).unwrap(), payload);
+    let request = rigging_tls::client().get(standin.url.join("fail").unwrap()).build().unwrap();
+    let response = client.execute(request, &ChannelLabel::Default).await.unwrap();
+    assert_eq!(response.status(), 403);
+    assert_eq!(response.body().as_ref(), b"denied");
     let request = rigging_tls::client().get(standin.url.join("fail").unwrap()).build().unwrap();
     assert_eq!(client.execute_to_file(request, &ChannelLabel::Default, &path).await.unwrap(), 403);
     assert_eq!(std::fs::read(path).unwrap(), payload);
