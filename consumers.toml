@@ -8,3 +8,8 @@
 # repo = "flotilla-org/flotilla"
 # rev = "<commit>"
 # crates = ["flotilla-cbor"]
+
+[[consumer]]
+repo = "flotilla-org/drydock"
+rev = "9379d92f722dc121d32eac9abd284ce57b1bff47"
+crates = ["rigging-http-serve", "rigging-tls"]
