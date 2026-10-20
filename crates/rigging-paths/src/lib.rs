@@ -18,6 +18,7 @@ impl PathPolicy {
     /// `app` must be a single normal path component (for example `drydock`).
     /// The root override is its ASCII-uppercase name with hyphens replaced
     /// by underscores, followed by `_ROOT` (e.g. `my-app` → `MY_APP_ROOT`).
+    /// Names such as `my-app` and `my_app` therefore share `MY_APP_ROOT`.
     /// A present root, including an empty value, wins over all XDG variables.
     /// Each XDG base gets the application name appended; missing bases use
     /// HOME and the XDG defaults, including on macOS. HOME is only required

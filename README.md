@@ -39,7 +39,9 @@ jackstay, wheelhouse, binnacle and the rest. The rules and their reasons are in
 first (`<root>/config`, `data`, `state`, `cache`), then each `XDG_*_HOME`
 with `/drydock` appended, then the corresponding XDG default below `HOME`.
 This policy also applies on macOS. Hyphens become underscores in the root
-override name (`my-app` uses `MY_APP_ROOT`); directory names retain the hyphens. All environment reads use `rigging_process::EnvVars`;
+override name (`my-app` uses `MY_APP_ROOT`); directory names retain the hyphens.
+Names such as `my-app` and `my_app` share that override.
+All environment reads use `rigging_process::EnvVars`;
 use `ProcessEnvVars` for the local process. Missing HOME is an error only when
 needed for a default. Empty values retain the original Flotilla policy's
 present-value semantics. Resolution neither creates directories nor parses config.
