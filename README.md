@@ -38,13 +38,14 @@ jackstay, wheelhouse, binnacle and the rest. The rules and their reasons are in
 `rigging_paths::PathPolicy::from_env("drydock", &env)` resolves `DRYDOCK_ROOT`
 first (`<root>/config`, `data`, `state`, `cache`), then each `XDG_*_HOME`
 with `/drydock` appended, then the corresponding XDG default below `HOME`.
-This policy also applies on macOS. All environment reads use `rigging_process::EnvVars`;
+This policy also applies on macOS. Hyphens become underscores in the root
+override name (`my-app` uses `MY_APP_ROOT`); directory names retain the hyphens. All environment reads use `rigging_process::EnvVars`;
 use `ProcessEnvVars` for the local process. Missing HOME is an error only when
 needed for a default. Empty values retain the original Flotilla policy's
 present-value semantics. Resolution neither creates directories nor parses config.
 
 `rigging_process::resolve_sibling_binary("drydockd", "DRYDOCKD_BIN", &env,
-std::env::current_exe, |path| path.exists())` returns the override verbatim,
+std::env::current_exe, |path| path.is_file())` returns the override verbatim,
 otherwise probes beside the executable, then above `deps/` for Cargo test
 binaries. Supply the platform's filename suffix explicitly. It does not search
 PATH or check executable permissions; spawning remains the application's job.

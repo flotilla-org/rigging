@@ -16,7 +16,8 @@ impl PathPolicy {
     /// Resolve an application's directories from an injected environment.
     ///
     /// `app` must be a single normal path component (for example `drydock`).
-    /// The root override is its ASCII-uppercase name followed by `_ROOT`.
+    /// The root override is its ASCII-uppercase name with hyphens replaced
+    /// by underscores, followed by `_ROOT` (e.g. `my-app` → `MY_APP_ROOT`).
     /// A present root, including an empty value, wins over all XDG variables.
     /// Each XDG base gets the application name appended; missing bases use
     /// HOME and the XDG defaults, including on macOS. HOME is only required
@@ -26,7 +27,7 @@ impl PathPolicy {
         if !matches!(components.next(), Some(std::path::Component::Normal(_))) || components.next().is_some() {
             return Err("application name must be a single normal path component".into());
         }
-        if let Some(root) = env.get(&format!("{}_ROOT", app.to_ascii_uppercase())) {
+        if let Some(root) = env.get(&format!("{}_ROOT", app.to_ascii_uppercase().replace('-', "_"))) {
             let root = PathBuf::from(root);
             return Ok(Self {
                 config_dir: root.join("config"),
@@ -76,7 +77,7 @@ mod tests {
         let home = tc.draw(gs::booleans());
         let mut vars = HashMap::new();
         if root {
-            vars.insert(format!("{}_ROOT", app.to_ascii_uppercase()), "/root".into());
+            vars.insert(format!("{}_ROOT", app.to_ascii_uppercase().replace('-', "_")), "/root".into());
         }
         if home {
             vars.insert("HOME".into(), "/home/test".into());
@@ -109,6 +110,18 @@ mod tests {
         } else {
             let paths = result.unwrap();
             assert_eq!(vec![paths.config_dir, paths.data_dir, paths.state_dir, paths.cache_dir], expected);
+        }
+    }
+
+    // Hyphenated and underscored application names use shell-friendly overrides
+    // while retaining the original application name in XDG directories.
+    #[test]
+    fn compound_application_names() {
+        for app in ["my-app", "my_app"] {
+            let env = Env(HashMap::from([("MY_APP_ROOT".into(), "/root".into())]));
+            assert_eq!(PathPolicy::from_env(app, &env).unwrap().config_dir, PathBuf::from("/root/config"));
+            let env = Env(HashMap::from([("HOME".into(), "/home/test".into())]));
+            assert_eq!(PathPolicy::from_env(app, &env).unwrap().config_dir, PathBuf::from("/home/test/.config").join(app));
         }
     }
 
