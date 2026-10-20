@@ -28,9 +28,27 @@ jackstay, wheelhouse, binnacle and the rest. The rules and their reasons are in
 | `rigging-http-serve` | Local axum serving on Unix sockets and loopback TCP with typed callers and authentication |
 | `flotilla-cbor` | The stack's CBOR profile: deterministic writers, safe readers, limits and framing |
 | `rigging-tls` | Rustls provider selection and reqwest builders with a default User-Agent |
+| `rigging-paths` | Application-named XDG config, data, state and cache directories |
 | `rigging-process` | Command execution, environment variables, bounded filesystem probes, scan cache and binary/version probes |
 | `rigging-http-client` | Streaming HTTP execution; `restricted` for explicit proxy/CA without redirects, retries or ambient proxy |
 | `rigging-replay-testkit` | Dev-only record/replay sessions, masks, YAML fixtures, mock runners and axum HTTP stand-ins |
+
+## Application paths and companions
+
+`rigging_paths::PathPolicy::from_env("drydock", &env)` resolves `DRYDOCK_ROOT`
+first (`<root>/config`, `data`, `state`, `cache`), then each `XDG_*_HOME`
+with `/drydock` appended, then the corresponding XDG default below `HOME`.
+This policy also applies on macOS. All environment reads use `rigging_process::EnvVars`;
+use `ProcessEnvVars` for the local process. Missing HOME is an error only when
+needed for a default. Empty values retain the original Flotilla policy's
+present-value semantics. Resolution neither creates directories nor parses config.
+
+`rigging_process::resolve_sibling_binary("drydockd", "DRYDOCKD_BIN", &env,
+std::env::current_exe, |path| path.exists())` returns the override verbatim,
+otherwise probes beside the executable, then above `deps/` for Cargo test
+binaries. Supply the platform's filename suffix explicitly. It does not search
+PATH or check executable permissions; spawning remains the application's job.
+The executable and filesystem probes are injected for isolated tests.
 
 ## Runtime and replay seams
 

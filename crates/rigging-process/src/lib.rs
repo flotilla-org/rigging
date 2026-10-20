@@ -12,6 +12,8 @@ pub const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 pub mod available_space;
 pub mod probe;
 pub mod scan_cache;
+pub mod sibling;
+pub use sibling::resolve_sibling_binary;
 
 use std::{
     path::{Path, PathBuf},
