@@ -74,6 +74,7 @@ impl HttpClient for Redirect {
 mod tests {
     use super::*;
     use axum::{body::to_bytes, extract::Request, routing::any};
+
     // Multiple service authorities keep distinct routers and preserve real
     // request headers, encoded query, method and body over the HTTP boundary.
     #[tokio::test]
@@ -82,10 +83,14 @@ mod tests {
         let router = || {
             Router::new().fallback(any(|r: Request| async move {
                 let (parts, body) = r.into_parts();
-                assert_eq!(parts.method, "POST");
-                assert_eq!(parts.uri.to_string(), "/x?labels=%7B%22a%22%3A%22b%22%7D");
-                assert_eq!(parts.headers["authorization"], "Bearer synthetic");
-                to_bytes(body, 1024).await.unwrap()
+                let body = to_bytes(body, 1024).await.unwrap();
+                format!(
+                    "{}\n{}\n{}\n{}",
+                    parts.method,
+                    parts.uri,
+                    parts.headers.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or(""),
+                    String::from_utf8_lossy(&body)
+                )
             }))
         };
         let server = StandIn::start_many([
@@ -101,18 +106,23 @@ mod tests {
             .build()
             .unwrap();
         let label = ChannelLabel::Http("multi-origin".into());
-        assert_eq!(server.http.execute(req, &label).await.unwrap().body().as_ref(), b"one");
+        assert_eq!(
+            server.http.execute(req, &label).await.unwrap().body().as_ref(),
+            b"POST\n/x?labels=%7B%22a%22%3A%22b%22%7D\nBearer synthetic\none"
+        );
         let req = client.get("https://two.invalid/").build().unwrap();
         assert_eq!(server.http.execute(req, &label).await.unwrap().body().as_ref(), b"two");
         let req = client.get("https://unknown.invalid/").build().unwrap();
         assert!(server.http.execute(req, &label).await.is_err());
     }
+
     // Invalid harness configurations fail at construction, before any requests.
     #[tokio::test]
     #[should_panic(expected = "duplicate stand-in origin")]
     async fn duplicate_origins_are_rejected() {
         StandIn::start_many([("https://one.invalid", Router::new()), ("https://one.invalid", Router::new())]).await;
     }
+
     #[tokio::test]
     #[should_panic(expected = "at least one origin")]
     async fn empty_origins_are_rejected() {
