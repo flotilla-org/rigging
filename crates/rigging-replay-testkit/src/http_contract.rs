@@ -1,5 +1,5 @@
 //! Network-boundary stand-in support; preserve the production request except its authority.
-use std::{sync::Arc, time::Duration};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use axum::Router;
@@ -15,7 +15,8 @@ use rigging_process::ChannelLabel;
 pub struct StandIn {
     /// Redirects requests for the declared service origin to this server.
     pub http: Arc<dyn HttpClient>,
-    /// Base URL for sending malformed requests directly to the stand-in.
+    /// Base URL of the lexicographically first declared origin, for sending
+    /// malformed requests directly. Single-origin callers retain their URL.
     pub url: Url,
     tasks: Vec<JoinHandle<()>>,
 }
@@ -29,7 +30,7 @@ impl StandIn {
     /// Serve independent origins through real loopback HTTP. Paths and queries
     /// are preserved, and undeclared origins are refused before any network IO.
     pub async fn start_many(routes: impl IntoIterator<Item = (&'static str, Router)>) -> Self {
-        let mut bases = std::collections::BTreeMap::new();
+        let mut bases = BTreeMap::new();
         let mut tasks = Vec::new();
         for (origin, router) in routes {
             assert!(!bases.contains_key(origin), "duplicate stand-in origin");
@@ -52,14 +53,14 @@ impl Drop for StandIn {
 }
 
 struct Redirect {
-    bases: std::collections::BTreeMap<&'static str, Url>,
+    bases: BTreeMap<&'static str, Url>,
 }
 
 #[async_trait]
 impl HttpClient for Redirect {
     async fn execute(&self, mut request: reqwest::Request, label: &ChannelLabel) -> Result<http::Response<Bytes>, String> {
         let origin = request.url().origin().ascii_serialization();
-        let mut url = self.bases.get(origin.as_str()).ok_or_else(|| "undeclared stand-in origin".to_string())?.clone();
+        let mut url = self.bases.get(origin.as_str()).ok_or_else(|| format!("undeclared stand-in origin: {origin}"))?.clone();
         url.set_path(request.url().path());
         url.set_query(request.url().query());
         *request.url_mut() = url;
@@ -105,5 +106,16 @@ mod tests {
         assert_eq!(server.http.execute(req, &label).await.unwrap().body().as_ref(), b"two");
         let req = client.get("https://unknown.invalid/").build().unwrap();
         assert!(server.http.execute(req, &label).await.is_err());
+    }
+    // Invalid harness configurations fail at construction, before any requests.
+    #[tokio::test]
+    #[should_panic(expected = "duplicate stand-in origin")]
+    async fn duplicate_origins_are_rejected() {
+        StandIn::start_many([("https://one.invalid", Router::new()), ("https://one.invalid", Router::new())]).await;
+    }
+    #[tokio::test]
+    #[should_panic(expected = "at least one origin")]
+    async fn empty_origins_are_rejected() {
+        StandIn::start_many([]).await;
     }
 }
