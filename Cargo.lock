@@ -1091,6 +1091,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rigging-paths"
+version = "0.1.0"
+dependencies = [
+ "hegeltest",
+ "rigging-process",
+]
+
+[[package]]
 name = "rigging-process"
 version = "0.1.0"
 dependencies = [

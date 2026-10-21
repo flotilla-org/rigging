@@ -28,9 +28,35 @@ jackstay, wheelhouse, binnacle and the rest. The rules and their reasons are in
 | `rigging-http-serve` | Local axum serving on Unix sockets and loopback TCP with typed callers and authentication |
 | `flotilla-cbor` | The stack's CBOR profile: deterministic writers, safe readers, limits and framing |
 | `rigging-tls` | Rustls provider selection and reqwest builders with a default User-Agent |
+| `rigging-paths` | Application-named XDG config, data, state and cache directories |
 | `rigging-process` | Command execution, environment variables, bounded filesystem probes, scan cache and binary/version probes |
 | `rigging-http-client` | Streaming HTTP execution; `restricted` for explicit proxy/CA without redirects, retries or ambient proxy |
 | `rigging-replay-testkit` | Dev-only record/replay sessions, masks, YAML fixtures, mock runners and axum HTTP stand-ins |
+
+## Application paths and companions
+
+`rigging_paths::PathPolicy::from_env("drydock", &env)` resolves `DRYDOCK_ROOT`
+first (`<root>/config`, `data`, `state`, `cache`), then each `XDG_*_HOME`
+with `/drydock` appended, then the corresponding XDG default below `HOME`.
+This policy also applies on macOS. Hyphens become underscores in the root
+override name (`my-app` uses `MY_APP_ROOT`); directory names retain the hyphens.
+Names such as `my-app` and `my_app` share that override.
+Path environment reads use `rigging_process::EnvVars::get_os` to preserve
+non-UTF-8 paths; OS-backed implementations must override that accessor.
+use `ProcessEnvVars` for the local process. Missing HOME is an error only when
+needed for a default, unlike Flotilla's fallback to `dirs::home_dir`.
+Empty root overrides and empty HOME values needed for defaults are errors.
+Empty or relative XDG bases are ignored in favor of the defaults. Resolution neither creates directories nor parses config.
+
+`rigging_process::resolve_sibling_binary("drydockd", "DRYDOCKD_BIN", &env,
+std::env::current_exe, |path| path.is_file())` returns a nonempty override verbatim (an empty override is unset),
+otherwise probes beside the executable, then above `deps/` for Cargo test
+binaries. Supply the platform's filename suffix explicitly. It does not search
+PATH or check executable permissions; spawning remains the application's job.
+The file probe must use `is_file()`, so directories cannot shadow companions.
+The executable and filesystem probes are injected for isolated tests.
+On Linux, `current_exe` resolves symlinks; on macOS it may report the symlink
+path. Lookup uses only the directory returned by that probe, not both locations.
 
 ## Runtime and replay seams
 

@@ -12,6 +12,8 @@ pub const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 pub mod available_space;
 pub mod probe;
 pub mod scan_cache;
+pub mod sibling;
+pub use sibling::resolve_sibling_binary;
 
 use std::{
     path::{Path, PathBuf},
@@ -1163,6 +1165,12 @@ mod tests {
 pub trait EnvVars: Send + Sync {
     fn get(&self, key: &str) -> Option<String>;
 
+    /// Lossless environment value for filesystem paths. Implementations backed
+    /// by an OS environment must override this with its native string lookup.
+    fn get_os(&self, key: &str) -> Option<std::ffi::OsString> {
+        self.get(key).map(Into::into)
+    }
+
     fn host_os(&self) -> &str {
         std::env::consts::OS
     }
@@ -1171,6 +1179,9 @@ pub trait EnvVars: Send + Sync {
 pub struct ProcessEnvVars;
 
 impl EnvVars for ProcessEnvVars {
+    fn get_os(&self, key: &str) -> Option<std::ffi::OsString> {
+        std::env::var_os(key)
+    }
     fn get(&self, key: &str) -> Option<String> {
         std::env::var(key).ok()
     }

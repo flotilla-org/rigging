@@ -1,0 +1,193 @@
+//! Application directories using XDG conventions on every operating system.
+use std::path::PathBuf;
+
+use rigging_process::EnvVars;
+
+/// Resolved directories. Resolution does not create or inspect directories.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathPolicy {
+    pub config_dir: PathBuf,
+    pub data_dir: PathBuf,
+    pub state_dir: PathBuf,
+    pub cache_dir: PathBuf,
+}
+
+impl PathPolicy {
+    /// Resolve an application's directories from an injected environment.
+    ///
+    /// `app` must be a single normal path component (for example `drydock`).
+    /// The root override is its ASCII-uppercase name with hyphens replaced
+    /// by underscores, followed by `_ROOT` (e.g. `my-app` → `MY_APP_ROOT`).
+    /// Names such as `my-app` and `my_app` therefore share `MY_APP_ROOT`.
+    /// A nonempty root wins over all XDG variables; an empty root is an error.
+    /// Each absolute, nonempty XDG base gets the application name appended;
+    /// empty or relative XDG values are ignored. Missing bases use
+    /// HOME and the XDG defaults, including on macOS. HOME is only required
+    /// when a default is needed and must be nonempty. Unlike Flotilla, missing
+    /// HOME is an error rather than falling back to `dirs::home_dir`.
+    /// All path values preserve native OS strings.
+    pub fn from_env(app: &str, env: &dyn EnvVars) -> Result<Self, String> {
+        let mut components = std::path::Path::new(app).components();
+        if !matches!(components.next(), Some(std::path::Component::Normal(_))) || components.next().is_some() {
+            return Err("application name must be a single normal path component".into());
+        }
+        if let Some(root) = env.get_os(&format!("{}_ROOT", app.to_ascii_uppercase().replace('-', "_"))) {
+            if root.is_empty() {
+                return Err("application root override is empty".into());
+            }
+            let root = PathBuf::from(root);
+            return Ok(Self {
+                config_dir: root.join("config"),
+                data_dir: root.join("data"),
+                state_dir: root.join("state"),
+                cache_dir: root.join("cache"),
+            });
+        }
+        let resolve = |key, default| {
+            let base = match env.get_os(key).map(PathBuf::from).filter(|path| path.is_absolute()) {
+                Some(value) => value,
+                None => {
+                    let home = env
+                        .get_os("HOME")
+                        .filter(|value| !value.is_empty())
+                        .ok_or("cannot determine home directory: HOME is unset or empty")?;
+                    PathBuf::from(home).join(default)
+                }
+            };
+            Ok::<_, String>(base.join(app))
+        };
+        Ok(Self {
+            config_dir: resolve("XDG_CONFIG_HOME", ".config")?,
+            data_dir: resolve("XDG_DATA_HOME", ".local/share")?,
+            state_dir: resolve("XDG_STATE_HOME", ".local/state")?,
+            cache_dir: resolve("XDG_CACHE_HOME", ".cache")?,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hegel::generators as gs;
+    use std::collections::HashMap;
+
+    struct Env(HashMap<String, String>);
+    impl EnvVars for Env {
+        fn get(&self, key: &str) -> Option<String> {
+            self.0.get(key).cloned()
+        }
+        fn host_os(&self) -> &str {
+            "macos"
+        }
+    }
+
+    // Every category independently obeys root > XDG > HOME default, even on macOS.
+    #[hegel::test]
+    fn directory_precedence(tc: hegel::TestCase) {
+        // Span both applications, optional root/HOME, and every subset of XDG bases.
+        let app = if tc.draw(gs::booleans()) { "flotilla" } else { "drydock" };
+        let root = tc.draw(gs::booleans());
+        let home = tc.draw(gs::booleans());
+        let mut vars = HashMap::new();
+        if root {
+            vars.insert(format!("{}_ROOT", app.to_ascii_uppercase().replace('-', "_")), "/root".into());
+        }
+        if home {
+            vars.insert("HOME".into(), "/home/test".into());
+        }
+        let categories = [
+            ("CONFIG", ".config", "config"),
+            ("DATA", ".local/share", "data"),
+            ("STATE", ".local/state", "state"),
+            ("CACHE", ".cache", "cache"),
+        ];
+        let mut expected = Vec::new();
+        let mut missing_home = false;
+        for (category, default, directory) in categories {
+            let xdg = tc.draw(gs::booleans());
+            if xdg {
+                vars.insert(format!("XDG_{category}_HOME"), format!("/xdg/{directory}"));
+            }
+            expected.push(if root {
+                PathBuf::from("/root").join(directory)
+            } else if xdg {
+                PathBuf::from("/xdg").join(directory).join(app)
+            } else {
+                missing_home |= !home;
+                PathBuf::from("/home/test").join(default).join(app)
+            });
+        }
+        let result = PathPolicy::from_env(app, &Env(vars));
+        if missing_home {
+            assert!(result.is_err());
+        } else {
+            let paths = result.unwrap();
+            assert_eq!(vec![paths.config_dir, paths.data_dir, paths.state_dir, paths.cache_dir], expected);
+        }
+    }
+
+    // Hyphenated and underscored application names use shell-friendly overrides
+    // while retaining the original application name in XDG directories.
+    #[test]
+    fn compound_application_names() {
+        for app in ["my-app", "my_app"] {
+            let env = Env(HashMap::from([("MY_APP_ROOT".into(), "/root".into())]));
+            assert_eq!(PathPolicy::from_env(app, &env).unwrap().config_dir, PathBuf::from("/root/config"));
+            let env = Env(HashMap::from([("HOME".into(), "/home/test".into())]));
+            assert_eq!(PathPolicy::from_env(app, &env).unwrap().config_dir, PathBuf::from("/home/test/.config").join(app));
+        }
+    }
+
+    // Invalid names, empty roots and unusable HOME values must not silently
+    // resolve against the current directory. Invalid XDG bases use defaults.
+    #[test]
+    fn invalid_names_and_empty_values() {
+        for app in ["", ".", "..", "/absolute", "two/parts"] {
+            assert!(PathPolicy::from_env(app, &Env(HashMap::new())).is_err());
+        }
+        let env = Env(HashMap::from([("APP_ROOT".into(), "".into()), ("HOME".into(), "/home/test".into())]));
+        assert!(PathPolicy::from_env("app", &env).unwrap_err().contains("root override is empty"));
+        for home in [None, Some("")] {
+            let vars = home.map(|value| HashMap::from([("HOME".into(), value.into())])).unwrap_or_default();
+            assert!(PathPolicy::from_env("app", &Env(vars)).is_err());
+        }
+        for value in ["", "relative"] {
+            let mut vars = HashMap::from([("HOME".into(), "/home/test".into())]);
+            for category in ["CONFIG", "DATA", "STATE", "CACHE"] {
+                vars.insert(format!("XDG_{category}_HOME"), value.into());
+            }
+            let paths = PathPolicy::from_env("app", &Env(vars)).unwrap();
+            assert_eq!(paths.config_dir, PathBuf::from("/home/test/.config/app"));
+            assert_eq!(paths.data_dir, PathBuf::from("/home/test/.local/share/app"));
+            assert_eq!(paths.state_dir, PathBuf::from("/home/test/.local/state/app"));
+            assert_eq!(paths.cache_dir, PathBuf::from("/home/test/.cache/app"));
+        }
+    }
+
+    // Non-UTF-8 root, HOME and XDG values survive injected OS-string lookup.
+    #[cfg(unix)]
+    #[test]
+    fn native_paths_are_lossless() {
+        use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+        struct Native(&'static str, OsString);
+        impl EnvVars for Native {
+            fn get(&self, _: &str) -> Option<String> {
+                panic!("lossy lookup")
+            }
+            fn get_os(&self, key: &str) -> Option<OsString> {
+                if key == self.0 {
+                    Some(self.1.clone())
+                } else if key == "HOME" {
+                    Some("/home/test".into())
+                } else {
+                    None
+                }
+            }
+        }
+        let native = OsString::from_vec(b"/native/\xff".to_vec());
+        for (key, suffix) in [("APP_ROOT", "config"), ("HOME", ".config/app"), ("XDG_CONFIG_HOME", "app")] {
+            let paths = PathPolicy::from_env("app", &Native(key, native.clone())).unwrap();
+            assert_eq!(paths.config_dir, PathBuf::from(&native).join(suffix));
+        }
+    }
+}
