@@ -19,16 +19,22 @@ impl PathPolicy {
     /// The root override is its ASCII-uppercase name with hyphens replaced
     /// by underscores, followed by `_ROOT` (e.g. `my-app` → `MY_APP_ROOT`).
     /// Names such as `my-app` and `my_app` therefore share `MY_APP_ROOT`.
-    /// A present root, including an empty value, wins over all XDG variables.
-    /// Each XDG base gets the application name appended; missing bases use
+    /// A nonempty root wins over all XDG variables; an empty root is an error.
+    /// Each absolute, nonempty XDG base gets the application name appended;
+    /// empty or relative XDG values are ignored. Missing bases use
     /// HOME and the XDG defaults, including on macOS. HOME is only required
-    /// when a default is needed. No ambient environment fallback is used.
+    /// when a default is needed and must be nonempty. Unlike Flotilla, missing
+    /// HOME is an error rather than falling back to `dirs::home_dir`.
+    /// All path values preserve native OS strings.
     pub fn from_env(app: &str, env: &dyn EnvVars) -> Result<Self, String> {
         let mut components = std::path::Path::new(app).components();
         if !matches!(components.next(), Some(std::path::Component::Normal(_))) || components.next().is_some() {
             return Err("application name must be a single normal path component".into());
         }
-        if let Some(root) = env.get(&format!("{}_ROOT", app.to_ascii_uppercase().replace('-', "_"))) {
+        if let Some(root) = env.get_os(&format!("{}_ROOT", app.to_ascii_uppercase().replace('-', "_"))) {
+            if root.is_empty() {
+                return Err("application root override is empty".into());
+            }
             let root = PathBuf::from(root);
             return Ok(Self {
                 config_dir: root.join("config"),
@@ -38,9 +44,15 @@ impl PathPolicy {
             });
         }
         let resolve = |key, default| {
-            let base = match env.get(key) {
-                Some(value) => PathBuf::from(value),
-                None => PathBuf::from(env.get("HOME").ok_or("cannot determine home directory: HOME is unset")?).join(default),
+            let base = match env.get_os(key).map(PathBuf::from).filter(|path| path.is_absolute()) {
+                Some(value) => value,
+                None => {
+                    let home = env
+                        .get_os("HOME")
+                        .filter(|value| !value.is_empty())
+                        .ok_or("cannot determine home directory: HOME is unset or empty")?;
+                    PathBuf::from(home).join(default)
+                }
             };
             Ok::<_, String>(base.join(app))
         };
@@ -126,18 +138,56 @@ mod tests {
         }
     }
 
-    // Invalid application components are refused; empty environment values retain
-    // the original policy's present-value semantics rather than reading the host.
+    // Invalid names, empty roots and unusable HOME values must not silently
+    // resolve against the current directory. Invalid XDG bases use defaults.
     #[test]
     fn invalid_names_and_empty_values() {
         for app in ["", ".", "..", "/absolute", "two/parts"] {
             assert!(PathPolicy::from_env(app, &Env(HashMap::new())).is_err());
         }
-        let env = Env(HashMap::from([("APP_ROOT".into(), "".into())]));
-        assert_eq!(PathPolicy::from_env("app", &env).unwrap().config_dir, PathBuf::from("config"));
-        let env = Env(HashMap::from([("HOME".into(), "".into()), ("XDG_CONFIG_HOME".into(), "".into())]));
-        let paths = PathPolicy::from_env("app", &env).unwrap();
-        assert_eq!(paths.config_dir, PathBuf::from("app"));
-        assert_eq!(paths.state_dir, PathBuf::from(".local/state/app"));
+        let env = Env(HashMap::from([("APP_ROOT".into(), "".into()), ("HOME".into(), "/home/test".into())]));
+        assert!(PathPolicy::from_env("app", &env).unwrap_err().contains("root override is empty"));
+        for home in [None, Some("")] {
+            let vars = home.map(|value| HashMap::from([("HOME".into(), value.into())])).unwrap_or_default();
+            assert!(PathPolicy::from_env("app", &Env(vars)).is_err());
+        }
+        for value in ["", "relative"] {
+            let mut vars = HashMap::from([("HOME".into(), "/home/test".into())]);
+            for category in ["CONFIG", "DATA", "STATE", "CACHE"] {
+                vars.insert(format!("XDG_{category}_HOME"), value.into());
+            }
+            let paths = PathPolicy::from_env("app", &Env(vars)).unwrap();
+            assert_eq!(paths.config_dir, PathBuf::from("/home/test/.config/app"));
+            assert_eq!(paths.data_dir, PathBuf::from("/home/test/.local/share/app"));
+            assert_eq!(paths.state_dir, PathBuf::from("/home/test/.local/state/app"));
+            assert_eq!(paths.cache_dir, PathBuf::from("/home/test/.cache/app"));
+        }
+    }
+
+    // Non-UTF-8 root, HOME and XDG values survive injected OS-string lookup.
+    #[cfg(unix)]
+    #[test]
+    fn native_paths_are_lossless() {
+        use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+        struct Native(&'static str, OsString);
+        impl EnvVars for Native {
+            fn get(&self, _: &str) -> Option<String> {
+                panic!("lossy lookup")
+            }
+            fn get_os(&self, key: &str) -> Option<OsString> {
+                if key == self.0 {
+                    Some(self.1.clone())
+                } else if key == "HOME" {
+                    Some("/home/test".into())
+                } else {
+                    None
+                }
+            }
+        }
+        let native = OsString::from_vec(b"/native/\xff".to_vec());
+        for (key, suffix) in [("APP_ROOT", "config"), ("HOME", ".config/app"), ("XDG_CONFIG_HOME", "app")] {
+            let paths = PathPolicy::from_env("app", &Native(key, native.clone())).unwrap();
+            assert_eq!(paths.config_dir, PathBuf::from(&native).join(suffix));
+        }
     }
 }
