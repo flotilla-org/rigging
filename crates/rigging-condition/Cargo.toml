@@ -1,0 +1,25 @@
+[package]
+name = "rigging-condition"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "One condition language for flotilla and binnacle: a strict subset of CEL with a checker, a three-valued evaluator and SQLite translation"
+
+# No I/O and no project dependencies (ADR 0068 §3); it builds for
+# wasm32-unknown-unknown so binnacle's web build can take it.
+[dependencies]
+serde.workspace = true
+
+[dev-dependencies]
+# The differential oracle (§3 of the design note). Pinned exactly: it runs
+# cel-spec v0.25.3, and an upgrade is a deliberate change that reruns the corpus.
+cel = { version = "=0.15.0", default-features = false, features = ["chrono"] }
+chrono = { version = "0.4", default-features = false, features = ["alloc"] }
+hegeltest.workspace = true
+rusqlite = { version = "0.41", features = ["bundled"] }
+serde_json = "1"
+
+[lints]
+workspace = true
