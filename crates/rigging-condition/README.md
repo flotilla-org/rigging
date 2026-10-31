@@ -83,8 +83,14 @@ consumer with address fields should set it to its canonical-address check.
 
 Declared variables (`row.convoy`, `param.limit`, `revision`) appear only on
 the right. `bind` substitutes them as literals, checking the value's type;
-evaluating a condition with a variable still unbound panics, since that is the
-consumer's bug, and `to_sql` reports it as `SqlError::UnboundVariable`.
+`evaluate` panics on a variable still unbound, since that is the consumer's
+bug; `try_evaluate` returns it as an error instead, and is the one to call
+where a panic is unwelcome, such as the wasm build. `to_sql` reports it as
+`SqlError::UnboundVariable`.
+
+`Checked::new` also applies the parser's limits to a tree built in code,
+and refuses one more than 32 levels deep, so evaluation, translation and
+printing never recurse without a bound.
 
 ## Evaluation
 

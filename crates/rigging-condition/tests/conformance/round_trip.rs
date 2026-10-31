@@ -1,7 +1,10 @@
 //! The canonical printer and the strict parser are inverses (§4.7).
 
 use hegel::{TestCase, generators as gs};
-use rigging_condition::{Condition, Duration, Field, Literal, Operand, ParseError, ParseErrorKind, Path, Relop, Timestamp, Variable};
+use rigging_condition::{
+    CheckError, Checked, Condition, Duration, Field, Limit, Literal, Operand, ParseError, ParseErrorKind, Path, Relop, Schema, Timestamp,
+    Variable,
+};
 
 // Segments that cover each printing rule: plain selectors, keywords and
 // reserved words (backticked), names that are only escaped identifiers, and
@@ -148,5 +151,20 @@ fn strict_parse_of_print_is_identity(tc: TestCase) {
             let term = if matches!(ast, Condition::Or(_)) { Condition::Not(Box::new(ast)) } else { ast };
             Condition::And(vec![Condition::Or(vec![term, Condition::Bool(true)]), Condition::Bool(true)])
         };
+    }
+}
+
+// Behaviour: a hand-built tree too deep for the parser's counts to see (a
+// same-kind `&&` chain prints flat) is refused as a limit before anything
+// recurses over it, and so is a deep `!` chain. The depth is one that the
+// derived `Drop` survives but the printer and checker would not.
+#[test]
+fn deep_hand_built_trees_are_refused() {
+    for and in [true, false] {
+        let mut tree = Condition::Bool(true);
+        for _ in 0..5_000 {
+            tree = if and { Condition::And(vec![Condition::Bool(true), tree]) } else { Condition::Not(Box::new(tree)) };
+        }
+        assert_eq!(Checked::new(tree, &Schema::new()).err(), Some(CheckError::Limit(Limit::Depth)));
     }
 }

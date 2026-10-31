@@ -120,8 +120,8 @@ impl Checked<Condition> {
     /// [`evaluate`](Self::evaluate) without the panic: the first unbound
     /// variable, if any is left, instead of a truth value.
     pub fn try_evaluate(&self, row: &impl Row) -> Result<Truth, Variable> {
-        match self.unbound().into_iter().next() {
-            Some(variable) => Err(variable),
+        match first_unbound(self) {
+            Some(variable) => Err(variable.clone()),
             None => Ok(evaluate(self, row)),
         }
     }
@@ -180,6 +180,22 @@ fn evaluate(condition: &Condition, row: &impl Row) -> Truth {
                 _ => Truth::U,
             })
         }
+    }
+}
+
+fn first_unbound(condition: &Condition) -> Option<&Variable> {
+    fn variable(operand: &Operand) -> Option<&Variable> {
+        match operand {
+            Operand::Variable(variable) => Some(variable),
+            Operand::Literal(_) => None,
+        }
+    }
+    match condition {
+        Condition::And(terms) | Condition::Or(terms) => terms.iter().find_map(first_unbound),
+        Condition::Not(inner) => first_unbound(inner),
+        Condition::Compare { operand, .. } | Condition::Under { prefix: operand, .. } => variable(operand),
+        Condition::In { list, .. } => list.iter().find_map(variable),
+        Condition::Has(_) | Condition::Member { .. } | Condition::Field(_) | Condition::Bool(_) => None,
     }
 }
 

@@ -20,6 +20,9 @@ pub const MAX_TERMS: usize = 32;
 pub const MAX_LIST_ELEMENTS: usize = 32;
 /// At most this many nested parentheses or `!`.
 pub const MAX_NESTING: usize = 12;
+/// At most this many levels in a tree built by hand. A parsed tree is at most
+/// `2 * MAX_NESTING + 2` deep, so the parser never meets this limit.
+pub const MAX_DEPTH: usize = 32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Mode {
@@ -54,6 +57,8 @@ pub enum Limit {
     ListElements,
     Nesting,
     Segments,
+    /// Only for trees built by hand: more than [`MAX_DEPTH`] levels.
+    Depth,
 }
 
 impl ParseError {
@@ -80,6 +85,7 @@ impl fmt::Display for ParseError {
                     Limit::ListElements => format!("more than {MAX_LIST_ELEMENTS} list elements"),
                     Limit::Nesting => format!("more than {MAX_NESTING} nested parentheses or !"),
                     Limit::Segments => format!("more than {MAX_SEGMENTS} segments in a name"),
+                    Limit::Depth => format!("more than {MAX_DEPTH} levels in the tree"),
                 };
                 write!(f, "{what} at byte {}", self.offset)
             }
@@ -697,10 +703,24 @@ impl Condition {
     /// refuses it, so evaluation, translation and printing stay bounded.
     /// When several limits are crossed, it names the one the parser meets first.
     pub fn check_limits(&self) -> Result<(), Limit> {
+        // First, before anything recurses without a bound: the tree's own depth.
+        within_depth(self, MAX_DEPTH)?;
         if self.to_string().len() > MAX_TEXT_BYTES {
             return Err(Limit::TextBytes);
         }
         check_nesting(self, 0)
+    }
+}
+
+/// Refuses a tree more than `budget` nodes deep. Recursion here is bounded by
+/// the budget, so a hostile hand-built tree (a long `And(And(…))` chain,
+/// which the nesting count treats as flat) cannot exhaust the stack.
+fn within_depth(condition: &Condition, budget: usize) -> Result<(), Limit> {
+    let Some(budget) = budget.checked_sub(1) else { return Err(Limit::Depth) };
+    match condition {
+        Condition::And(terms) | Condition::Or(terms) => terms.iter().try_for_each(|term| within_depth(term, budget)),
+        Condition::Not(inner) => within_depth(inner, budget),
+        _ => Ok(()),
     }
 }
 
