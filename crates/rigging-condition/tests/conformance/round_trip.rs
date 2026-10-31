@@ -1,7 +1,7 @@
 //! The canonical printer and the strict parser are inverses (§4.7).
 
 use hegel::{TestCase, generators as gs};
-use rigging_condition::{Condition, Duration, Field, Literal, Operand, Path, Relop, Timestamp, Variable};
+use rigging_condition::{Condition, Duration, Field, Literal, Operand, ParseError, ParseErrorKind, Path, Relop, Timestamp, Variable};
 
 // Segments that cover each printing rule: plain selectors, keywords and
 // reserved words (backticked), names that are only escaped identifiers, and
@@ -77,6 +77,15 @@ fn operand(tc: &TestCase) -> Operand {
     }
 }
 
+/// A short length from `min`, or now and then 32 or 33, either side of the limit.
+fn length(tc: &TestCase, min: usize) -> usize {
+    if tc.draw(gs::weighted_booleans(0.15)) {
+        tc.draw(gs::integers::<usize>().min_value(32).max_value(33))
+    } else {
+        tc.draw(gs::integers::<usize>().min_value(min).max_value(4))
+    }
+}
+
 /// A condition in the parser's normal form (n-ary nodes never directly hold
 /// their own kind), at most `depth` connectives deep. Each connective adds at
 /// most two to the parser's nesting count, so depth 4 stays inside the limit.
@@ -90,7 +99,7 @@ fn condition(tc: &TestCase, depth: usize) -> Condition {
             operand: operand(tc),
         },
         2 => {
-            let len = tc.draw(gs::integers::<usize>().max_value(4));
+            let len = length(tc, 0);
             Condition::In { field: field(tc), list: (0..len).map(|_| operand(tc)).collect() }
         }
         3 => Condition::Member { key: string(tc), field: field(tc) },
@@ -100,7 +109,9 @@ fn condition(tc: &TestCase, depth: usize) -> Condition {
         7 => Condition::Not(Box::new(condition(tc, depth - 1))),
         kind => {
             let and = kind == 8;
-            let len = tc.draw(gs::integers::<usize>().min_value(2).max_value(4));
+            let len = length(tc, 2);
+            // A run long enough to cross the term limit holds only leaves.
+            let depth = if len > 4 { 1 } else { depth };
             let terms = (0..len)
                 .map(|_| match condition(tc, depth - 1) {
                     Condition::And(inner) if and => Condition::Not(Box::new(Condition::And(inner))),
@@ -113,11 +124,29 @@ fn condition(tc: &TestCase, depth: usize) -> Condition {
     }
 }
 
-// Behaviour (§4.7): print-then-parse returns exactly the AST, so the strict
-// parser accepts every canonical print and nothing is lost in printing.
+// Behaviour (§4.7, §4.2): print-then-parse returns exactly the AST, so the
+// strict parser accepts every canonical print and nothing is lost in
+// printing; and `check_limits`, which `Checked::new` applies to trees built
+// by hand, refuses exactly the trees whose print the parser refuses for a limit.
 #[hegel::test(test_cases = 500)]
 fn strict_parse_of_print_is_identity(tc: TestCase) {
-    let ast = condition(&tc, 4);
-    let text = ast.to_string();
-    assert_eq!(Condition::parse_strict(&text), Ok(ast), "{text}");
+    // The tree under 0 to 13 wrappings, each adding one or two to the nesting
+    // count, so some wrapping is the first to cross the limit of 12: `!`
+    // (two, or one over a field, has or under), or `(… || true) && true`
+    // (one), which mixes the parities.
+    let mut ast = condition(&tc, 4);
+    for _ in 0..=13 {
+        let text = ast.to_string();
+        match (ast.check_limits(), Condition::parse_strict(&text)) {
+            (Ok(()), parsed) => assert_eq!(parsed.as_ref(), Ok(&ast), "{text}"),
+            (Err(limit), Err(ParseError { kind: ParseErrorKind::Limit(parsed), .. })) => assert_eq!(limit, parsed, "{text}"),
+            (Err(limit), parsed) => panic!("check_limits gave {limit:?}, the parser {parsed:?}: {text}"),
+        }
+        ast = if tc.draw(gs::booleans()) {
+            Condition::Not(Box::new(ast))
+        } else {
+            let term = if matches!(ast, Condition::Or(_)) { Condition::Not(Box::new(ast)) } else { ast };
+            Condition::And(vec![Condition::Or(vec![term, Condition::Bool(true)]), Condition::Bool(true)])
+        };
+    }
 }

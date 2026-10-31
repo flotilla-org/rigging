@@ -91,6 +91,11 @@ pub fn run(case: &Case, checked: &Checked<Condition>) {
         let entry = match (ty, declared.as_str()) {
             (_, Some("none")) => continue,
             (_, Some("interned")) => Storage::Interned { name: format!("c{i}") },
+            // A store's bug: a template with no parameter slot.
+            (_, Some("bad-template")) => {
+                columns.insert(path.clone(), Column::List { member: "1".into() });
+                continue;
+            }
             (Type::List(_), _) => Storage::List { table: format!("l{i}") },
             (Type::Map(_), _) => Storage::Map { table: format!("m{i}"), codes },
             _ => Storage::Cell { name: format!("c{i}"), codes },

@@ -17,6 +17,11 @@ use crate::{
 };
 
 /// How the store holds each field it can filter on.
+///
+/// Every string in a [`Column`] and an [`InternTable`] is spliced into the
+/// SQL as written: it is trusted SQL that the store wrote, and must never be
+/// built from user input. Only condition literals are user input, and they
+/// are always parameters.
 pub trait ColumnMap {
     fn column(&self, path: &Path) -> Option<Column>;
 }
@@ -78,6 +83,8 @@ pub enum SqlError {
     Unsupported {
         at: String,
     },
+    /// A `List` or `Map` template without exactly one `{}`: the store's bug.
+    BadTemplate(Path),
 }
 
 impl SqlError {
@@ -87,6 +94,7 @@ impl SqlError {
             SqlError::UnboundVariable(_) => "unbound-variable",
             SqlError::MissingCode { .. } => "missing-code",
             SqlError::Unsupported { .. } => "unsupported",
+            SqlError::BadTemplate(_) => "bad-template",
         }
     }
 }
@@ -98,6 +106,7 @@ impl fmt::Display for SqlError {
             SqlError::UnboundVariable(variable) => write!(f, "variable {variable} is unbound"),
             SqlError::MissingCode { field, value } => write!(f, "{field} has no stored code for {value:?}"),
             SqlError::Unsupported { at } => write!(f, "{at} cannot be translated for this column"),
+            SqlError::BadTemplate(path) => write!(f, "the column template for {path} must hold exactly one {{}}"),
         }
     }
 }
@@ -186,14 +195,8 @@ impl<C: ColumnMap> Translator<'_, C> {
                 }
             },
             Condition::Member { key, field } => match (&field.key, self.column(&field.path)?) {
-                (None, Column::List { member }) => {
-                    let param = self.param(Param::Text(key.clone()));
-                    member.replace("{}", &param)
-                }
-                (None, Column::Map { lookup, .. }) => {
-                    let param = self.param(Param::Text(key.clone()));
-                    format!("({}) IS NOT NULL", lookup.replace("{}", &param))
-                }
+                (None, Column::List { member }) => self.fill(&field.path, &member, key)?,
+                (None, Column::Map { lookup, .. }) => format!("({}) IS NOT NULL", self.fill(&field.path, &lookup, key)?),
                 _ => return Err(unsupported()),
             },
             Condition::Under { field, prefix } => match self.scalar(field)? {
@@ -218,11 +221,19 @@ impl<C: ColumnMap> Translator<'_, C> {
             (None, Column::Value { expr, codes }) => Scalar::Value { expr, codes },
             (None, Column::Interned { expr, strings }) => Scalar::Interned { expr, strings },
             (Some(key), Column::Map { lookup, codes }) => {
-                let param = self.param(Param::Text(key.clone()));
-                Scalar::Value { expr: format!("({})", lookup.replace("{}", &param)), codes }
+                Scalar::Value { expr: format!("({})", self.fill(&field.path, &lookup, key)?), codes }
             }
             _ => return Err(unsupported()),
         })
+    }
+
+    /// A child-table template with its one `{}` replaced by a parameter for `key`.
+    fn fill(&mut self, path: &Path, template: &str, key: &str) -> Result<String, SqlError> {
+        if template.matches("{}").count() != 1 {
+            return Err(SqlError::BadTemplate(path.clone()));
+        }
+        let param = self.param(Param::Text(key.to_owned()));
+        Ok(template.replace("{}", &param))
     }
 
     /// An interned cell tested against strings matching `test`. SQLite gives

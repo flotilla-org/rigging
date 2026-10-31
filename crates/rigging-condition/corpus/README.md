@@ -33,7 +33,8 @@ crate. `corpus.json` is plain JSON with one case per line.
   flotilla's canonical-address validation.
 - `storage`: for SQL cases, per field: `"interned"` (the cell holds an id in
   `strings(id, domain, s)` with `UNIQUE(domain, s)`, domain `ad`), `{"codes":
-  {value: code}}` for an enum, or `"none"` (the store has no column for it).
+  {value: code}}` for an enum, `"none"` (the store has no column for it), or
+  `"bad-template"` (a list whose template has no `{}`, a store bug).
   Other scalars are an indexed cell in table `t`; lists and maps are child
   tables. Columns are named `c<i>` by the field's position in path order.
 
@@ -51,7 +52,7 @@ A case's `schema` is a schema's name or an inline schema.
 - Exactly one of these errors, or none:
   - `parse_error`: `syntax`, `literal`, `limit` or `not-canonical`;
   - `check_error`: `unknown-field`, `unknown-variable`, `variable-as-field`,
-    `type-mismatch`, `ordering`, `invalid-literal` or `empty-list`;
+    `type-mismatch`, `ordering`, `invalid-literal`, `empty-list` or `limit`;
   - `bind_error`: `unknown-variable`, `type-mismatch` or `invalid-literal`.
 - `bindings`: variable text to a value, bound before evaluation.
 - `rows`: each `{"values": {path: value}, "unknown": [path], "expect": "T" | "F" | "U", "reason": text | null}`.
@@ -61,7 +62,7 @@ A case's `schema` is a schema's name or an inline schema.
   canonical text of the first top-level conjunct that is not T, or `null`.
 - `sql`: run against in-memory SQLite, which must keep exactly the rows that
   expect T. It may hold `error` (`unknown-column`, `unbound-variable`,
-  `missing-code` or `unsupported`), `text` (the exact SQL) and `plan` (the
+  `missing-code`, `unsupported` or `bad-template`), `text` (the exact SQL) and `plan` (the
   `detail` lines of `EXPLAIN QUERY PLAN SELECT id FROM t WHERE …`, from the
   bundled SQLite of the pinned `rusqlite`). SQL rows have no unknown fields.
 

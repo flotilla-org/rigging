@@ -232,6 +232,7 @@
     {"name": "bind/type", "schema": "cr", "input": "`head-sha` == revision", "bindings": {"revision": 3}, "bind_error": "type-mismatch"},
     {"name": "bind/address", "schema": "cr", "input": "vessel.under(row.convoy)", "bindings": {"row.convoy": "Not An Address"}, "bind_error": "invalid-literal"},
     {"name": "bind/unbound-in-sql", "schema": "cr", "input": "`head-sha` == revision", "rows": [], "sql": {"error": "unbound-variable"}},
+    {"name": "sql/bad-template", "schema": {"fields": {"labels": {"type": {"list": "string"}}}, "storage": {"labels": "bad-template"}}, "input": "\"k\" in labels", "rows": [], "sql": {"error": "bad-template"}},
     {"name": "hostile/escaped-name", "schema": "cr", "input": "`a OR 1-1 --` == 1", "rows": [{"values": {"`a OR 1-1 --`": 1}, "expect": "T"}, {"values": {"`a OR 1-1 --`": 2}, "expect": "F"}], "sql": {"text": "t.c0 = ?1"}},
     {"name": "hostile/no-column", "schema": "cr", "input": "`x/../y` == 1", "rows": [{"values": {"`x/../y`": 1}, "expect": "T"}], "sql": {"error": "unknown-column"}},
     {"name": "hostile/quote", "schema": "cr", "input": "`a\" OR 1=1 --` == 1", "parse_error": "syntax", "lenient": true},

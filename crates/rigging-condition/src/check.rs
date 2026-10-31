@@ -229,6 +229,8 @@ pub enum CheckError {
     EmptyList {
         at: String,
     },
+    /// A tree built by hand that is over the parser's limits.
+    Limit(crate::syntax::Limit),
 }
 
 impl CheckError {
@@ -242,6 +244,7 @@ impl CheckError {
             CheckError::OrderingNotAllowed { .. } => "ordering",
             CheckError::InvalidLiteral { .. } => "invalid-literal",
             CheckError::EmptyList { .. } => "empty-list",
+            CheckError::Limit(_) => "limit",
         }
     }
 }
@@ -256,6 +259,7 @@ impl fmt::Display for CheckError {
             CheckError::OrderingNotAllowed { at, ty } => write!(f, "{at}: {ty} has no ordering"),
             CheckError::InvalidLiteral { at, reason } => write!(f, "{at}: {reason}"),
             CheckError::EmptyList { at } => write!(f, "{at}: in needs a non-empty list"),
+            CheckError::Limit(limit) => write!(f, "over the {limit:?} limit"),
         }
     }
 }
@@ -334,6 +338,7 @@ impl<T> Checked<T> {
 impl Checked<Condition> {
     /// Checks `condition` against `schema` (§4.3).
     pub fn new(condition: Condition, schema: &Schema) -> Result<Self, CheckError> {
+        condition.check_limits().map_err(CheckError::Limit)?;
         check(&condition, schema)?;
         Ok(Checked { value: condition, schema: schema.clone() })
     }

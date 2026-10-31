@@ -688,6 +688,60 @@ impl<'a> Parser<'a> {
     }
 }
 
+// ---------------------------------------------------------------- limits
+
+impl Condition {
+    /// Whether the condition is within the limits, counted on its canonical
+    /// print as the parser counts them. Parsed conditions always are; a tree
+    /// built by hand may not be, and [`Checked::new`](crate::Checked::new)
+    /// refuses it, so evaluation, translation and printing stay bounded.
+    /// When several limits are crossed, it names the one the parser meets first.
+    pub fn check_limits(&self) -> Result<(), Limit> {
+        if self.to_string().len() > MAX_TEXT_BYTES {
+            return Err(Limit::TextBytes);
+        }
+        check_nesting(self, 0)
+    }
+}
+
+/// Terms of an n-ary node once nested nodes of its own kind are flattened, as
+/// parsing its print would flatten them.
+fn flat_terms(condition: &Condition) -> usize {
+    match condition {
+        Condition::And(terms) => terms.iter().map(|t| if matches!(t, Condition::And(_)) { flat_terms(t) } else { 1 }).sum(),
+        Condition::Or(terms) => terms.iter().map(|t| if matches!(t, Condition::Or(_)) { flat_terms(t) } else { 1 }).sum(),
+        _ => 1,
+    }
+}
+
+/// `depth` is the count of `!` and `(` the parser has entered at this node.
+fn check_nesting(condition: &Condition, depth: usize) -> Result<(), Limit> {
+    let deeper = |depth: usize| if depth >= MAX_NESTING { Err(Limit::Nesting) } else { Ok(depth + 1) };
+    match condition {
+        Condition::And(terms) | Condition::Or(terms) => {
+            // The parser reads every term of a run before counting the run.
+            let and = matches!(condition, Condition::And(_));
+            terms.iter().try_for_each(|term| {
+                let parenthesised = and && matches!(term, Condition::Or(_));
+                check_nesting(term, if parenthesised { deeper(depth)? } else { depth })
+            })?;
+            if flat_terms(condition) > MAX_TERMS {
+                return Err(Limit::Terms);
+            }
+            Ok(())
+        }
+        Condition::Not(inner) => {
+            let depth = deeper(depth)?;
+            match **inner {
+                Condition::Field(_) | Condition::Has(_) | Condition::Under { .. } => check_nesting(inner, depth),
+                _ => check_nesting(inner, deeper(depth)?),
+            }
+        }
+        Condition::In { list, .. } if list.len() > MAX_LIST_ELEMENTS => Err(Limit::ListElements),
+        _ => Ok(()),
+    }
+}
+
 // ---------------------------------------------------------------- printer
 
 /// Writes `s` double-quoted, escaped exactly as `serde_json` prints it.

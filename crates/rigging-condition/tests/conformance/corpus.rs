@@ -210,6 +210,10 @@ fn corpus() {
             (None, Outcome::Error(stage, message)) => panic!("{}: unexpected {stage} {message}", case.name),
             (None, Outcome::Checked(checked)) => {
                 let types = field_types(&case.schema);
+                // A variable left unbound is refused, never read as U.
+                if let Some(variable) = checked.unbound().into_iter().next() {
+                    assert_eq!(checked.try_evaluate(&Values::default()), Err(variable), "{}", case.name);
+                }
                 for (i, row_json) in case.json["rows"].as_array().into_iter().flatten().enumerate() {
                     let row = row(&types, row_json);
                     assert_eq!(checked.evaluate(&row), truth(&row_json["expect"]), "{} row {i}", case.name);

@@ -3,7 +3,7 @@
 use std::{borrow::Cow, cmp::Ordering, collections::BTreeMap};
 
 use crate::{
-    ast::{Condition, Field, Literal, Operand, Path},
+    ast::{Condition, Field, Literal, Operand, Path, Variable},
     check::Checked,
     time::{Duration, Timestamp},
 };
@@ -114,7 +114,16 @@ impl Checked<Condition> {
     /// If a variable is still unbound: binding is the consumer's job, and an
     /// unbound variable at evaluation time is a bug, not U (§4.3).
     pub fn evaluate(&self, row: &impl Row) -> Truth {
-        evaluate(self, row)
+        self.try_evaluate(row).unwrap_or_else(|variable| panic!("variable {variable} is unbound; bind it before evaluating"))
+    }
+
+    /// [`evaluate`](Self::evaluate) without the panic: the first unbound
+    /// variable, if any is left, instead of a truth value.
+    pub fn try_evaluate(&self, row: &impl Row) -> Result<Truth, Variable> {
+        match self.unbound().into_iter().next() {
+            Some(variable) => Err(variable),
+            None => Ok(evaluate(self, row)),
+        }
     }
 
     /// The first top-level conjunct that is not T, as the reason a condition
