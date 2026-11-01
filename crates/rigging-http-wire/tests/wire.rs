@@ -77,14 +77,17 @@ fn exclusions_override_wildcards_in_any_order(tc: hegel::TestCase) {
     assert_eq!(chosen, expected, "Accept {ranges:?} over {allowed:?}");
 }
 
-// The highest quality wins over list order, ties go to the earlier type, an empty Accept
-// takes the first, and a quality outside 0..=1 or not a number is refused.
+// The highest quality wins over list order, ties go to the earlier type, an Accept with no
+// ranges takes the first, and a quality outside 0..=1 or not a number is refused.
 #[test]
 fn quality_ordering_and_invalid_qualities() {
     let media = ["application/json", "application/cbor"];
     assert_eq!(negotiate("application/json;q=0.4, application/cbor;q=0.5", &media), Ok(1));
     assert_eq!(negotiate("application/cbor, application/json", &media), Ok(0));
     assert_eq!(negotiate("", &media), Ok(0));
+    // Empty list elements are skipped; a header of only empty elements has no ranges.
+    assert_eq!(negotiate(" , application/cbor,, ", &media), Ok(1));
+    assert_eq!(negotiate(",", &media), Ok(0));
     for quality in ["no", "NaN", "inf", "1.5", "-0.1"] {
         assert_eq!(negotiate(&format!("application/json;q={quality}"), &media), Err(NotAcceptable::InvalidQuality));
     }

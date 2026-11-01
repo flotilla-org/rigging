@@ -60,14 +60,14 @@ pub fn accept(headers: &HeaderMap) -> Result<&str, NotAcceptable> {
 ///
 /// For each allowed type the most specific matching range sets its quality, so
 /// `application/json;q=0, */*` excludes JSON while accepting everything else. The highest
-/// quality wins and ties go to the earlier type. An empty `accept` picks the first.
+/// quality wins and ties go to the earlier type. An `accept` with no ranges picks the first.
 ///
 /// Qualities are read leniently, as any number from 0 to 1 (`.5` and `1e0` are accepted
 /// where RFC 9110 writes `0.5` and `1`), but one that is not a number refuses the whole
 /// header, even when another range would match: a client that cannot write `Accept`
 /// learns so rather than getting a guess.
 pub fn negotiate(accept: &str, allowed: &[&str]) -> Result<usize, NotAcceptable> {
-    if accept.trim().is_empty() {
+    if media_ranges(accept).next().is_none() {
         return Ok(0);
     }
     let mut candidates = vec![None::<(u8, f32)>; allowed.len()];
@@ -101,9 +101,10 @@ pub fn negotiate(accept: &str, allowed: &[&str]) -> Result<usize, NotAcceptable>
 }
 
 /// Each range of an `Accept` value: its lowercase media type and its raw `q` parameter.
+/// Empty list elements (`a, , b,`) are skipped, as RFC 9110 §5.6.1 requires of a recipient.
 /// [`negotiate`] and [`Encoding::for_errors`] read ranges only through this.
 fn media_ranges(accept: &str) -> impl Iterator<Item = (String, Option<&str>)> {
-    accept.split(',').map(|entry| {
+    accept.split(',').filter(|entry| !entry.trim().is_empty()).map(|entry| {
         let mut parts = entry.trim().split(';');
         let media = parts.next().unwrap_or_default().trim().to_ascii_lowercase();
         let quality =
