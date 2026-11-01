@@ -50,6 +50,14 @@ parsed to. So `parse_strict(print(ast)) == ast`, and canonical text is the one
 spelling for storage, interned keys and the wire. `Condition` serializes with
 serde as that text.
 
+Erratum against the note: its grammar has `Unary = "!" Atom`, and an atom
+can be a whole comparison, so `!` takes the comparison after it. The parser
+follows the note: `!count == 1` is `!(count == 1)`, where CEL reads
+`(!count) == 1`, a type error for an int. For a bool field the two readings
+agree (`!draft == true` either way). Canonical text never meets this, since
+`!` before anything but a field, `has(…)` or `under(…)` prints with
+parentheses.
+
 Canonical text (§4.7): one space around binary operators, none after `!`;
 strings double-quoted with `serde_json`'s escaping; floats as Rust's `{:?}`
 (`1e21`, `1e-7`, `0.0` for `-0.0`); `timestamp("…Z")` in UTC and
@@ -57,6 +65,13 @@ strings double-quoted with `serde_json`'s escaping; floats as Rust's `{:?}`
 identifier and backticked otherwise; `&&` and `||` n-ary, an `||` inside `&&`
 parenthesised, and `!` followed by parentheses unless its operand is a field,
 `has(…)` or an `under` call. Nothing is reordered.
+
+Canonical text is CEL as written, with backticked identifiers enabled
+(cel-go's `EnableIdentEscapeSyntax`), with two exceptions. CEL escapes only a
+selected field, so a path whose first segment needs backticks
+(`` `updated-at` ``) is not CEL, and CEL's `has` takes a selection, so
+`has(state)` is not. Both read as CEL once the row is one map `r`
+(`` r.`updated-at` ``, `has(r.state)`), which is how the oracle runs them.
 
 The parser enforces CEL's minimum limits before any schema is read: 32 terms
 in one `&&` or `||` run (after flattening), 32 list elements, 12 nested
@@ -90,7 +105,10 @@ where a panic is unwelcome, such as the wasm build. `to_sql` reports it as
 
 `Checked::new` also applies the parser's limits to a tree built in code,
 and refuses one more than 32 levels deep, so evaluation, translation and
-printing never recurse without a bound.
+printing never recurse without a bound. It refuses an `&&` or `||` of fewer
+than two terms, or one directly holding another of its kind (`shape`): the
+parser never builds these, and their print parses to a different tree. So
+every checked condition has canonical text that parses back to it.
 
 ## Evaluation
 
@@ -106,6 +124,7 @@ Kleene tables. What U means is the consumer's decision (§4.5).
 
 `first_failing` gives the first top-level conjunct that is not T, or the whole
 condition when it is not a conjunction: the reason a verb's `when` failed.
+Like `evaluate`, it panics on a variable still unbound.
 
 ## SQL
 
@@ -134,9 +153,13 @@ maps in child tables are never absent: no elements is empty.
 - every case through the parsers, printer, checker and evaluator;
 - SQL-marked cases against in-memory SQLite, including the pinned query plans;
 - every case without unknown fields through the `cel` crate (0.15.0, which runs
-  cel-spec v0.25.3), with its error read as U: the differential oracle of §3;
+  cel-spec v0.25.3), with its error read as U: the differential oracle of §3.
+  The program is the canonical text itself, but for the two exceptions above;
 - a Hegel property that strict-parsing the canonical print of a generated AST
-  gives the AST back.
+  gives the AST back, and that the limit and shape checks refuse exactly the
+  trees for which it does not;
+- Hegel properties that timestamp parsing and printing agree with `chrono`
+  over CEL's whole range.
 
 The `cel` and `rusqlite` crates are dev-dependencies only.
 
@@ -147,3 +170,6 @@ Field-to-field comparison, arithmetic, string functions, more macros and
 construct with an exact SQLite and SPARQL mapping and corpus cases;
 `Condition`, `Literal`, `Type` and the error enums are `#[non_exhaustive]` for
 that.
+
+Evaluation walks the checked AST; a compiled form can come behind the same
+API when a hot path needs it, checked against the same corpus.

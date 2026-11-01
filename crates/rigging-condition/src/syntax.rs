@@ -31,33 +31,44 @@ pub(crate) enum Mode {
 }
 
 /// A refusal from the parser, with the byte offset it refers to.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("{kind} at byte {offset}")]
 pub struct ParseError {
     pub kind: ParseErrorKind,
     pub offset: usize,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum ParseErrorKind {
     /// Not a condition in the subset.
+    #[error("{0}")]
     Syntax(String),
     /// A string, number, timestamp or duration literal that does not parse.
+    #[error("{0}")]
     Literal(String),
     /// Over one of the limits.
+    #[error("{0}")]
     Limit(Limit),
     /// Strict parsing: the text parses, but is not the canonical spelling.
+    #[error("not canonical text; the canonical spelling is {canonical}")]
     NotCanonical { canonical: String },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum Limit {
+    #[error("more than {MAX_TEXT_BYTES} bytes of text")]
     TextBytes,
+    #[error("more than {MAX_TERMS} terms in one && or || run")]
     Terms,
+    #[error("more than {MAX_LIST_ELEMENTS} list elements")]
     ListElements,
+    #[error("more than {MAX_NESTING} nested parentheses or !")]
     Nesting,
+    #[error("more than {MAX_SEGMENTS} segments in a name")]
     Segments,
     /// Only for trees built by hand: more than [`MAX_DEPTH`] levels.
+    #[error("more than {MAX_DEPTH} levels in the tree")]
     Depth,
 }
 
@@ -73,28 +84,6 @@ impl ParseError {
         }
     }
 }
-
-impl fmt::Display for ParseError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.kind {
-            ParseErrorKind::Syntax(message) | ParseErrorKind::Literal(message) => write!(f, "{message} at byte {}", self.offset),
-            ParseErrorKind::Limit(limit) => {
-                let what = match limit {
-                    Limit::TextBytes => format!("more than {MAX_TEXT_BYTES} bytes of text"),
-                    Limit::Terms => format!("more than {MAX_TERMS} terms in one && or || run"),
-                    Limit::ListElements => format!("more than {MAX_LIST_ELEMENTS} list elements"),
-                    Limit::Nesting => format!("more than {MAX_NESTING} nested parentheses or !"),
-                    Limit::Segments => format!("more than {MAX_SEGMENTS} segments in a name"),
-                    Limit::Depth => format!("more than {MAX_DEPTH} levels in the tree"),
-                };
-                write!(f, "{what} at byte {}", self.offset)
-            }
-            ParseErrorKind::NotCanonical { canonical } => write!(f, "not canonical text; the canonical spelling is {canonical}"),
-        }
-    }
-}
-
-impl std::error::Error for ParseError {}
 
 // ---------------------------------------------------------------- lexer
 
@@ -703,7 +692,6 @@ impl Condition {
     /// refuses it, so evaluation, translation and printing stay bounded.
     /// When several limits are crossed, it names the one the parser meets first.
     pub fn check_limits(&self) -> Result<(), Limit> {
-        // First, before anything recurses without a bound: the tree's own depth.
         within_depth(self, MAX_DEPTH)?;
         if self.to_string().len() > MAX_TEXT_BYTES {
             return Err(Limit::TextBytes);

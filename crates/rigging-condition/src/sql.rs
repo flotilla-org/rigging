@@ -9,7 +9,7 @@
 //! gives NULL exactly where the evaluator gives U, so a `WHERE` keeps exactly
 //! the rows that evaluate to T.
 
-use std::{collections::BTreeMap, fmt};
+use std::collections::BTreeMap;
 
 use crate::{
     ast::{Condition, Field, Literal, Operand, Path, Relop, Variable},
@@ -67,23 +67,23 @@ pub enum Param {
     Text(String),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum SqlError {
     /// The store cannot filter on this field.
+    #[error("no column for {0}")]
     UnknownColumn(Path),
+    #[error("variable {0} is unbound")]
     UnboundVariable(Variable),
     /// An enum value with no stored code.
-    MissingCode {
-        field: Path,
-        value: String,
-    },
+    #[error("{field} has no stored code for {value:?}")]
+    MissingCode { field: Path, value: String },
     /// A form the column's storage cannot express, such as ordering on an
     /// interned column or a list used as a scalar.
-    Unsupported {
-        at: String,
-    },
+    #[error("{at} cannot be translated for this column")]
+    Unsupported { at: String },
     /// A `List` or `Map` template without exactly one `{}`: the store's bug.
+    #[error("the column template for {0} must hold exactly one {{}}")]
     BadTemplate(Path),
 }
 
@@ -98,20 +98,6 @@ impl SqlError {
         }
     }
 }
-
-impl fmt::Display for SqlError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            SqlError::UnknownColumn(path) => write!(f, "no column for {path}"),
-            SqlError::UnboundVariable(variable) => write!(f, "variable {variable} is unbound"),
-            SqlError::MissingCode { field, value } => write!(f, "{field} has no stored code for {value:?}"),
-            SqlError::Unsupported { at } => write!(f, "{at} cannot be translated for this column"),
-            SqlError::BadTemplate(path) => write!(f, "the column template for {path} must hold exactly one {{}}"),
-        }
-    }
-}
-
-impl std::error::Error for SqlError {}
 
 impl Checked<Condition> {
     /// SQLite `WHERE` text and its parameters, in order: the text names them

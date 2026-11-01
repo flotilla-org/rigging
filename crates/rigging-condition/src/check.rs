@@ -105,27 +105,18 @@ impl fmt::Debug for Schema {
 }
 
 /// Why a declaration was refused.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum SchemaError {
     /// Declared twice, one path a prefix of another, or a field sharing its
     /// first segment with a variable.
+    #[error("{0} conflicts with another declaration")]
     Conflict(Path),
     /// A map or list of something other than a scalar, a list of a type that
     /// `in` cannot test, an enum with no values, or a non-scalar variable.
+    #[error("{0} cannot have type {1}")]
     InvalidType(Path, Type),
 }
-
-impl fmt::Display for SchemaError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            SchemaError::Conflict(path) => write!(f, "{path} conflicts with another declaration"),
-            SchemaError::InvalidType(path, ty) => write!(f, "{path} cannot have type {ty}"),
-        }
-    }
-}
-
-impl std::error::Error for SchemaError {}
 
 fn valid_type(ty: &Type, nested: bool) -> bool {
     match ty {
@@ -200,37 +191,38 @@ impl Schema {
 }
 
 /// Why a condition does not check against a schema.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum CheckError {
+    #[error("unknown field {0}")]
     UnknownField(Path),
+    #[error("unknown variable {0}")]
     UnknownVariable(Variable),
     /// A declared variable's name used as a field.
+    #[error("{0} names a bound variable, not a field")]
     VariableAsField(Path),
     /// A literal, variable or field of the wrong type. `at` is the canonical
     /// text of the term.
-    TypeMismatch {
-        at: String,
-        expected: String,
-        found: String,
-    },
+    #[error("{at}: expected {expected}, found {found}")]
+    TypeMismatch { at: String, expected: String, found: String },
     /// `<`, `<=`, `>` or `>=` on a bool, enum or address.
-    OrderingNotAllowed {
-        at: String,
-        ty: Type,
-    },
+    #[error("{at}: {ty} has no ordering")]
+    OrderingNotAllowed { at: String, ty: Type },
     /// A literal of the right type that is not allowed: outside an enum's
     /// set, refused by the address hook, or a non-finite float.
-    InvalidLiteral {
-        at: String,
-        reason: String,
-    },
+    #[error("{at}: {reason}")]
+    InvalidLiteral { at: String, reason: String },
     /// `f in []`.
-    EmptyList {
-        at: String,
-    },
+    #[error("{at}: in needs a non-empty list")]
+    EmptyList { at: String },
     /// A tree built by hand that is over the parser's limits.
+    #[error("{0}")]
     Limit(crate::syntax::Limit),
+    /// A tree built by hand with an `&&` or `||` of fewer than two terms, or
+    /// one directly holding another of its kind. No text parses to it, so it
+    /// has no canonical text. `at` is the node's print.
+    #[error("{at}: an && or || needs two or more terms, none of its own kind")]
+    Shape { at: String },
 }
 
 impl CheckError {
@@ -245,33 +237,20 @@ impl CheckError {
             CheckError::InvalidLiteral { .. } => "invalid-literal",
             CheckError::EmptyList { .. } => "empty-list",
             CheckError::Limit(_) => "limit",
+            CheckError::Shape { .. } => "shape",
         }
     }
 }
-
-impl fmt::Display for CheckError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            CheckError::UnknownField(path) => write!(f, "unknown field {path}"),
-            CheckError::UnknownVariable(variable) => write!(f, "unknown variable {variable}"),
-            CheckError::VariableAsField(path) => write!(f, "{path} names a bound variable, not a field"),
-            CheckError::TypeMismatch { at, expected, found } => write!(f, "{at}: expected {expected}, found {found}"),
-            CheckError::OrderingNotAllowed { at, ty } => write!(f, "{at}: {ty} has no ordering"),
-            CheckError::InvalidLiteral { at, reason } => write!(f, "{at}: {reason}"),
-            CheckError::EmptyList { at } => write!(f, "{at}: in needs a non-empty list"),
-            CheckError::Limit(limit) => write!(f, "over the {limit:?} limit"),
-        }
-    }
-}
-
-impl std::error::Error for CheckError {}
 
 /// Why [`Checked::bind`] refused a value.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum BindError {
+    #[error("{0} is not a declared variable")]
     UnknownVariable(Variable),
+    #[error("{variable} needs a {expected} value")]
     TypeMismatch { variable: Variable, expected: Type },
+    #[error("{variable}: {reason}")]
     InvalidValue { variable: Variable, reason: String },
 }
 
@@ -284,18 +263,6 @@ impl BindError {
         }
     }
 }
-
-impl fmt::Display for BindError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            BindError::UnknownVariable(variable) => write!(f, "{variable} is not a declared variable"),
-            BindError::TypeMismatch { variable, expected } => write!(f, "{variable} needs a {expected} value"),
-            BindError::InvalidValue { variable, reason } => write!(f, "{variable}: {reason}"),
-        }
-    }
-}
-
-impl std::error::Error for BindError {}
 
 /// Proof that `T` checked against a schema. For a [`Condition`], it is the
 /// only way to evaluate it or translate it to SQL.
@@ -336,9 +303,12 @@ impl<T> Checked<T> {
 }
 
 impl Checked<Condition> {
-    /// Checks `condition` against `schema` (§4.3).
+    /// Checks `condition` against `schema` (§4.3). A tree built in code must
+    /// also be within the limits and in the parser's shape (see
+    /// [`Condition::check_shape`]), so that it has canonical text.
     pub fn new(condition: Condition, schema: &Schema) -> Result<Self, CheckError> {
         condition.check_limits().map_err(CheckError::Limit)?;
+        condition.check_shape()?;
         check(&condition, schema)?;
         Ok(Checked { value: condition, schema: schema.clone() })
     }
@@ -365,6 +335,27 @@ impl Checked<Condition> {
             }
         });
         out
+    }
+}
+
+impl Condition {
+    /// Refuses an `&&` or `||` of fewer than two terms, or one directly
+    /// holding another of its kind: the shapes the parser never builds,
+    /// which print to text that parses to a different tree. Call it after
+    /// [`check_limits`](Condition::check_limits), which bounds the depth.
+    pub fn check_shape(&self) -> Result<(), CheckError> {
+        match self {
+            Condition::And(terms) | Condition::Or(terms) => {
+                let and = matches!(self, Condition::And(_));
+                let same_kind = |term: &Condition| matches!((and, term), (true, Condition::And(_)) | (false, Condition::Or(_)));
+                if terms.len() < 2 || terms.iter().any(same_kind) {
+                    return Err(CheckError::Shape { at: self.to_string() });
+                }
+                terms.iter().try_for_each(Condition::check_shape)
+            }
+            Condition::Not(inner) => inner.check_shape(),
+            _ => Ok(()),
+        }
     }
 }
 

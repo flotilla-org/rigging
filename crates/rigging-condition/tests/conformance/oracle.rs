@@ -2,27 +2,39 @@
 //! rows have no unknown fields runs through the stock `cel` crate, with its
 //! error read as U, and must agree with the corpus.
 //!
-//! The adapter follows the compatibility promise: the row is one map `r`
-//! with absent fields left out and every intermediate map of a dotted path
-//! present; enums and addresses are strings; `under` is
-//! `f == P || f.startsWith(P + "/")`. `cel` 0.15 does not parse backticked
-//! identifiers, so each field segment is renamed to `s0`, `s1`, …; a name has
-//! no meaning beyond telling fields apart.
+//! The canonical text itself is the CEL program, parsed with backticked
+//! identifiers enabled (cel-go's `EnableIdentEscapeSyntax`). The row follows
+//! the compatibility promise: each first segment is a variable, a dotted
+//! path is nested maps with every intermediate map present, absent fields are
+//! left out, and enums and addresses are strings. `under` is a function
+//! whose body is the CEL `f == p || f.startsWith(p + "/")`.
+//!
+//! Two canonical spellings are not CEL as written: a backticked first
+//! segment (CEL escapes only a selected field), and `has()` of a one-segment
+//! path (CEL's `has` takes a selection). For those the oracle reprints the
+//! condition with the row as one map `r`, each segment renamed `s0`, `s1`,
+//! …, and `under` written out.
 
 use std::{collections::HashMap, sync::Arc};
 
-use cel::{Context, Env, Value as Cel};
+use cel::{Context, Env, ExecutionError, Value as Cel, extractors::This, parser::Parser};
 use rigging_condition::{Condition, Field, Operand, Path, Type, Value};
 use serde_json::Value as Json;
 
 use crate::corpus::{Outcome, cases, field_types, row, run_front, truth};
 
-struct Names(HashMap<String, String>);
+/// Field names in the oracle's row: the segments themselves, or renamed.
+struct Names(Option<HashMap<String, String>>);
 
 impl Names {
     fn segment(&mut self, segment: &str) -> String {
-        let next = format!("s{}", self.0.len());
-        self.0.entry(segment.to_owned()).or_insert(next).clone()
+        match &mut self.0 {
+            None => segment.to_owned(),
+            Some(names) => {
+                let next = format!("s{}", names.len());
+                names.entry(segment.to_owned()).or_insert(next).clone()
+            }
+        }
     }
 
     fn path(&mut self, path: &Path) -> String {
@@ -99,7 +111,8 @@ impl Node {
     }
 }
 
-fn oracle_row(names: &mut Names, types: &std::collections::BTreeMap<Path, Type>, row: &rigging_condition::Values) -> Cel {
+/// The row's variables: one per first segment.
+fn oracle_row(names: &mut Names, types: &std::collections::BTreeMap<Path, Type>, row: &rigging_condition::Values) -> HashMap<String, Cel> {
     let mut root = Node::default();
     // Every declared path's intermediate maps exist, present or not.
     for path in types.keys() {
@@ -112,36 +125,89 @@ fn oracle_row(names: &mut Names, types: &std::collections::BTreeMap<Path, Type>,
             node.children.entry(names.segment(&segments[segments.len() - 1])).or_default().value = Some(value);
         }
     }
-    root.into_cel()
+    root.children.into_iter().map(|(k, v)| (k, v.into_cel())).collect()
 }
 
-// Behaviour (§3): over rows whose fields are present or absent, a stock CEL
+/// Whether the canonical text is CEL as written: no path starts with a
+/// backticked segment, and no `has()` takes a one-segment path.
+fn written_in_cel(condition: &Condition) -> bool {
+    let plain = |path: &Path| !path.to_string().starts_with('`');
+    match condition {
+        Condition::And(terms) | Condition::Or(terms) => terms.iter().all(written_in_cel),
+        Condition::Not(inner) => written_in_cel(inner),
+        Condition::Has(path) => plain(path) && path.segments().len() > 1,
+        Condition::Compare { field, .. }
+        | Condition::In { field, .. }
+        | Condition::Member { field, .. }
+        | Condition::Under { field, .. } => plain(&field.path),
+        Condition::Field(field) => plain(&field.path),
+        _ => true,
+    }
+}
+
+fn parse(text: &str) -> Result<cel::parser::Expression, cel::parser::ParseErrors> {
+    Parser::new().enable_ident_escape_syntax(true).parse(text)
+}
+
+// Behaviour (§3, §4.7): canonical text is CEL, but for the two spellings
+// above; and over rows whose fields are present or absent, a stock CEL
 // evaluator returns true for T, false for F and an error for U.
 #[test]
 fn cel_crate_agrees_with_the_corpus() {
     let env = Arc::new(Env::stdlib());
-    let mut compared = 0;
+    let definition = Arc::new(parse("f == p || f.startsWith(p + \"/\")").unwrap());
+    let (mut as_written, mut reprinted) = (0, 0);
     for case in cases() {
         let Outcome::Checked(checked) = run_front(&case) else { continue };
+        let canonical = checked.to_string();
+        let cel = written_in_cel(&checked);
+        let program = match (cel, parse(&canonical)) {
+            (true, Ok(program)) => Some(program),
+            (true, Err(e)) => panic!("{}: canonical text is not CEL: {canonical}: {e}", case.name),
+            (false, Ok(_)) => panic!("{}: canonical text unexpectedly CEL as written: {canonical}", case.name),
+            (false, Err(_)) => None,
+        };
         let types = field_types(&case.schema);
         for (i, row_json) in case.json["rows"].as_array().into_iter().flatten().enumerate() {
             if row_json.get("unknown").and_then(Json::as_array).is_some_and(|u| !u.is_empty()) {
                 continue;
             }
-            let mut names = Names(HashMap::new());
-            let text = names.print(&checked);
-            let program = env.compile(&text).unwrap_or_else(|e| panic!("{}: cel cannot parse {text}: {e}", case.name));
+            let row = row(&types, row_json);
             let mut context = Context::with_env(Arc::clone(&env));
-            context.add_variable_from_value("r", oracle_row(&mut names, &types, &row(&types, row_json)));
-            let got = match program.execute(&context) {
+            let definition = Arc::clone(&definition);
+            context
+                .add_function("under", move |This(f): This<Arc<String>>, p: Arc<String>| -> Result<Cel, ExecutionError> {
+                    let mut scope = Context::default();
+                    scope.add_variable_from_value("f", Cel::String(f));
+                    scope.add_variable_from_value("p", Cel::String(p));
+                    scope.resolve(&definition)
+                })
+                .unwrap();
+            let (text, result) = match &program {
+                Some(program) => {
+                    for (name, value) in oracle_row(&mut Names(None), &types, &row) {
+                        context.add_variable_from_value(name, value);
+                    }
+                    as_written += 1;
+                    (canonical.clone(), context.resolve(program))
+                }
+                None => {
+                    let mut names = Names(Some(HashMap::new()));
+                    let text = names.print(&checked);
+                    let program = parse(&text).unwrap_or_else(|e| panic!("{}: cel cannot parse {text}: {e}", case.name));
+                    context.add_variable_from_value("r", Cel::Map(oracle_row(&mut names, &types, &row).into()));
+                    reprinted += 1;
+                    (text, context.resolve(&program))
+                }
+            };
+            let got = match result {
                 Ok(Cel::Bool(true)) => "T",
                 Ok(Cel::Bool(false)) => "F",
                 Ok(other) => panic!("{}: cel gave {other:?} for {text}", case.name),
                 Err(_) => "U",
             };
             assert_eq!(truth(&Json::String(got.into())), truth(&row_json["expect"]), "{} row {i}: cel on {text}", case.name);
-            compared += 1;
         }
     }
-    assert!(compared > 100, "only {compared} rows were compared");
+    assert!(as_written > 250 && reprinted > 20, "compared {as_written} rows as written and {reprinted} reprinted");
 }

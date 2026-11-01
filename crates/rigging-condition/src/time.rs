@@ -17,16 +17,9 @@ pub struct Timestamp(i64);
 pub struct Duration(i64);
 
 /// Why a timestamp or duration string was refused.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("{0}")]
 pub struct TimeError(pub(crate) &'static str);
-
-impl fmt::Display for TimeError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.0)
-    }
-}
-
-impl std::error::Error for TimeError {}
 
 fn min_timestamp() -> i64 {
     days_from_civil(1, 1, 1) * SECONDS_PER_DAY * MICROS_PER_SECOND
@@ -173,9 +166,15 @@ impl Duration {
                 "" => return Err(TimeError("duration needs a unit")),
                 _ => return Err(TimeError("duration unit must be h, m, s, ms or us")),
             };
-            // Too many digits can only overflow the range; refuse before parsing.
-            if int_part.len() > 20 || frac_part.len() > 20 {
+            // Leading zeros of the whole part and trailing zeros of the
+            // fraction carry nothing. Past 20 digits, a whole part is out of
+            // range, and a fraction is finer than a microsecond of any unit.
+            let (int_part, frac_part) = (int_part.trim_start_matches('0'), frac_part.trim_end_matches('0'));
+            if int_part.len() > 20 {
                 return Err(TimeError("duration is out of range"));
+            }
+            if frac_part.len() > 20 {
+                return Err(TimeError("duration is finer than a microsecond"));
             }
             let whole: i128 = if int_part.is_empty() { 0 } else { int_part.parse().map_err(|_| TimeError("duration is out of range"))? };
             let scale = 10_i128.pow(frac_part.len() as u32);

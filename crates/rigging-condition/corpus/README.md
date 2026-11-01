@@ -16,10 +16,22 @@ crate. `corpus.json` is plain JSON with one case per line.
 - `cel_spec`: cases generated from cel-spec at
   `21ec6f4e52e8d694687ff9ed7408d3eccbb955d7` by
   `cargo run -p rigging-condition --example cel_spec_slice -- <cel-spec checkout>`.
-  The generator reads `tests/simple/testdata/{logic,comparisons,fields,lists,timestamps}.textproto`,
-  turns each literal on the left of a comparison or `in` into a field holding
-  that literal, and keeps the tests with a boolean result that check against
-  the schema this builds. Regenerate rather than edit them.
+  The generator reads `tests/simple/testdata/{logic,comparisons,fields,lists,timestamps}.textproto`
+  and makes parts of each expression into fields: a literal on the left of
+  a comparison or `in`, a binding and a bound map's entries, a selected map
+  literal's entries, and a part below the top that fails with one of CEL's
+  errors on plain values (division by zero, a missing key, an index out of
+  bounds) as an absent field. It keeps the tests with a boolean or error
+  result, an error read as U, that then check against the schema this
+  builds. Regenerate rather than edit them.
+
+  The gap: 10 of those files' 71 error-result tests are in the slice. The
+  rest are refused before evaluation (a comparison of mismatched types is a
+  `check_error`, an out-of-range timestamp or duration a `parse_error`), have
+  no boolean place to put the error in (`timestamp('0000-01-01T00:00:00Z')`
+  on its own, a map index's value), or use what the subset leaves out (`null`,
+  non-string map keys, unsigned ints, ternaries, arithmetic at the top).
+  Hand-written cases cover the first group for the subset's own types.
 
 ## Schemas
 
@@ -44,7 +56,10 @@ A case's `schema` is a schema's name or an inline schema.
 
 - `name`.
 - `input`: the text, or a list of parts, each a string or
-  `{"repeat": s, "count": n}`, concatenated.
+  `{"repeat": s, "count": n}`, concatenated. Or, in place of `input`:
+- `tree`: a condition built in code, not parsed: `{"and": [t, …]}`,
+  `{"or": [t, …]}`, `{"not": t}`, or a leaf's canonical text. When it checks,
+  `canonical` is its print, which parses strictly back to the tree.
 - `lenient`: `true` parses leniently; otherwise strictly, and the input is its
   own canonical print.
 - `canonical`: for a lenient case, the canonical print. Printing it and
@@ -52,7 +67,9 @@ A case's `schema` is a schema's name or an inline schema.
 - Exactly one of these errors, or none:
   - `parse_error`: `syntax`, `literal`, `limit` or `not-canonical`;
   - `check_error`: `unknown-field`, `unknown-variable`, `variable-as-field`,
-    `type-mismatch`, `ordering`, `invalid-literal`, `empty-list` or `limit`;
+    `type-mismatch`, `ordering`, `invalid-literal`, `empty-list`, `limit`, or
+    `shape` (a tree's `&&` or `||` of fewer than two terms, or directly
+    holding another of its kind);
   - `bind_error`: `unknown-variable`, `type-mismatch` or `invalid-literal`.
 - `bindings`: variable text to a value, bound before evaluation.
 - `rows`: each `{"values": {path: value}, "unknown": [path], "expect": "T" | "F" | "U", "reason": text | null}`.
@@ -72,9 +89,11 @@ the same stage.
 
 ## The differential oracle
 
-Every case that checks, and every row without unknown fields, also runs
-through the `cel` crate under the conventions of §3: the row is one map with
-absent fields left out and intermediate maps present, enums and addresses are
-strings, `under` is `f == P || f.startsWith(P + "/")`, and an error is U.
-`cel` 0.15 does not parse backticked identifiers, so the oracle renames each
-field segment.
+Every row without unknown fields of a case that checks also runs through the
+`cel` crate under the conventions of §3: each first segment is a variable and
+a dotted path nested maps, absent fields are left out and intermediate maps
+present, enums and addresses are strings, `under` is
+`f == P || f.startsWith(P + "/")`, and an error is U. The program is the
+canonical text, parsed with backticked identifiers enabled. Where that is not
+CEL (a backticked first segment, or `has()` of a one-segment path), the oracle
+reprints the condition over one row map `r`.

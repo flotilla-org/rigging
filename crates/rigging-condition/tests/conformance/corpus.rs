@@ -137,6 +137,22 @@ pub fn input(json: &Json) -> String {
     }
 }
 
+/// A tree built in code: `{"and": [..]}`, `{"or": [..]}`, `{"not": t}`, or
+/// a leaf's canonical text.
+pub fn tree(json: &Json) -> Condition {
+    let terms = |terms: &Json| terms.as_array().unwrap().iter().map(tree).collect();
+    match json {
+        Json::String(leaf) => Condition::parse_strict(leaf).unwrap(),
+        Json::Object(node) => match node.iter().next().unwrap() {
+            (kind, inner) if kind == "and" => Condition::And(terms(inner)),
+            (kind, inner) if kind == "or" => Condition::Or(terms(inner)),
+            (kind, inner) if kind == "not" => Condition::Not(Box::new(tree(inner))),
+            (kind, _) => panic!("unknown tree node {kind}"),
+        },
+        other => panic!("bad tree {other}"),
+    }
+}
+
 /// What a case leads to: an error at one stage, or a checked and bound condition.
 pub enum Outcome {
     Error(&'static str, String),
@@ -147,27 +163,46 @@ pub enum Outcome {
 /// expectation on the way.
 pub fn run_front(case: &Case) -> Outcome {
     let json = &case.json;
-    let input = &input(&json["input"]);
-    let lenient = json.get("lenient").and_then(Json::as_bool).unwrap_or(false);
-    let parsed = if lenient { Condition::parse_lenient(input) } else { Condition::parse_strict(input) };
-    let parsed = match parsed {
-        Ok(parsed) => parsed,
-        Err(error) => return Outcome::Error("parse_error", error.code().to_owned() + ": " + &error.to_string()),
-    };
-    let canonical = parsed.to_string();
-    let expected = json.get("canonical").map(self::input).unwrap_or_else(|| input.clone());
-    assert_eq!(canonical, expected, "{}: canonical print", case.name);
-    assert!(lenient || json.get("canonical").is_none(), "{}: a strict case's input is its canonical text", case.name);
-    assert_eq!(
-        Condition::parse_strict(&canonical).as_ref(),
-        Ok(&parsed),
-        "{}: the canonical print parses strictly to the same AST",
-        case.name
-    );
     let schema = schema(&case.schema);
-    let checked = match Checked::new(parsed, &schema) {
-        Ok(checked) => checked,
-        Err(error) => return Outcome::Error("check_error", error.code().to_owned() + ": " + &error.to_string()),
+    let checked = match json.get("tree") {
+        Some(json_tree) => {
+            let checked = match Checked::new(tree(json_tree), &schema) {
+                Ok(checked) => checked,
+                Err(error) => return Outcome::Error("check_error", error.code().to_owned() + ": " + &error.to_string()),
+            };
+            let canonical = checked.to_string();
+            assert_eq!(Some(canonical.as_str()), json["canonical"].as_str(), "{}: canonical print", case.name);
+            assert_eq!(
+                Condition::parse_strict(&canonical).as_ref(),
+                Ok(&*checked),
+                "{}: a checked tree's print parses back to it",
+                case.name
+            );
+            checked
+        }
+        None => {
+            let input = &input(&json["input"]);
+            let lenient = json.get("lenient").and_then(Json::as_bool).unwrap_or(false);
+            let parsed = if lenient { Condition::parse_lenient(input) } else { Condition::parse_strict(input) };
+            let parsed = match parsed {
+                Ok(parsed) => parsed,
+                Err(error) => return Outcome::Error("parse_error", error.code().to_owned() + ": " + &error.to_string()),
+            };
+            let canonical = parsed.to_string();
+            let expected = json.get("canonical").map(self::input).unwrap_or_else(|| input.clone());
+            assert_eq!(canonical, expected, "{}: canonical print", case.name);
+            assert!(lenient || json.get("canonical").is_none(), "{}: a strict case's input is its canonical text", case.name);
+            assert_eq!(
+                Condition::parse_strict(&canonical).as_ref(),
+                Ok(&parsed),
+                "{}: the canonical print parses strictly to the same AST",
+                case.name
+            );
+            match Checked::new(parsed, &schema) {
+                Ok(checked) => checked,
+                Err(error) => return Outcome::Error("check_error", error.code().to_owned() + ": " + &error.to_string()),
+            }
+        }
     };
     let mut bindings = BTreeMap::new();
     for (path, v) in json["bindings"].as_object().into_iter().flatten() {

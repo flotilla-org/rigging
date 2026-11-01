@@ -1,7 +1,5 @@
 //! The condition AST (§4.2 of the design note). `Display` prints canonical text.
 
-use std::fmt;
-
 pub use crate::time::{Duration, Timestamp};
 
 /// CEL keywords: never a bare segment.
@@ -117,16 +115,9 @@ pub enum Relop {
 }
 
 /// Why a path or variable could not be built.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("{0}")]
 pub struct NameError(pub(crate) String);
-
-impl fmt::Display for NameError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for NameError {}
 
 pub(crate) fn is_selector(segment: &str) -> bool {
     let mut chars = segment.chars();

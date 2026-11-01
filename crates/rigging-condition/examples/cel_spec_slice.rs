@@ -7,17 +7,33 @@
 //! ```
 //!
 //! It reads `tests/simple/testdata/{logic,comparisons,fields,lists,timestamps}.textproto`
-//! and keeps the tests with a boolean result whose expression is inside the
-//! subset once each literal on the left of a comparison or `in` becomes a
-//! field holding that literal (`1 < 2` becomes `lhs0 < 2` with `lhs0 = 1`),
-//! and each binding becomes a field. A test that does not check against the
-//! schema this builds is outside the subset and left out.
+//! and keeps the tests with a boolean or error result whose expression is
+//! inside the subset once some of its parts become fields, an error result
+//! read as U (§3). The parts that become fields:
+//!
+//! - a literal on the left of a comparison or `in`, as a field holding it
+//!   (`1 < 2` becomes `lhs0 < 2` with `lhs0 = 1`);
+//! - a binding, as a field, and a bound map's entries as fields under it;
+//! - a map literal with string keys that is selected from, as a field per
+//!   entry (`has({'a': 1}.a)` becomes `has(lhs0.a)` with `lhs0.a = 1`); a
+//!   key it lacks is an absent field;
+//! - a part below the top that the `cel` crate fails to evaluate, as an
+//!   absent field of the type its place needs (`1/0 != 0 && true` becomes
+//!   `lhs0 != 0 && true` with `lhs0` absent), since an error is U.
+//!
+//! A test that does not then check against the schema this builds is outside
+//! the subset and left out.
 
-use std::{collections::BTreeMap, env, fs, path::PathBuf};
+use std::{
+    collections::{BTreeMap, HashMap},
+    env, fs,
+    path::PathBuf,
+    sync::Arc,
+};
 
 use cel::{
-    IdedExpr,
-    common::ast::{Expr, LiteralValue},
+    Context, ExecutionError, IdedExpr, Value as Cel,
+    common::ast::{EntryExpr, Expr, LiteralValue},
     parser::Parser,
 };
 use rigging_condition::{Checked, Condition, Duration, Field, Literal, Operand, Path, Relop, Schema, Timestamp, Type};
@@ -55,36 +71,50 @@ fn main() {
 /// One test, lifted into the subset, or `None` when it is outside it.
 fn convert(name: &str, test: &TextProto) -> Option<Json> {
     let expr = test.string("expr")?;
-    let expect = match test.message("value")?.scalar("bool_value")? {
-        "true" => "T",
-        "false" => "F",
-        _ => return None,
+    let expect = match test.message("value").and_then(|v| v.scalar("bool_value")) {
+        Some("true") => "T",
+        Some("false") => "F",
+        Some(_) => return None,
+        None if test.message("eval_error").is_some() => "U",
+        None => return None,
     };
     let mut lift = Lift::default();
     for binding in test.messages("bindings") {
         let key = binding.string("key")?;
         let value = binding.message("value")?.message("value")?;
-        let (ty, literal) = if let Some(n) = value.scalar("int64_value") {
-            (Type::Int, Literal::Int(n.parse().ok()?))
-        } else if let Some(x) = value.scalar("double_value") {
-            (Type::Number, Literal::Float(x.parse().ok()?))
-        } else if let Some(s) = value.string("string_value") {
-            (Type::String, Literal::String(s))
-        } else {
-            (Type::Bool, Literal::Bool(value.scalar("bool_value")? == "true"))
-        };
-        lift.fields.insert(key, (ty, literal));
+        match value.message("map_value") {
+            Some(map) => {
+                let mut entries = BTreeMap::new();
+                let mut value_type = None;
+                for entry in map.messages("entries") {
+                    let key = entry.message("key")?.string("string_value")?;
+                    let value = entry.message("value")?;
+                    let (ty, literal) = scalar(value)?;
+                    value_type = Some(ty.clone());
+                    entries.insert(key.clone(), cel_value(&literal)?);
+                    lift.declare(Path::new([binding.string("key")?, key]).ok()?, ty, Some(literal));
+                }
+                lift.context.add_variable_from_value(key.clone(), Cel::Map(entries.into_iter().collect::<HashMap<_, _>>().into()));
+                lift.maps.insert(key, value_type);
+            }
+            None => {
+                let (ty, literal) = scalar(value)?;
+                lift.context.add_variable_from_value(key.clone(), cel_value(&literal)?);
+                lift.declare(Path::new([key]).ok()?, ty, Some(literal));
+            }
+        }
     }
-    let parsed = Parser::new().parse(&expr).ok()?;
-    let condition = lift.condition(&parsed)?;
+    let parsed = Parser::new().enable_ident_escape_syntax(true).parse(&expr).ok()?;
+    let condition = lift.condition(&parsed, true)?;
     let mut schema = Schema::new();
     let mut fields = serde_json::Map::new();
     let mut values = serde_json::Map::new();
-    for (key, (ty, literal)) in &lift.fields {
-        let path = Path::new([key.clone()]).ok()?;
+    for (path, (ty, literal)) in &lift.fields {
         schema.insert_field(path.clone(), ty.clone(), true).ok()?;
         fields.insert(path.to_string(), json!({ "type": ty.to_string() }));
-        values.insert(path.to_string(), literal_json(literal)?);
+        if let Some(literal) = literal {
+            values.insert(path.to_string(), literal_json(literal)?);
+        }
     }
     let checked = Checked::new(condition, &schema).ok()?;
     let canonical = checked.to_string();
@@ -100,6 +130,28 @@ fn convert(name: &str, test: &TextProto) -> Option<Json> {
     Some(case)
 }
 
+fn scalar(value: &TextProto) -> Option<(Type, Literal)> {
+    Some(if let Some(n) = value.scalar("int64_value") {
+        (Type::Int, Literal::Int(n.parse().ok()?))
+    } else if let Some(x) = value.scalar("double_value") {
+        (Type::Number, Literal::Float(x.parse().ok()?))
+    } else if let Some(s) = value.string("string_value") {
+        (Type::String, Literal::String(s))
+    } else {
+        (Type::Bool, Literal::Bool(value.scalar("bool_value")? == "true"))
+    })
+}
+
+fn cel_value(literal: &Literal) -> Option<Cel> {
+    Some(match literal {
+        Literal::Int(n) => Cel::Int(*n),
+        Literal::Float(x) => Cel::Float(*x),
+        Literal::String(s) => Cel::String(Arc::new(s.clone())),
+        Literal::Bool(b) => Cel::Bool(*b),
+        _ => return None,
+    })
+}
+
 fn literal_json(literal: &Literal) -> Option<Json> {
     Some(match literal {
         Literal::String(s) => json!(s),
@@ -112,73 +164,176 @@ fn literal_json(literal: &Literal) -> Option<Json> {
     })
 }
 
+fn literal_type(literal: &Literal) -> Option<Type> {
+    Some(match literal {
+        Literal::String(_) => Type::String,
+        Literal::Int(_) => Type::Int,
+        Literal::Float(_) => Type::Number,
+        Literal::Bool(_) => Type::Bool,
+        Literal::Timestamp(_) => Type::Timestamp,
+        Literal::Duration(_) => Type::Duration,
+        _ => return None,
+    })
+}
+
 #[derive(Default)]
 struct Lift {
-    fields: BTreeMap<String, (Type, Literal)>,
+    /// Each field, and its value when it is present.
+    fields: BTreeMap<Path, (Type, Option<Literal>)>,
+    /// The bound or lifted maps, whose entries are fields, and the type of
+    /// their values when they have any.
+    maps: BTreeMap<String, Option<Type>>,
+    /// The bindings, for evaluating a part with the `cel` crate.
+    context: Context<'static, 'static>,
+    next: usize,
     lifted: bool,
 }
 
 impl Lift {
-    fn condition(&mut self, e: &IdedExpr) -> Option<Condition> {
+    fn declare(&mut self, path: Path, ty: Type, literal: Option<Literal>) {
+        self.fields.insert(path, (ty, literal));
+    }
+
+    fn fresh(&mut self) -> String {
+        self.lifted = true;
+        self.next += 1;
+        format!("lhs{}", self.next - 1)
+    }
+
+    /// `e` in a boolean place; `top` when it is the whole expression.
+    fn condition(&mut self, e: &IdedExpr, top: bool) -> Option<Condition> {
         match &e.expr {
             Expr::Literal(LiteralValue::Boolean(b)) => Some(Condition::Bool(*b.inner())),
-            Expr::Ident(name) if matches!(self.fields.get(name), Some((Type::Bool, _))) => Some(Condition::Field(self.field(name)?)),
+            Expr::Ident(_) | Expr::Select(_) if !matches!(&e.expr, Expr::Select(select) if select.test) => {
+                let field = self.field(e, Type::Bool)?;
+                matches!(self.fields.get(&field.path), Some((Type::Bool, _))).then_some(Condition::Field(field))
+            }
+            Expr::Select(select) if select.test => {
+                let root = self.map(&select.operand)?;
+                let ty = self.maps[&root].clone().unwrap_or(Type::Bool);
+                let path = Path::new([root, select.field.clone()]).ok()?;
+                self.fields.entry(path.clone()).or_insert((ty, None));
+                Some(Condition::Has(path))
+            }
             Expr::Call(call) if call.target.is_none() => {
                 let args = &call.args;
                 match (call.func_name.as_str(), args.len()) {
-                    ("_&&_", 2) => Some(Condition::and([self.condition(&args[0])?, self.condition(&args[1])?])),
-                    ("_||_", 2) => Some(Condition::or([self.condition(&args[0])?, self.condition(&args[1])?])),
-                    ("!_", 1) => Some(Condition::Not(Box::new(self.condition(&args[0])?))),
+                    ("_&&_", 2) => Some(Condition::and([self.condition(&args[0], false)?, self.condition(&args[1], false)?])),
+                    ("_||_", 2) => Some(Condition::or([self.condition(&args[0], false)?, self.condition(&args[1], false)?])),
+                    ("!_", 1) => Some(Condition::Not(Box::new(self.condition(&args[0], false)?))),
                     ("@in", 2) => {
                         let Expr::List(list) = &args[1].expr else { return None };
                         let list = list.elements.iter().map(|e| literal(e).map(Operand::Literal)).collect::<Option<Vec<_>>>()?;
-                        Some(Condition::In { field: self.left(&args[0])?, list })
-                    }
-                    (op, 2) => {
-                        let op = match op {
-                            "_==_" => Relop::Eq,
-                            "_!=_" => Relop::Ne,
-                            "_<_" => Relop::Lt,
-                            "_<=_" => Relop::Le,
-                            "_>_" => Relop::Gt,
-                            "_>=_" => Relop::Ge,
+                        let ty = match list.first() {
+                            Some(Operand::Literal(first)) => literal_type(first)?,
                             _ => return None,
                         };
-                        let operand = Operand::Literal(literal(&args[1])?);
-                        Some(Condition::Compare { field: self.left(&args[0])?, op, operand })
+                        Some(Condition::In { field: self.left(&args[0], ty)?, list })
                     }
+                    (op, 2) if relop(op).is_some() => {
+                        let literal = literal(&args[1])?;
+                        let field = self.left(&args[0], literal_type(&literal)?)?;
+                        Some(Condition::Compare { field, op: relop(op)?, operand: Operand::Literal(literal) })
+                    }
+                    _ if !top => self.failing(e, Type::Bool).map(Condition::Field),
                     _ => None,
                 }
+            }
+            _ if !top => self.failing(e, Type::Bool).map(Condition::Field),
+            _ => None,
+        }
+    }
+
+    /// The path a name or a select from a map spells, if it names a field.
+    fn path(&mut self, e: &IdedExpr) -> Option<Path> {
+        match &e.expr {
+            Expr::Ident(name) if !self.maps.contains_key(name) => {
+                let path = Path::new([name.clone()]).ok()?;
+                self.fields.contains_key(&path).then_some(path)
+            }
+            Expr::Select(select) if !select.test => {
+                let root = self.map(&select.operand)?;
+                Path::new([root, select.field.clone()]).ok()
             }
             _ => None,
         }
     }
 
-    fn field(&self, name: &str) -> Option<Field> {
-        Some(Field::new(Path::new([name]).ok()?))
+    /// A bound map's name, or a map literal with string keys lifted into fields.
+    fn map(&mut self, e: &IdedExpr) -> Option<String> {
+        match &e.expr {
+            Expr::Ident(name) if self.maps.contains_key(name) => Some(name.clone()),
+            Expr::Map(map) => {
+                let mut entries = Vec::new();
+                for entry in &map.entries {
+                    let EntryExpr::MapEntry(entry) = &entry.expr else { return None };
+                    let Some(Literal::String(key)) = literal(&entry.key) else { return None };
+                    let value = literal(&entry.value)?;
+                    Path::new([key.as_str()]).ok()?;
+                    entries.push((key, literal_type(&value)?, value));
+                }
+                let root = self.fresh();
+                let value_type = entries.first().map(|(_, ty, _)| ty.clone());
+                for (key, ty, value) in entries {
+                    self.declare(Path::new([root.clone(), key]).ok()?, ty, Some(value));
+                }
+                self.maps.insert(root.clone(), value_type);
+                Some(root)
+            }
+            _ => None,
+        }
     }
 
-    /// The left of a comparison: a bound name, or a literal lifted into a field.
-    fn left(&mut self, e: &IdedExpr) -> Option<Field> {
-        if let Expr::Ident(name) = &e.expr {
-            self.fields.contains_key(name).then_some(())?;
-            return self.field(name);
-        }
-        let literal = literal(e)?;
-        let ty = match &literal {
-            Literal::String(_) => Type::String,
-            Literal::Int(_) => Type::Int,
-            Literal::Float(_) => Type::Number,
-            Literal::Bool(_) => Type::Bool,
-            Literal::Timestamp(_) => Type::Timestamp,
-            Literal::Duration(_) => Type::Duration,
-            _ => return None,
-        };
-        let name = format!("lhs{}", self.fields.len());
-        self.fields.insert(name.clone(), (ty, literal));
-        self.lifted = true;
-        self.field(&name)
+    /// The field a name or select reads; a map's missing key is an absent
+    /// field of the map's value type, or `ty` for a map with no values.
+    fn field(&mut self, e: &IdedExpr, ty: Type) -> Option<Field> {
+        let path = self.path(e)?;
+        let ty = self.maps.get(&path.segments()[0]).cloned().flatten().unwrap_or(ty);
+        self.fields.entry(path.clone()).or_insert((ty, None));
+        Some(Field::new(path))
     }
+
+    /// The left of a comparison of type `ty`: a field, a literal lifted into
+    /// one, or a part that fails to evaluate.
+    fn left(&mut self, e: &IdedExpr, ty: Type) -> Option<Field> {
+        if matches!(&e.expr, Expr::Ident(_) | Expr::Select(_)) {
+            return self.field(e, ty);
+        }
+        if let Some(literal) = literal(e) {
+            let path = Path::new([self.fresh()]).ok()?;
+            self.declare(path.clone(), literal_type(&literal)?, Some(literal));
+            return Some(Field::new(path));
+        }
+        self.failing(e, ty)
+    }
+
+    /// An absent field of type `ty` standing for `e`, when evaluating `e`
+    /// fails with one of CEL's errors on plain values: division by zero, or
+    /// a missing or ill-typed key or index. Other failures of the `cel` crate
+    /// can be what it lacks (protobuf messages, nanoseconds), not CEL errors.
+    fn failing(&mut self, e: &IdedExpr, ty: Type) -> Option<Field> {
+        use ExecutionError::*;
+        let cel_error = matches!(
+            self.context.resolve(e),
+            Err(DivisionByZero(_) | RemainderByZero(_) | NoSuchKey(_) | IndexOutOfBounds(_) | UnsupportedIndex(..))
+        );
+        cel_error.then_some(())?;
+        let path = Path::new([self.fresh()]).ok()?;
+        self.declare(path.clone(), ty, None);
+        Some(Field::new(path))
+    }
+}
+
+fn relop(op: &str) -> Option<Relop> {
+    Some(match op {
+        "_==_" => Relop::Eq,
+        "_!=_" => Relop::Ne,
+        "_<_" => Relop::Lt,
+        "_<=_" => Relop::Le,
+        "_>_" => Relop::Gt,
+        "_>=_" => Relop::Ge,
+        _ => return None,
+    })
 }
 
 fn literal(e: &IdedExpr) -> Option<Literal> {

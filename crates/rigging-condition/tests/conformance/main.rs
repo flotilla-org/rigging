@@ -5,3 +5,4 @@ mod corpus;
 mod oracle;
 mod round_trip;
 mod sqlite;
+mod time;

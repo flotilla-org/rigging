@@ -129,6 +129,11 @@ impl Checked<Condition> {
     /// The first top-level conjunct that is not T, as the reason a condition
     /// failed; the whole condition when it is not a conjunction. `None` when
     /// the condition is T. It prints as canonical text.
+    ///
+    /// # Panics
+    ///
+    /// If a variable it evaluates is still unbound, as
+    /// [`evaluate`](Self::evaluate) does.
     pub fn first_failing(&self, row: &impl Row) -> Option<&Condition> {
         let condition: &Condition = self;
         match condition {

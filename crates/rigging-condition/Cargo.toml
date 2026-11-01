@@ -11,6 +11,7 @@ description = "One condition language for flotilla and binnacle: a strict subset
 # wasm32-unknown-unknown so binnacle's web build can take it.
 [dependencies]
 serde.workspace = true
+thiserror = "2"
 
 [dev-dependencies]
 # The differential oracle (§3 of the design note). Pinned exactly: it runs

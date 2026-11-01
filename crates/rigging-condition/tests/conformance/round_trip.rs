@@ -89,9 +89,10 @@ fn length(tc: &TestCase, min: usize) -> usize {
     }
 }
 
-/// A condition in the parser's normal form (n-ary nodes never directly hold
-/// their own kind), at most `depth` connectives deep. Each connective adds at
-/// most two to the parser's nesting count, so depth 4 stays inside the limit.
+/// A condition at most `depth` connectives deep, mostly in the parser's
+/// shape (n-ary nodes of two or more terms, never directly holding their own
+/// kind) and now and then not. Each connective adds at most two to the
+/// parser's nesting count, so depth 4 stays inside the limit.
 fn condition(tc: &TestCase, depth: usize) -> Condition {
     let top = if depth == 0 { 6 } else { 9 };
     match tc.draw(gs::integers::<u8>().max_value(top)) {
@@ -112,38 +113,52 @@ fn condition(tc: &TestCase, depth: usize) -> Condition {
         7 => Condition::Not(Box::new(condition(tc, depth - 1))),
         kind => {
             let and = kind == 8;
-            let len = length(tc, 2);
+            // Now and then a shape the parser never builds: no terms, one
+            // term, or a term of the node's own kind.
+            let misshapen = if tc.draw(gs::weighted_booleans(0.25)) { Some(tc.draw(gs::integers::<usize>().max_value(2))) } else { None };
+            let len = match misshapen {
+                Some(len @ (0 | 1)) => len,
+                _ => length(tc, 2),
+            };
             // A run long enough to cross the term limit holds only leaves.
             let depth = if len > 4 { 1 } else { depth };
-            let terms = (0..len)
+            let mut terms: Vec<Condition> = (0..len)
                 .map(|_| match condition(tc, depth - 1) {
                     Condition::And(inner) if and => Condition::Not(Box::new(Condition::And(inner))),
                     Condition::Or(inner) if !and => Condition::Not(Box::new(Condition::Or(inner))),
                     term => term,
                 })
                 .collect();
+            if misshapen == Some(2) {
+                let at = tc.draw(gs::integers::<usize>().max_value(len - 1));
+                let inner = vec![condition(tc, 0), condition(tc, 0)];
+                terms[at] = if and { Condition::And(inner) } else { Condition::Or(inner) };
+            }
             if and { Condition::And(terms) } else { Condition::Or(terms) }
         }
     }
 }
 
-// Behaviour (§4.7, §4.2): print-then-parse returns exactly the AST, so the
-// strict parser accepts every canonical print and nothing is lost in
-// printing; and `check_limits`, which `Checked::new` applies to trees built
-// by hand, refuses exactly the trees whose print the parser refuses for a limit.
+// Behaviour (§4.7, §4.2): for a tree of the parser's shape, print-then-parse
+// returns exactly the AST, so the strict parser accepts every canonical print
+// and nothing is lost in printing; `check_shape` refuses exactly the trees
+// whose print parses to something else; and `check_limits` refuses exactly
+// the trees whose print the parser refuses for a limit. `Checked::new`
+// applies both to trees built by hand.
 #[hegel::test(test_cases = 500)]
 fn strict_parse_of_print_is_identity(tc: TestCase) {
-    // The tree under 0 to 13 wrappings, each adding one or two to the nesting
-    // count, so some wrapping is the first to cross the limit of 12: `!`
-    // (two, or one over a field, has or under), or `(… || true) && true`
-    // (one), which mixes the parities.
+    // Up to 13 wrappings, so one of them crosses the nesting limit of 12: `!`
+    // adds two (one over a field, has or under), `(… || true) && true` one.
     let mut ast = condition(&tc, 4);
     for _ in 0..=13 {
         let text = ast.to_string();
-        match (ast.check_limits(), Condition::parse_strict(&text)) {
-            (Ok(()), parsed) => assert_eq!(parsed.as_ref(), Ok(&ast), "{text}"),
-            (Err(limit), Err(ParseError { kind: ParseErrorKind::Limit(parsed), .. })) => assert_eq!(limit, parsed, "{text}"),
-            (Err(limit), parsed) => panic!("check_limits gave {limit:?}, the parser {parsed:?}: {text}"),
+        match (ast.check_limits(), ast.check_shape(), Condition::parse_strict(&text)) {
+            (Ok(()), Ok(()), parsed) => assert_eq!(parsed.as_ref(), Ok(&ast), "{text}"),
+            (Ok(()), Err(_), parsed) => assert_ne!(parsed.as_ref(), Ok(&ast), "{text}"),
+            (Err(limit), Ok(()), Err(ParseError { kind: ParseErrorKind::Limit(parsed), .. })) => assert_eq!(limit, parsed, "{text}"),
+            (Err(limit), Ok(()), parsed) => panic!("check_limits gave {limit:?}, the parser {parsed:?}: {text}"),
+            // Over a limit and misshapen: the print is of some other tree.
+            (Err(_), Err(_), _) => {}
         }
         ast = if tc.draw(gs::booleans()) {
             Condition::Not(Box::new(ast))
