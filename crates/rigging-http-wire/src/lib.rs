@@ -148,8 +148,9 @@ impl Encoding {
         }
     }
 
-    /// One encoded value. JSON writes integers beyond ±(2^53 − 1) through [`json_safe_integers`];
-    /// CBOR carries them natively.
+    /// One encoded value. Bodies are JSON-shaped: both encodings write the value's
+    /// `serde_json::Value`, so they carry the same data. JSON writes integers beyond
+    /// ±(2^53 − 1) through [`json_safe_integers`]; CBOR carries them natively.
     pub fn encode<T: Serialize + ?Sized>(self, value: &T) -> Result<Vec<u8>, String> {
         let mut value = serde_json::to_value(value).map_err(|error| error.to_string())?;
         match self {

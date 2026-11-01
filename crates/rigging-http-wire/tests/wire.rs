@@ -87,10 +87,15 @@ fn quality_ordering_and_invalid_qualities() {
 }
 
 // An Accept no representation satisfies answers 406 unsupported_format with Vary: Accept,
-// in CBOR when the refused header still named it and in JSON otherwise.
+// in CBOR when the refused header still named it (and did not exclude it), else in JSON.
 #[tokio::test]
 async fn unacceptable_requests_answer_406_in_the_requested_error_encoding() {
-    for (accept, cbor) in [("text/html", false), ("application/cbor;q=bad", true), ("application/json;q=0, application/cbor;q=0", false)] {
+    for (accept, cbor) in [
+        ("text/html", false),
+        ("application/cbor;q=bad", true),
+        ("application/json;q=0, application/cbor;q=0", false),
+        ("application/cbor;q=0, text/html", false),
+    ] {
         let request = Request::post("/echo").header(header::ACCEPT, accept).body(Body::from(r#"{"text":"","count":0,"tags":[]}"#));
         let (status, headers, bytes) = send(request.unwrap()).await;
         assert_eq!(status, StatusCode::NOT_ACCEPTABLE, "{accept}");
