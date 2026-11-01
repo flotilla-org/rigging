@@ -30,8 +30,12 @@ async fn bodyless(encoding: Encoding, Wire(()): Wire<(), LIMIT>) -> Negotiated<V
     encoding.ok(json!({"big": u64::MAX, "small": i64::MIN}))
 }
 
+async fn optional(encoding: Encoding, Wire(note): Wire<Option<Note>, LIMIT>) -> Negotiated<Option<Note>> {
+    encoding.ok(note)
+}
+
 fn app() -> Router {
-    Router::new().route("/echo", post(echo)).route("/bodyless", get(bodyless).delete(bodyless))
+    Router::new().route("/echo", post(echo)).route("/bodyless", get(bodyless).delete(bodyless)).route("/optional", get(optional))
 }
 
 async fn send(request: Request<Body>) -> (StatusCode, HeaderMap, Bytes) {
@@ -84,6 +88,10 @@ fn quality_ordering_and_invalid_qualities() {
     for quality in ["no", "NaN", "inf", "1.5", "-0.1"] {
         assert_eq!(negotiate(&format!("application/json;q={quality}"), &media), Err(NotAcceptable::InvalidQuality));
     }
+    // Lenient about how a valid quality is written, strict about one that is not a number,
+    // even when another range in the header would match.
+    assert_eq!(negotiate("application/json;q=.5, application/cbor;q=1e0", &media), Ok(1));
+    assert_eq!(negotiate("text/html;q=abc, application/json", &media), Err(NotAcceptable::InvalidQuality));
 }
 
 // An Accept no representation satisfies answers 406 unsupported_format with Vary: Accept,
@@ -95,6 +103,7 @@ async fn unacceptable_requests_answer_406_in_the_requested_error_encoding() {
         ("application/cbor;q=bad", true),
         ("application/json;q=0, application/cbor;q=0", false),
         ("application/cbor;q=0, text/html", false),
+        ("application/cbor-seq;q=x", true),
     ] {
         let request = Request::post("/echo").header(header::ACCEPT, accept).body(Body::from(r#"{"text":"","count":0,"tags":[]}"#));
         let (status, headers, bytes) = send(request.unwrap()).await;
@@ -151,16 +160,24 @@ async fn an_over_limit_stream_is_refused_while_reading() {
     assert_eq!(decode(&headers, &bytes)["code"], "payload_too_large");
 }
 
-// A declared Content-Length over the limit is refused before reading, and one that is not
-// a number is a bad request.
+// A declared Content-Length over the limit is refused before reading, ahead of the
+// Content-Type check; one that is not a number, or two that disagree, are a bad request.
 #[tokio::test]
 async fn declared_lengths_are_checked_before_reading() {
-    for (length, expected) in [((LIMIT + 1).to_string(), StatusCode::PAYLOAD_TOO_LARGE), ("lots".into(), StatusCode::BAD_REQUEST)] {
-        let request = Request::post("/echo")
-            .header(header::CONTENT_LENGTH, length)
-            .body(Body::from_stream(futures_util::stream::pending::<Result<Bytes, Infallible>>()));
-        let (status, ..) = tokio::time::timeout(Duration::from_secs(5), send(request.unwrap())).await.expect("refused before reading");
-        assert_eq!(status, expected);
+    let over = (LIMIT + 1).to_string();
+    for (lengths, content_type, expected) in [
+        (vec![over.as_str()], "application/json", StatusCode::PAYLOAD_TOO_LARGE),
+        (vec![over.as_str()], "text/plain", StatusCode::PAYLOAD_TOO_LARGE),
+        (vec!["lots"], "application/json", StatusCode::BAD_REQUEST),
+        (vec!["2", "3"], "application/json", StatusCode::BAD_REQUEST),
+    ] {
+        let mut request = Request::post("/echo").header(header::CONTENT_TYPE, content_type);
+        for length in lengths {
+            request = request.header(header::CONTENT_LENGTH, length);
+        }
+        let request = request.body(Body::from_stream(futures_util::stream::pending::<Result<Bytes, Infallible>>())).unwrap();
+        let (status, ..) = tokio::time::timeout(Duration::from_secs(5), send(request)).await.expect("refused before reading");
+        assert_eq!(status, expected, "{content_type}");
     }
 }
 
@@ -181,10 +198,14 @@ async fn wrong_content_type_and_malformed_bodies_are_refused() {
     }
 }
 
-// GET and DELETE take no body: an empty one decodes as `()`, and any byte is 413 whatever
-// the route's limit.
+// GET, HEAD and DELETE take no body: an empty one decodes as `()` or `None`, and any byte
+// is 413 whatever the route's limit.
 #[tokio::test]
 async fn bodyless_methods_take_no_body() {
+    let (status, headers, bytes) = send(Request::get("/optional").body(Body::empty()).unwrap()).await;
+    assert_eq!((status, decode(&headers, &bytes)), (StatusCode::OK, Value::Null));
+    let (status, _, bytes) = send(Request::head("/bodyless").body(Body::from("{}")).unwrap()).await;
+    assert_eq!((status, bytes.len()), (StatusCode::PAYLOAD_TOO_LARGE, 0));
     for method in ["GET", "DELETE"] {
         let (status, headers, bytes) = send(Request::builder().method(method).uri("/bodyless").body(Body::empty()).unwrap()).await;
         assert_eq!(status, StatusCode::OK);
@@ -210,4 +231,20 @@ async fn encoding_faults_and_unauthorized_keep_the_error_shape() {
 
     let response = Encoding::Json.error_code(StatusCode::UNAUTHORIZED, "unauthorized", "sign in");
     assert_eq!(response.headers()[header::WWW_AUTHENTICATE], "Bearer");
+}
+
+// A sequence item is one independently decodable value: a `\n`-terminated JSON line, with
+// the JSON integer profile applied, or one CBOR data item that concatenates into a sequence.
+#[test]
+fn sequence_items_decode_independently() {
+    let items = [json!({"n": u64::MAX}), json!([1, "two"])];
+    let lines: Vec<u8> = items.iter().flat_map(|item| Encoding::Json.encode_item(item).unwrap()).collect();
+    let decoded: Vec<Value> = lines.split_inclusive(|byte| *byte == b'\n').map(|line| serde_json::from_slice(line).unwrap()).collect();
+    assert_eq!(decoded, [json!({"n": {"u64": u64::MAX.to_string()}}), items[1].clone()]);
+    assert!(lines.ends_with(b"\n"));
+    for item in &items {
+        let bytes = Encoding::Cbor.encode_item(item).unwrap();
+        assert_eq!(bytes, Encoding::Cbor.encode(item).unwrap());
+        assert_eq!(flotilla_cbor::from_slice::<Value>(&bytes, &LIMITS).unwrap(), *item);
+    }
 }

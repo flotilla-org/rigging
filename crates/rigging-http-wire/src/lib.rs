@@ -61,6 +61,11 @@ pub fn accept(headers: &HeaderMap) -> Result<&str, NotAcceptable> {
 /// For each allowed type the most specific matching range sets its quality, so
 /// `application/json;q=0, */*` excludes JSON while accepting everything else. The highest
 /// quality wins and ties go to the earlier type. An empty `accept` picks the first.
+///
+/// Qualities are read leniently, as any number from 0 to 1 (`.5` and `1e0` are accepted
+/// where RFC 9110 writes `0.5` and `1`), but one that is not a number refuses the whole
+/// header, even when another range would match: a client that cannot write `Accept`
+/// learns so rather than getting a guess.
 pub fn negotiate(accept: &str, allowed: &[&str]) -> Result<usize, NotAcceptable> {
     if accept.trim().is_empty() {
         return Ok(0);
@@ -149,8 +154,10 @@ impl Encoding {
     }
 
     /// One encoded value. Bodies are JSON-shaped: both encodings write the value's
-    /// `serde_json::Value`, so they carry the same data. JSON writes integers beyond
-    /// ±(2^53 − 1) through [`json_safe_integers`]; CBOR carries them natively.
+    /// `serde_json::Value`, so they carry the same data, at the cost of holding that tree
+    /// beside the encoded bytes. JSON writes integers beyond ±(2^53 − 1) through
+    /// [`json_safe_integers`]; CBOR carries them natively. CBOR output is bounded by
+    /// [`LIMITS`], so a deeper or larger value is an error.
     pub fn encode<T: Serialize + ?Sized>(self, value: &T) -> Result<Vec<u8>, String> {
         let mut value = serde_json::to_value(value).map_err(|error| error.to_string())?;
         match self {
@@ -172,7 +179,8 @@ impl Encoding {
     }
 
     /// `value` as the response body, with `Cache-Control: no-store` and `Vary: Accept`. A value
-    /// that cannot be encoded answers 500 in the same encoding.
+    /// that cannot be encoded answers 500 in the same encoding, naming the encoder's reason
+    /// (as a depth or size limit) so a client can tell which limit its request reached.
     pub fn render(self, status: StatusCode, value: impl Serialize) -> Response {
         match self.encode(&value) {
             Ok(bytes) => vary_accept(
@@ -238,7 +246,8 @@ pub fn vary_accept(mut response: Response) -> Response {
 }
 
 /// Rewrites integers beyond ±(2^53 − 1), which JSON readers may round, as
-/// `{"u64": "…"}` or `{"i64": "…"}`.
+/// `{"u64": "…"}` or `{"i64": "…"}`. `as_u64` and `as_i64` read the number whether or not
+/// serde_json's `arbitrary_precision` feature is on, so feature unification does not change it.
 pub fn json_safe_integers(value: &mut Value) {
     const SAFE: u64 = (1 << 53) - 1;
     match value {
@@ -298,19 +307,25 @@ pub struct Body {
 }
 
 impl Body {
-    /// Reads at most `limit` bytes, stopping at the limit while streaming: a declared
-    /// `Content-Length` over it, or a chunked body that reaches it, answers 413. With a
-    /// nonzero limit the `Content-Type` must be `application/json` (the default when absent)
-    /// or `application/cbor`, else 415; with a zero limit any body is 413.
+    /// Reads at most `limit` bytes, stopping at the limit while streaming. Checks run in this
+    /// order: a conflicting or non-numeric `Content-Length` is 400 and one over the
+    /// limit is 413; then, with a nonzero limit, a `Content-Type` other than `application/json`
+    /// (the default when absent) or `application/cbor` is 415; then a body that streams past
+    /// the limit is 413. With a zero limit any body is 413.
     pub async fn read(request: Request, limit: usize) -> Result<Self, BodyError> {
         let headers = request.headers();
-        if let Some(length) = headers.get(header::CONTENT_LENGTH) {
-            let Some(size) = length.to_str().ok().and_then(|v| v.parse::<u64>().ok()) else {
+        // Every Content-Length value must be the same number: hyper refuses conflicting
+        // lengths on HTTP/1, but a request handed here from elsewhere may carry them.
+        let mut declared = None;
+        for length in headers.get_all(header::CONTENT_LENGTH) {
+            let size = length.to_str().ok().and_then(|v| v.parse::<u64>().ok());
+            if size.is_none() || declared.is_some_and(|declared| Some(declared) != size) {
                 return Err(BodyError::new(StatusCode::BAD_REQUEST, "invalid Content-Length"));
-            };
-            if size > limit as u64 {
-                return Err(BodyError::too_large());
             }
+            declared = size;
+        }
+        if declared.is_some_and(|size| size > limit as u64) {
+            return Err(BodyError::too_large());
         }
         let media = headers
             .get(header::CONTENT_TYPE)
@@ -359,7 +374,9 @@ impl Body {
 ///
 /// GET, HEAD and DELETE take no body: their limit is zero, and `T` is decoded from an absent
 /// value, so such a route takes `Wire<()>` or `Wire<Option<_>>`. A refusal answers in the
-/// encoding `Accept` negotiates.
+/// encoding `Accept` negotiates. `Wire` refuses only the body: a route that negotiates
+/// takes [`Encoding`] too, which runs first and answers 406 for an unacceptable `Accept`;
+/// `Wire` alone then renders its refusals with [`Encoding::for_errors`].
 #[derive(Clone, Debug)]
 pub struct Wire<T, const LIMIT: usize = DEFAULT_BODY_LIMIT>(pub T);
 

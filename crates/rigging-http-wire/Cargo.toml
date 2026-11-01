@@ -11,12 +11,13 @@ description = "HTTP wire rules: Accept negotiation, JSON and CBOR bodies, body l
 axum = { workspace = true }
 flotilla-cbor = { path = "../flotilla-cbor" }
 serde = { workspace = true }
+# No workspace entry exists; flotilla-cbor declares it the same way.
 serde_json = "1"
 
 [dev-dependencies]
 futures-util = "0.3"
 hegeltest.workspace = true
-tokio = { version = "1", features = ["macros", "rt"] }
+tokio = { workspace = true }
 tower = { version = "0.5", features = ["util"] }
 
 [lints]
