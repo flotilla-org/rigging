@@ -170,6 +170,8 @@ async fn declared_lengths_are_checked_before_reading() {
         (vec![over.as_str()], "text/plain", StatusCode::PAYLOAD_TOO_LARGE),
         (vec!["lots"], "application/json", StatusCode::BAD_REQUEST),
         (vec!["2", "3"], "application/json", StatusCode::BAD_REQUEST),
+        (vec!["+2"], "application/json", StatusCode::BAD_REQUEST),
+        (vec![" 2"], "application/json", StatusCode::BAD_REQUEST),
     ] {
         let mut request = Request::post("/echo").header(header::CONTENT_TYPE, content_type);
         for length in lengths {
@@ -231,6 +233,27 @@ async fn encoding_faults_and_unauthorized_keep_the_error_shape() {
 
     let response = Encoding::Json.error_code(StatusCode::UNAUTHORIZED, "unauthorized", "sign in");
     assert_eq!(response.headers()[header::WWW_AUTHENTICATE], "Bearer");
+}
+
+// JSON keeps every integer within ±(2^53 − 1) a number and tags each one beyond it, at any
+// depth. Spans the whole i64 range, both exact edges and one past each, and u64 extremes.
+#[hegel::test]
+fn json_integer_profile_has_exact_boundaries(tc: hegel::TestCase) {
+    const SAFE: i64 = (1 << 53) - 1;
+    // Half the cases land exactly on an edge, where a full-range draw rarely does.
+    let n = if tc.draw(gs::booleans()) {
+        tc.draw(gs::sampled_from(vec![-SAFE - 1, -SAFE, SAFE, SAFE + 1, i64::MIN, i64::MAX]))
+    } else {
+        tc.draw(gs::integers::<i64>())
+    };
+    let mut value = json!({"nested": [n, u64::MAX, (1u64 << 53) - 1]});
+    rigging_http_wire::json_safe_integers(&mut value);
+    let expected = match n {
+        n if n > SAFE => json!({"u64": n.to_string()}),
+        n if n < -SAFE => json!({"i64": n.to_string()}),
+        n => json!(n),
+    };
+    assert_eq!(value["nested"], json!([expected, {"u64": u64::MAX.to_string()}, (1u64 << 53) - 1]));
 }
 
 // A sequence item is one independently decodable value: a `\n`-terminated JSON line, with

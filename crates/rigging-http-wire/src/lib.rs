@@ -71,14 +71,8 @@ pub fn negotiate(accept: &str, allowed: &[&str]) -> Result<usize, NotAcceptable>
         return Ok(0);
     }
     let mut candidates = vec![None::<(u8, f32)>; allowed.len()];
-    for entry in accept.split(',') {
-        let mut parts = entry.trim().split(';');
-        let media = parts.next().unwrap_or_default().trim().to_ascii_lowercase();
-        let quality = parts
-            .find_map(|p| p.split_once('=').filter(|(key, _)| key.trim().eq_ignore_ascii_case("q")).map(|(_, value)| value.trim()))
-            .unwrap_or("1")
-            .parse::<f32>()
-            .map_err(|_| NotAcceptable::InvalidQuality)?;
+    for (media, quality) in media_ranges(accept) {
+        let quality = quality.unwrap_or("1").parse::<f32>().map_err(|_| NotAcceptable::InvalidQuality)?;
         if !quality.is_finite() || !(0.0..=1.0).contains(&quality) {
             return Err(NotAcceptable::InvalidQuality);
         }
@@ -104,6 +98,18 @@ pub fn negotiate(accept: &str, allowed: &[&str]) -> Result<usize, NotAcceptable>
         .max_by(|(ia, a), (ib, b)| a.total_cmp(b).then(ib.cmp(ia)))
         .map(|(index, _)| index)
         .ok_or(NotAcceptable::NoMatch)
+}
+
+/// Each range of an `Accept` value: its lowercase media type and its raw `q` parameter.
+/// [`negotiate`] and [`Encoding::for_errors`] read ranges only through this.
+fn media_ranges(accept: &str) -> impl Iterator<Item = (String, Option<&str>)> {
+    accept.split(',').map(|entry| {
+        let mut parts = entry.trim().split(';');
+        let media = parts.next().unwrap_or_default().trim().to_ascii_lowercase();
+        let quality =
+            parts.find_map(|p| p.split_once('=').filter(|(key, _)| key.trim().eq_ignore_ascii_case("q")).map(|(_, value)| value.trim()));
+        (media, quality)
+    })
 }
 
 /// A structured response encoding.
@@ -133,12 +139,7 @@ impl Encoding {
             Ok(1 | 2) => Self::Cbor,
             Ok(_) => Self::Json,
             Err(NotAcceptable::InvalidQuality)
-                if accept.split(',').any(|range| {
-                    matches!(
-                        range.split(';').next().unwrap_or_default().trim().to_ascii_lowercase().as_str(),
-                        "application/cbor" | "application/cbor-seq"
-                    )
-                }) =>
+                if media_ranges(accept).any(|(media, _)| matches!(media.as_str(), "application/cbor" | "application/cbor-seq")) =>
             {
                 Self::Cbor
             }
@@ -318,7 +319,9 @@ impl Body {
         // lengths on HTTP/1, but a request handed here from elsewhere may carry them.
         let mut declared = None;
         for length in headers.get_all(header::CONTENT_LENGTH) {
-            let size = length.to_str().ok().and_then(|v| v.parse::<u64>().ok());
+            // RFC 9110: 1*DIGIT, so no sign or whitespace, which u64::parse would let through.
+            let size =
+                length.to_str().ok().filter(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit())).and_then(|v| v.parse::<u64>().ok());
             if size.is_none() || declared.is_some_and(|declared| Some(declared) != size) {
                 return Err(BodyError::new(StatusCode::BAD_REQUEST, "invalid Content-Length"));
             }
@@ -373,10 +376,10 @@ impl Body {
 /// A request body decoded as `T` by signature, within `LIMIT` bytes ([`Body::read`]).
 ///
 /// GET, HEAD and DELETE take no body: their limit is zero, and `T` is decoded from an absent
-/// value, so such a route takes `Wire<()>` or `Wire<Option<_>>`. A refusal answers in the
-/// encoding `Accept` negotiates. `Wire` refuses only the body: a route that negotiates
-/// takes [`Encoding`] too, which runs first and answers 406 for an unacceptable `Accept`;
-/// `Wire` alone then renders its refusals with [`Encoding::for_errors`].
+/// value, so such a route takes `Wire<()>` or `Wire<Option<_>>`. `Wire` refuses only the
+/// body, in the encoding `Accept` negotiates, or in [`Encoding::for_errors`]'s pick when
+/// `Accept` is unacceptable. A route that negotiates takes [`Encoding`] too, which runs
+/// first and answers 406 for an unacceptable `Accept` before `Wire` reads anything.
 #[derive(Clone, Debug)]
 pub struct Wire<T, const LIMIT: usize = DEFAULT_BODY_LIMIT>(pub T);
 
