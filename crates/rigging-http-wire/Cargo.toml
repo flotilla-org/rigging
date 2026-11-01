@@ -1,0 +1,23 @@
+[package]
+name = "rigging-http-wire"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "HTTP wire rules: Accept negotiation, JSON and CBOR bodies, body limits, as axum extractors"
+
+# Not gated on Unix: every server in the stack takes these rules, whatever its listener.
+[dependencies]
+axum = { workspace = true }
+flotilla-cbor = { path = "../flotilla-cbor" }
+serde = { workspace = true }
+serde_json = "1"
+
+[dev-dependencies]
+futures-util = "0.3"
+hegeltest.workspace = true
+tokio = { version = "1", features = ["macros", "rt"] }
+tower = { version = "0.5", features = ["util"] }
+
+[lints]
+workspace = true

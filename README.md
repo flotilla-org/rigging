@@ -26,6 +26,7 @@ jackstay, wheelhouse, binnacle and the rest. The rules and their reasons are in
 | `rigging-stream` | Shared Tokio `RawStream` and `ByteStream` types |
 | `rigging-ssh` | SSH session port with ambient/pinned OpenSSH Unix forwards and exec |
 | `rigging-http-serve` | Local axum serving on Unix sockets and loopback TCP with typed callers and authentication |
+| `rigging-http-wire` | HTTP wire rules for axum routes: `Accept` negotiation, JSON and CBOR bodies, limits, 406/413/415 |
 | `flotilla-cbor` | The stack's CBOR profile: deterministic writers, safe readers, limits and framing |
 | `rigging-tls` | Rustls provider selection and reqwest builders with a default User-Agent |
 | `rigging-paths` | Application-named XDG config, data, state and cache directories |
