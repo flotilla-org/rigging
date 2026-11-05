@@ -93,3 +93,19 @@ pub struct SourceDescription {
     #[serde(default)]
     pub secrets: Vec<CredentialInfo>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn debug_output_never_carries_token_or_secret_material() {
+        let created =
+            InstallCreated { install: "lab".into(), consumer_token: IssuedToken { id: "t1".into(), token: "token-material".into() } };
+        let secret = IssuedSecret { id: "s1".into(), secret: "secret-material".into() };
+        let request = AddSecret { secret: Some("requested-material".into()) };
+        let printed = format!("{created:?} {secret:?} {request:?}");
+        assert!(printed.contains("t1") && printed.contains("s1"), "ids stay visible: {printed}");
+        assert!(!printed.contains("material"), "{printed}");
+    }
+}
