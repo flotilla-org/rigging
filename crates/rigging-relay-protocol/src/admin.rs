@@ -14,7 +14,7 @@
 //! Rotation is add-then-revoke: an install may hold several valid consumer tokens and several
 //! secrets per source, so producers and consumers can move to new material without a window
 //! in which nothing verifies. Token and secret material is returned once, when created.
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, fmt};
 
 use serde::{Deserialize, Serialize};
 
@@ -27,14 +27,14 @@ pub struct InstallCreated {
     pub consumer_token: IssuedToken,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IssuedToken {
     pub id: String,
     pub token: String,
 }
 
 /// Optional body for adding a source secret. Without `secret`, the relay generates one.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AddSecret {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret: Option<String>,
@@ -43,10 +43,29 @@ pub struct AddSecret {
 /// Minimum length of an operator-supplied webhook secret.
 pub const MIN_SECRET_LEN: usize = 32;
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IssuedSecret {
     pub id: String,
     pub secret: String,
+}
+
+// Token and secret material never reaches a log through `{:?}`.
+impl fmt::Debug for IssuedToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("IssuedToken").field("id", &self.id).field("token", &"<redacted>").finish()
+    }
+}
+
+impl fmt::Debug for AddSecret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AddSecret").field("secret", &self.secret.as_ref().map(|_| "<redacted>")).finish()
+    }
+}
+
+impl fmt::Debug for IssuedSecret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("IssuedSecret").field("id", &self.id).field("secret", &"<redacted>").finish()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

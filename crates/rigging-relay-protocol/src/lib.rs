@@ -47,8 +47,8 @@ pub enum StreamFrame {
     Delivery(Delivery),
     /// The consumer's cursor is older than retention: a delivery it has not seen may have
     /// been removed. The consumer must refresh whatever it derives from the stream, then
-    /// resume from `latest_cursor`. `oldest_cursor` is the oldest retained delivery, absent
-    /// when none remain.
+    /// resume from `latest_cursor`. `oldest_cursor` is the oldest retained delivery; the relay
+    /// sends `null` when none remain.
     Gap {
         oldest_cursor: Option<u64>,
         latest_cursor: u64,
