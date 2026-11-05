@@ -1408,6 +1408,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rigging-relay-protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "rigging-replay-testkit"
 version = "0.1.0"
 dependencies = [

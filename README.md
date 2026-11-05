@@ -33,6 +33,7 @@ jackstay, wheelhouse, binnacle and the rest. The rules and their reasons are in
 | `rigging-process` | Command execution, environment variables, bounded filesystem probes, scan cache and binary/version probes |
 | `rigging-http-client` | Streaming HTTP execution; `restricted` for explicit proxy/CA without redirects, retries or ambient proxy |
 | `rigging-condition` | One condition language, a strict CEL subset: parser, canonical printer, checker, three-valued evaluator, SQLite translation and conformance corpus; builds for wasm32 |
+| `rigging-relay-protocol` | Webhook relay wire types: stream frames, the consumer ack, admin bodies and per-source configuration; serde only, builds for wasm32 |
 | `rigging-replay-testkit` | Dev-only record/replay sessions, masks, YAML fixtures, mock runners and axum HTTP stand-ins |
 
 ## Application paths and companions
