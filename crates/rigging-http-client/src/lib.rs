@@ -60,6 +60,41 @@ pub trait HttpClient: Send + Sync {
         }
         Ok(status)
     }
+
+    /// Send a request and return as soon as the response head arrives, its body read
+    /// chunk by chunk, for responses that run long or never end (a watch stream). Test
+    /// clients may use the buffered `execute`, whose body comes as one chunk. A client's
+    /// request timeout covers reading the body too, so a stream with no end needs one
+    /// without: [`ReqwestHttpClient::local`]'s, not `new`'s or `restricted`'s.
+    async fn execute_streaming(&self, request: reqwest::Request, label: &ChannelLabel) -> Result<http::Response<StreamingBody>, String> {
+        Ok(self.execute(request, label).await?.map(StreamingBody::from))
+    }
+}
+
+/// A response body read as it arrives.
+#[derive(Debug)]
+pub struct StreamingBody(Source);
+
+#[derive(Debug)]
+enum Source {
+    Live(reqwest::Response),
+    Buffered(Option<bytes::Bytes>),
+}
+
+impl StreamingBody {
+    /// The next chunk, or `None` once the body has ended.
+    pub async fn chunk(&mut self) -> Result<Option<bytes::Bytes>, String> {
+        match &mut self.0 {
+            Source::Live(response) => response.chunk().await.map_err(|error| error.to_string()),
+            Source::Buffered(body) => Ok(body.take().filter(|body| !body.is_empty())),
+        }
+    }
+}
+
+impl From<bytes::Bytes> for StreamingBody {
+    fn from(body: bytes::Bytes) -> Self {
+        Self(Source::Buffered(Some(body)))
+    }
 }
 
 /// Production implementation that delegates to `reqwest::Client`.
@@ -91,6 +126,19 @@ impl ReqwestHttpClient {
                 builder = builder.add_root_certificate(certificate);
             }
         }
+        Ok(Self { client: builder.build().map_err(|_| "cannot construct HTTP client")? })
+    }
+
+    /// A client for one Local Endpoint: every request goes to the Unix socket or, on Windows,
+    /// the named pipe at `endpoint`, whatever its URL's host. It has no proxy, redirects or
+    /// retries, and no request deadline, so streams can run for as long as they last;
+    /// bound a request with `RequestBuilder::timeout` where one is wanted.
+    pub fn local(endpoint: &Path) -> Result<Self, String> {
+        let builder = rigging_tls::client_builder().no_proxy().redirect(reqwest::redirect::Policy::none()).retry(reqwest::retry::never());
+        #[cfg(unix)]
+        let builder = builder.unix_socket(endpoint);
+        #[cfg(windows)]
+        let builder = builder.windows_named_pipe(endpoint.as_os_str());
         Ok(Self { client: builder.build().map_err(|_| "cannot construct HTTP client")? })
     }
 
@@ -138,5 +186,14 @@ impl HttpClient for ReqwestHttpClient {
             file.flush().await.map_err(|error| error.to_string())?;
         }
         Ok(status)
+    }
+
+    async fn execute_streaming(&self, request: reqwest::Request, _label: &ChannelLabel) -> Result<http::Response<StreamingBody>, String> {
+        let response = self.client.execute(request).await.map_err(|error| error.to_string())?;
+        let mut builder = http::Response::builder().status(response.status());
+        for (name, value) in response.headers() {
+            builder = builder.header(name, value);
+        }
+        builder.body(StreamingBody(Source::Live(response))).map_err(|error| error.to_string())
     }
 }

@@ -14,6 +14,11 @@ supplies the listeners on Unix.
   `application/cbor`, else 415. The route's byte limit is applied while reading,
   so a chunked body stops at the limit with 413; GET, HEAD and DELETE take none.
   CBOR decodes through `flotilla-cbor`'s safe reader within that limit.
+- **Sequences.** A response of many values, such as a watch stream, negotiates
+  `application/jsonl` (the default; `application/x-ndjson` too) or
+  `application/cbor-seq` with `Encoding::negotiate_sequence`, and writes each
+  value with `encode_item`. A client splits the body back into values with
+  `Items` as its bytes arrive; it builds without a server.
 
 ```rust,no_run
 use axum::{Router, routing::post};

@@ -400,3 +400,107 @@ impl<S: Send + Sync, T: DeserializeOwned, const LIMIT: usize> FromRequest<S> for
         value.map(Wire).map_err(|error| error.respond(encoding))
     }
 }
+
+/// A response that is a sequence of values, one [`Encoding::encode_item`] each: JSON Lines or
+/// a CBOR sequence (RFC 8742), which a client reads with [`Items`] as the bytes arrive.
+impl Encoding {
+    /// The encoding `Accept` prefers between `application/jsonl` (the default, also read as
+    /// `application/x-ndjson`) and `application/cbor-seq`.
+    pub fn negotiate_sequence(headers: &HeaderMap) -> Result<Self, NotAcceptable> {
+        Ok(match negotiate(accept(headers)?, &["application/jsonl", "application/x-ndjson", "application/cbor-seq"])? {
+            0 | 1 => Self::Json,
+            _ => Self::Cbor,
+        })
+    }
+
+    /// The `Content-Type` of a sequence response in this encoding.
+    pub fn sequence_type(self) -> &'static str {
+        match self {
+            Self::Json => "application/jsonl",
+            Self::Cbor => "application/cbor-seq",
+        }
+    }
+
+    /// The encoding a sequence response's `Content-Type` names, if it names one.
+    pub fn of_sequence(content_type: &str) -> Option<Self> {
+        match content_type.split(';').next().unwrap_or_default().trim().to_ascii_lowercase().as_str() {
+            "application/jsonl" | "application/x-ndjson" => Some(Self::Json),
+            "application/cbor-seq" => Some(Self::Cbor),
+            _ => None,
+        }
+    }
+}
+
+/// Splits a sequence body into its values as its bytes arrive, in any pieces. A value is
+/// bounded by [`LIMITS`]: one still arriving past `max_message` is an error, not more buffer.
+#[derive(Debug)]
+pub struct Items {
+    encoding: Encoding,
+    buffer: Vec<u8>,
+    /// How much of a JSON line's buffer is known to hold no newline.
+    scanned: usize,
+}
+
+impl Items {
+    pub fn new(encoding: Encoding) -> Self {
+        Self { encoding, buffer: vec![], scanned: 0 }
+    }
+
+    pub fn push(&mut self, bytes: &[u8]) {
+        self.buffer.extend_from_slice(bytes);
+    }
+
+    /// The next whole value, or `None` until more bytes arrive. JSON Lines skips blank lines.
+    /// A value past the limit, or CBOR that doesn't frame, ends the sequence: its bytes stay, so
+    /// the error comes again. A whole value that doesn't decode is passed over.
+    pub fn take<T: DeserializeOwned>(&mut self) -> Result<Option<T>, String> {
+        loop {
+            let (len, value) = match self.encoding {
+                Encoding::Json => {
+                    let Some(end) = self.buffer[self.scanned..].iter().position(|&b| b == b'\n').map(|at| self.scanned + at) else {
+                        self.scanned = self.buffer.len();
+                        return self.waiting();
+                    };
+                    self.scanned = 0;
+                    if end > LIMITS.max_message {
+                        return Err(Self::too_long());
+                    }
+                    let line = &self.buffer[..end];
+                    if line.trim_ascii().is_empty() {
+                        self.buffer.drain(..=end);
+                        continue;
+                    }
+                    (end + 1, serde_json::from_slice(line).map_err(|error| error.to_string()))
+                }
+                Encoding::Cbor => {
+                    let Some(len) = flotilla_cbor::item_len(&self.buffer, &LIMITS).map_err(|error| error.to_string())? else {
+                        return Ok(None);
+                    };
+                    (len, flotilla_cbor::from_slice(&self.buffer[..len], &LIMITS).map_err(|error| error.to_string()))
+                }
+            };
+            self.buffer.drain(..len);
+            return value.map(Some);
+        }
+    }
+
+    /// Whether no part of a value is waiting: a body that ends otherwise ended mid-value.
+    pub fn is_empty(&self) -> bool {
+        match self.encoding {
+            Encoding::Json => self.buffer.trim_ascii().is_empty(),
+            Encoding::Cbor => self.buffer.is_empty(),
+        }
+    }
+
+    fn waiting<T>(&self) -> Result<Option<T>, String> {
+        // No newline has arrived, so the buffer is one line still arriving.
+        if self.buffer.len() > LIMITS.max_message {
+            return Err(Self::too_long());
+        }
+        Ok(None)
+    }
+
+    fn too_long() -> String {
+        format!("a line of over {} bytes", LIMITS.max_message)
+    }
+}
