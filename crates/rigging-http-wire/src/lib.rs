@@ -413,6 +413,7 @@ impl Encoding {
         })
     }
 
+    /// The `Content-Type` of a sequence response in this encoding.
     pub fn sequence_type(self) -> &'static str {
         match self {
             Self::Json => "application/jsonl",
@@ -436,11 +437,13 @@ impl Encoding {
 pub struct Items {
     encoding: Encoding,
     buffer: Vec<u8>,
+    /// How much of a JSON line's buffer is known to hold no newline.
+    scanned: usize,
 }
 
 impl Items {
     pub fn new(encoding: Encoding) -> Self {
-        Self { encoding, buffer: vec![] }
+        Self { encoding, buffer: vec![], scanned: 0 }
     }
 
     pub fn push(&mut self, bytes: &[u8]) {
@@ -452,9 +455,14 @@ impl Items {
         loop {
             let (len, value) = match self.encoding {
                 Encoding::Json => {
-                    let Some(end) = self.buffer.iter().position(|&b| b == b'\n') else {
+                    let Some(end) = self.buffer[self.scanned..].iter().position(|&b| b == b'\n').map(|at| self.scanned + at) else {
+                        self.scanned = self.buffer.len();
                         return self.waiting();
                     };
+                    self.scanned = 0;
+                    if end > LIMITS.max_message {
+                        return Err(Self::too_long());
+                    }
                     let line = &self.buffer[..end];
                     if line.trim_ascii().is_empty() {
                         self.buffer.drain(..=end);
@@ -483,9 +491,14 @@ impl Items {
     }
 
     fn waiting<T>(&self) -> Result<Option<T>, String> {
+        // No newline has arrived, so the buffer is one line still arriving.
         if self.buffer.len() > LIMITS.max_message {
-            return Err(format!("a line of over {} bytes", LIMITS.max_message));
+            return Err(Self::too_long());
         }
         Ok(None)
+    }
+
+    fn too_long() -> String {
+        format!("a line of over {} bytes", LIMITS.max_message)
     }
 }

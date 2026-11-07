@@ -305,6 +305,21 @@ fn a_sequence_reads_back_as_its_bytes_arrive() {
 }
 
 #[test]
+fn a_json_line_past_the_limit_is_refused_however_it_arrives() {
+    let mut line = vec![b'"'];
+    line.resize(LIMITS.max_message + 1, b'a');
+    line.extend_from_slice(b"\"\n");
+    for piece in [line.len(), line.len() / 2] {
+        let mut reader = Items::new(Encoding::Json);
+        let refused = line.chunks(piece).any(|chunk| {
+            reader.push(chunk);
+            reader.take::<Value>().is_err()
+        });
+        assert!(refused, "in pieces of {piece}");
+    }
+}
+
+#[test]
 fn sequence_types_negotiate_and_name_their_encoding() {
     let headers = |accept: &str| {
         let mut headers = HeaderMap::new();

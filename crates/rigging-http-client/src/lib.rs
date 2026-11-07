@@ -63,7 +63,9 @@ pub trait HttpClient: Send + Sync {
 
     /// Send a request and return as soon as the response head arrives, its body read
     /// chunk by chunk, for responses that run long or never end (a watch stream). Test
-    /// clients may use the buffered `execute`, whose body comes as one chunk.
+    /// clients may use the buffered `execute`, whose body comes as one chunk. A client's
+    /// request timeout covers reading the body too, so a stream with no end needs one
+    /// without: [`ReqwestHttpClient::local`]'s, not `new`'s or `restricted`'s.
     async fn execute_streaming(&self, request: reqwest::Request, label: &ChannelLabel) -> Result<http::Response<StreamingBody>, String> {
         Ok(self.execute(request, label).await?.map(StreamingBody::from))
     }
