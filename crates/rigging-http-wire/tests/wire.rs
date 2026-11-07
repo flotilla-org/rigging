@@ -7,7 +7,7 @@ use axum::{
 };
 use futures_util::StreamExt;
 use hegel::generators as gs;
-use rigging_http_wire::{Encoding, LIMITS, Negotiated, NotAcceptable, Wire, negotiate};
+use rigging_http_wire::{Encoding, Items, LIMITS, Negotiated, NotAcceptable, Wire, negotiate};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{convert::Infallible, time::Duration};
@@ -273,4 +273,49 @@ fn sequence_items_decode_independently() {
         assert_eq!(bytes, Encoding::Cbor.encode(item).unwrap());
         assert_eq!(flotilla_cbor::from_slice::<Value>(&bytes, &LIMITS).unwrap(), *item);
     }
+}
+
+// A sequence reads back value by value however its bytes are split, in either encoding.
+#[test]
+fn a_sequence_reads_back_as_its_bytes_arrive() {
+    let items = [json!({"seq": 1, "text": "héllo"}), json!([1, "two"]), json!({"seq": 3})];
+    for encoding in [Encoding::Json, Encoding::Cbor] {
+        let bytes: Vec<u8> = items.iter().flat_map(|item| encoding.encode_item(item).unwrap()).collect();
+        for piece in [1, 3, bytes.len()] {
+            let mut reader = Items::new(encoding);
+            let mut read = vec![];
+            for chunk in bytes.chunks(piece) {
+                reader.push(chunk);
+                while let Some(value) = reader.take::<Value>().unwrap() {
+                    read.push(value);
+                }
+            }
+            assert_eq!(read, items, "{encoding:?} in pieces of {piece}");
+            assert!(reader.is_empty());
+        }
+        let mut reader = Items::new(encoding);
+        reader.push(&bytes[..bytes.len() - 1]);
+        while reader.take::<Value>().unwrap().is_some() {}
+        assert!(!reader.is_empty(), "{encoding:?} ended mid-value");
+    }
+    let mut reader = Items::new(Encoding::Json);
+    reader.push(b"\n  \n{\"a\":1}\nnot json\n");
+    assert_eq!(reader.take::<Value>().unwrap(), Some(json!({"a": 1})));
+    assert!(reader.take::<Value>().is_err());
+}
+
+#[test]
+fn sequence_types_negotiate_and_name_their_encoding() {
+    let headers = |accept: &str| {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::ACCEPT, accept.parse().unwrap());
+        headers
+    };
+    assert_eq!(Encoding::negotiate_sequence(&headers("application/cbor-seq, application/jsonl;q=0.5")), Ok(Encoding::Cbor));
+    assert_eq!(Encoding::negotiate_sequence(&headers("application/x-ndjson")), Ok(Encoding::Json));
+    assert_eq!(Encoding::negotiate_sequence(&headers("application/json")), Err(NotAcceptable::NoMatch));
+    for encoding in [Encoding::Json, Encoding::Cbor] {
+        assert_eq!(Encoding::of_sequence(&format!("{}; charset=utf-8", encoding.sequence_type())), Some(encoding));
+    }
+    assert_eq!(Encoding::of_sequence("application/json"), None);
 }
