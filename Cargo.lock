@@ -1353,6 +1353,7 @@ dependencies = [
  "reqwest",
  "rigging-process",
  "rigging-tls",
+ "tempfile",
  "tokio",
 ]
 
