@@ -451,6 +451,7 @@ impl Items {
     }
 
     /// The next whole value, or `None` until more bytes arrive. JSON Lines skips blank lines.
+    /// An error ends the sequence: the bytes that caused it stay, so it comes again.
     pub fn take<T: DeserializeOwned>(&mut self) -> Result<Option<T>, String> {
         loop {
             let (len, value) = match self.encoding {
