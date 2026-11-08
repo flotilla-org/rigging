@@ -492,35 +492,34 @@ async fn command_execution_error_survives_record_replay() {
     session.finish();
 }
 
-/// Reads `stream` to its end and finishes it.
-async fn read_to_end(stream: &mut dyn rigging_process::CommandLines) -> (Vec<String>, CommandOutput) {
+/// Reads `stream` to its end: its lines, then how it ended.
+async fn read_to_end(stream: &mut dyn rigging_process::CommandLines) -> (Vec<String>, Result<(), String>) {
     let mut lines = Vec::new();
-    while let Some(line) = stream.next_line().await.expect("read") {
-        lines.push(line);
+    loop {
+        match stream.next_line().await {
+            Ok(Some(line)) => lines.push(line),
+            Ok(None) => return (lines, Ok(())),
+            Err(error) => return (lines, Err(error)),
+        }
     }
-    (lines, stream.finish().await.expect("finish"))
 }
 
-// A line-streamed command that ends on its own replays its lines, masked, then its end.
+// A line-streamed command that fails replays its lines and its error, masked.
 #[tokio::test]
 async fn an_ended_line_stream_survives_record_replay() {
     let temp = tempfile::tempdir().expect("recording directory");
     let path = temp.path().join("lines.yaml");
     let mut masks = Masks::new();
     masks.add("/private/runtime", "{runtime}");
-    let script = "echo 'pulled /private/runtime/a'; echo second; echo 'no /private/runtime' >&2; exit 4";
-    let args = ["-c", script];
+    let args = ["-c", "echo 'pulled /private/runtime/a'; echo second; echo 'no /private/runtime' >&2; exit 4"];
     let label = rigging_process::command_channel_label("sh", &args);
     let session = Session::recording(&path, masks.clone());
     let recording = RecordingRunner::new(session.clone(), Arc::new(rigging_process::ProcessCommandRunner));
-    let mut live = recording.stream_lines("sh", &args, Path::new("/"), &label).await.expect("live");
-    let expected = read_to_end(&mut *live).await;
-    drop(live);
+    let expected = read_to_end(&mut *recording.stream_lines("sh", &args, Path::new("/"), &label).await.expect("live")).await;
     session.finish();
     let fixture = std::fs::read_to_string(&path).expect("recording");
-    assert!(fixture.contains("channel: command_lines") && !fixture.contains("/private/runtime/a"), "{fixture}");
-    assert_eq!(expected.0, ["pulled /private/runtime/a", "second"]);
-    assert_eq!((expected.1.exit_code, expected.1.stderr.as_str()), (Some(4), "no /private/runtime\n"));
+    assert!(fixture.contains("channel: command_lines") && !fixture.contains("/private/runtime"), "{fixture}");
+    assert_eq!(expected, (vec!["pulled /private/runtime/a".to_string(), "second".into()], Err("no /private/runtime\n".into())));
     let session = Session::replaying(&path, masks);
     let mut replayed = ReplayRunner::new(session.clone()).stream_lines("sh", &args, Path::new("/"), &label).await.expect("replay");
     assert_eq!(read_to_end(&mut *replayed).await, expected);
@@ -533,19 +532,17 @@ async fn an_ended_line_stream_survives_record_replay() {
 async fn a_stopped_line_stream_replays_waiting_after_its_lines() {
     let temp = tempfile::tempdir().expect("recording directory");
     let path = temp.path().join("endless.yaml");
-    let args = ["-c", "echo one; echo two; exec sleep 30"];
+    let args = ["-c", "echo one; exec sleep 30"];
     let label = rigging_process::command_channel_label("sh", &args);
     let session = Session::recording(&path, Masks::new());
     let recording = RecordingRunner::new(session.clone(), Arc::new(rigging_process::ProcessCommandRunner));
     let mut live = recording.stream_lines("sh", &args, Path::new("/"), &label).await.expect("live");
-    assert_eq!(live.next_line().await.expect("read"), Some("one".into()));
-    assert_eq!(live.next_line().await.expect("read"), Some("two".into()));
+    assert_eq!(live.next_line().await, Ok(Some("one".into())));
     drop(live);
     session.finish();
     let session = Session::replaying(&path, Masks::new());
     let mut replayed = ReplayRunner::new(session.clone()).stream_lines("sh", &args, Path::new("/"), &label).await.expect("replay");
-    assert_eq!(replayed.next_line().await.expect("read"), Some("one".into()));
-    assert_eq!(replayed.next_line().await.expect("read"), Some("two".into()));
+    assert_eq!(replayed.next_line().await, Ok(Some("one".into())));
     let waited = tokio::time::timeout(std::time::Duration::from_millis(50), replayed.next_line()).await;
     assert!(waited.is_err(), "a stopped command never ends in replay");
     session.finish();

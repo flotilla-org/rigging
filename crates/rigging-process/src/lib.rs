@@ -14,7 +14,7 @@ pub mod lines;
 pub mod probe;
 pub mod scan_cache;
 pub mod sibling;
-pub use lines::{CommandLines, ScriptedLines};
+pub use lines::CommandLines;
 pub use sibling::resolve_sibling_binary;
 
 use std::{
@@ -120,7 +120,6 @@ pub fn http_channel_label_with<const ENABLED: bool, L: ChannelLabeler + ?Sized>(
 }
 
 /// Raw output from a command, preserving stdout/stderr regardless of exit status.
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandOutput {
     pub stdout: String,
     pub stderr: String,
@@ -719,7 +718,7 @@ impl<G: CommandGuard> CommandRunner for ProcessRunner<G> {
     }
 
     async fn stream_lines(&self, cmd: &str, args: &[&str], cwd: &Path, _label: &ChannelLabel) -> Result<Box<dyn CommandLines>, String> {
-        lines::spawn_lines(self, cmd, args, cwd).await
+        Ok(Box::new(lines::ChildLines::spawn(self.checked_command(cmd, args, cwd).await?)?))
     }
 
     async fn run_with_input(&self, cmd: &str, args: &[&str], cwd: &Path, _label: &ChannelLabel, input: &[u8]) -> Result<String, String> {

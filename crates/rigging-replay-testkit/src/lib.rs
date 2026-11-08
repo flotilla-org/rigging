@@ -17,6 +17,7 @@ use tracing::warn;
 use rigging_process::ChannelLabel;
 use rigging_process::ChannelLabeler;
 use rigging_process::ChannelRequest;
+use rigging_process::CommandLines;
 use rigging_process::CommandOutput;
 use rigging_process::CommandRunner;
 use rigging_process::DefaultLabeler;
@@ -58,9 +59,11 @@ pub enum Interaction<E: ExtraChannel = NoExtra> {
         response_headers: HashMap<String, String>,
     },
     /// A command whose stdout was read line by line as it arrived
-    /// ([`CommandRunner::stream_lines`]). With no `end`, the consumer stopped
-    /// the command before it ended, and a replay waits after the last line,
-    /// as the live command would have.
+    /// ([`CommandRunner::stream_lines`]): the lines read, then how the stream
+    /// ended. `ended` with no `error` is success; `ended` with an `error` is
+    /// the stream's final error; an `error` without `ended` means the command
+    /// could not start. Neither means the consumer stopped the command, and a
+    /// replay waits after the last line, as the live command would have.
     #[serde(rename = "command_lines")]
     CommandLines {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -70,23 +73,13 @@ pub enum Interaction<E: ExtraChannel = NoExtra> {
         cwd: String,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         lines: Vec<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        end: Option<LinesEnd>,
-        /// The command could not be started.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        ended: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
     #[serde(untagged)]
     Extra(E),
-}
-
-/// How a line-streamed command ended on its own: its exit code and the tail
-/// of its stderr.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LinesEnd {
-    pub exit_code: Option<i32>,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub stderr: String,
 }
 
 // Missing exit_code in legacy fixtures meant success; explicit null represents
@@ -547,15 +540,9 @@ impl<E: ExtraChannel> CommandRunner for ReplayRunner<E> {
         Ok(CommandOutput { stdout: stdout.unwrap_or_default(), stderr: stderr.unwrap_or_default(), exit_code })
     }
 
-    async fn stream_lines(
-        &self,
-        cmd: &str,
-        args: &[&str],
-        cwd: &Path,
-        label: &ChannelLabel,
-    ) -> Result<Box<dyn rigging_process::CommandLines>, String> {
+    async fn stream_lines(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<Box<dyn CommandLines>, String> {
         let interaction = self.session.next(label);
-        let Interaction::CommandLines { cmd: expected_cmd, args: expected_args, cwd: expected_cwd, lines, end, error, .. } = interaction
+        let Interaction::CommandLines { cmd: expected_cmd, args: expected_args, cwd: expected_cwd, lines, ended, error, .. } = interaction
         else {
             panic!("ReplayRunner: expected command_lines interaction");
         };
@@ -564,11 +551,10 @@ impl<E: ExtraChannel> CommandRunner for ReplayRunner<E> {
         assert_eq!(actual_args, expected_args, "ReplayRunner: args mismatch for '{cmd}'");
         let actual_cwd = cwd.to_string_lossy();
         assert_eq!(actual_cwd, expected_cwd, "ReplayRunner: cwd mismatch for '{cmd}'");
-        if let Some(error) = error {
-            return Err(error);
+        match (ended, error) {
+            (false, Some(error)) => Err(error),
+            (ended, error) => Ok(Box::new(ScriptedLines::new(lines, ended.then(|| error.map_or(Ok(()), Err))))),
         }
-        let end = end.map(|end| CommandOutput { stdout: String::new(), stderr: end.stderr, exit_code: end.exit_code });
-        Ok(Box::new(rigging_process::ScriptedLines::new(lines, end)))
     }
 
     async fn run_with_input(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel, _input: &[u8]) -> Result<String, String> {
@@ -671,13 +657,13 @@ fn unmask_interaction<E: ExtraChannel>(interaction: &Interaction<E>, masks: &Mas
             exit_code: *exit_code,
             error: error.as_ref().map(|s| masks.unmask(s)),
         },
-        Interaction::CommandLines { label, cmd, args, cwd, lines, end, error } => Interaction::CommandLines {
+        Interaction::CommandLines { label, cmd, args, cwd, lines, ended, error } => Interaction::CommandLines {
             label: label.clone(),
             cmd: masks.unmask(cmd),
             args: args.iter().map(|a| masks.unmask(a)).collect(),
             cwd: masks.unmask(cwd),
             lines: lines.iter().map(|line| masks.unmask(line)).collect(),
-            end: end.as_ref().map(|end| LinesEnd { exit_code: end.exit_code, stderr: masks.unmask(&end.stderr) }),
+            ended: *ended,
             error: error.as_ref().map(|s| masks.unmask(s)),
         },
         Interaction::Extra(extra) => Interaction::Extra(extra.transform(&|value| masks.unmask(value))),
@@ -696,13 +682,40 @@ fn unmask_interaction<E: ExtraChannel>(interaction: &Interaction<E>, masks: &Mas
     }
 }
 
+/// Lines given up front, then an end: a stand-in for tests and replays. With
+/// no end, the command never ends on its own: after the lines,
+/// [`CommandLines::next_line`] waits until the stream is dropped, as a live
+/// never-ending command would.
+pub struct ScriptedLines {
+    lines: std::collections::VecDeque<String>,
+    end: Option<Result<(), String>>,
+}
+
+impl ScriptedLines {
+    pub fn new(lines: impl IntoIterator<Item = String>, end: Option<Result<(), String>>) -> Self {
+        Self { lines: lines.into_iter().collect(), end }
+    }
+}
+
+#[async_trait]
+impl CommandLines for ScriptedLines {
+    async fn next_line(&mut self) -> Result<Option<String>, String> {
+        if let Some(line) = self.lines.pop_front() {
+            return Ok(Some(line));
+        }
+        match self.end.as_mut() {
+            Some(end) => std::mem::replace(end, Ok(())).map(|()| None),
+            None => std::future::pending().await,
+        }
+    }
+}
+
 /// A live line stream that records the lines its consumer read. The
-/// interaction is recorded when the consumer finishes the stream, with the
-/// command's end, or when it drops the stream unfinished, with none: the
-/// consumer stopped the command.
+/// interaction is recorded when the stream ends, with how it ended, or when
+/// the consumer drops it first, with no end: the consumer stopped the command.
 struct RecordedLines<E: ExtraChannel> {
     session: Session<E>,
-    inner: Box<dyn rigging_process::CommandLines>,
+    inner: Box<dyn CommandLines>,
     interaction: Option<Interaction<E>>,
 }
 
@@ -715,22 +728,20 @@ impl<E: ExtraChannel> RecordedLines<E> {
 }
 
 #[async_trait]
-impl<E: ExtraChannel> rigging_process::CommandLines for RecordedLines<E> {
+impl<E: ExtraChannel> CommandLines for RecordedLines<E> {
     async fn next_line(&mut self) -> Result<Option<String>, String> {
-        let line = self.inner.next_line().await?;
-        if let (Some(line), Some(Interaction::CommandLines { lines, .. })) = (&line, &mut self.interaction) {
-            lines.push(line.clone());
+        let line = self.inner.next_line().await;
+        if let Some(Interaction::CommandLines { lines, ended, error, .. }) = &mut self.interaction {
+            match &line {
+                Ok(Some(line)) => lines.push(line.clone()),
+                Ok(None) => *ended = true,
+                Err(message) => (*ended, *error) = (true, Some(message.clone())),
+            }
         }
-        Ok(line)
-    }
-
-    async fn finish(&mut self) -> Result<CommandOutput, String> {
-        let output = self.inner.finish().await?;
-        if let Some(Interaction::CommandLines { end, .. }) = &mut self.interaction {
-            *end = Some(LinesEnd { exit_code: output.exit_code, stderr: output.stderr.clone() });
+        if !matches!(line, Ok(Some(_))) {
+            self.record();
         }
-        self.record();
-        Ok(output)
+        line
     }
 }
 
@@ -846,13 +857,7 @@ impl<E: ExtraChannel> CommandRunner for RecordingRunner<E> {
         self.inner.spawn_long_lived(cmd, args, cwd, label).await
     }
 
-    async fn stream_lines(
-        &self,
-        cmd: &str,
-        args: &[&str],
-        cwd: &Path,
-        label: &ChannelLabel,
-    ) -> Result<Box<dyn rigging_process::CommandLines>, String> {
+    async fn stream_lines(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<Box<dyn CommandLines>, String> {
         let request = ChannelRequest::Command { cmd, args };
         let default = DefaultLabeler.label_for(&request);
         let interaction = |error: Option<String>| Interaction::CommandLines {
@@ -861,7 +866,7 @@ impl<E: ExtraChannel> CommandRunner for RecordingRunner<E> {
             args: args.iter().map(|s| s.to_string()).collect(),
             cwd: cwd.to_string_lossy().to_string(),
             lines: Vec::new(),
-            end: None,
+            ended: false,
             error,
         };
         match self.inner.stream_lines(cmd, args, cwd, label).await {
@@ -983,13 +988,13 @@ fn mask_interaction<E: ExtraChannel>(interaction: &Interaction<E>, masks: &Masks
             exit_code: *exit_code,
             error: error.as_ref().map(|s| masks.mask(s)),
         },
-        Interaction::CommandLines { label, cmd, args, cwd, lines, end, error } => Interaction::CommandLines {
+        Interaction::CommandLines { label, cmd, args, cwd, lines, ended, error } => Interaction::CommandLines {
             label: label.clone(),
             cmd: masks.mask(cmd),
             args: args.iter().map(|a| masks.mask(a)).collect(),
             cwd: masks.mask(cwd),
             lines: lines.iter().map(|line| masks.mask(line)).collect(),
-            end: end.as_ref().map(|end| LinesEnd { exit_code: end.exit_code, stderr: masks.mask(&end.stderr) }),
+            ended: *ended,
             error: error.as_ref().map(|s| masks.mask(s)),
         },
         Interaction::Extra(extra) => Interaction::Extra(extra.transform(&|value| masks.mask(value))),
