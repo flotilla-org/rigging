@@ -48,6 +48,7 @@ fn replay_session_serves_in_order() {
             stderr: None,
             exit_code: Some(0),
             error: None,
+            ended: None,
         }],
     };
 
@@ -227,6 +228,7 @@ fn round_is_empty() {
         stderr: None,
         exit_code: Some(0),
         error: None,
+        ended: None,
     }]);
     assert!(!round.is_empty());
 }
@@ -246,6 +248,7 @@ fn recorder_saves_single_round() {
         stderr: None,
         exit_code: Some(0),
         error: None,
+        ended: None,
     });
     recorder.save();
 
@@ -273,6 +276,7 @@ fn recorder_applies_masks() {
         stderr: None,
         exit_code: Some(0),
         error: None,
+        ended: None,
     });
     recorder.save();
 
@@ -504,7 +508,8 @@ async fn read_to_end(stream: &mut dyn rigging_process::CommandLines) -> (Vec<Str
     }
 }
 
-// A line-streamed command that fails replays its lines and its error, masked.
+// A line-streamed command that fails is recorded as a command, and replays its lines and its
+// error, masked.
 #[tokio::test]
 async fn an_ended_line_stream_survives_record_replay() {
     let temp = tempfile::tempdir().expect("recording directory");
@@ -518,7 +523,7 @@ async fn an_ended_line_stream_survives_record_replay() {
     let expected = read_to_end(&mut *recording.stream_lines("sh", &args, Path::new("/"), &label).await.expect("live")).await;
     session.finish();
     let fixture = std::fs::read_to_string(&path).expect("recording");
-    assert!(fixture.contains("channel: command_lines") && !fixture.contains("/private/runtime"), "{fixture}");
+    assert!(fixture.contains("ended: true") && !fixture.contains("/private/runtime"), "{fixture}");
     assert_eq!(expected, (vec!["pulled /private/runtime/a".to_string(), "second".into()], Err("no /private/runtime\n".into())));
     let session = Session::replaying(&path, masks);
     let mut replayed = ReplayRunner::new(session.clone()).stream_lines("sh", &args, Path::new("/"), &label).await.expect("replay");
