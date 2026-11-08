@@ -10,9 +10,11 @@ pub const COMMAND_TERMINATION_GRACE: Duration = Duration::from_secs(5);
 pub const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub mod available_space;
+pub mod lines;
 pub mod probe;
 pub mod scan_cache;
 pub mod sibling;
+pub use lines::{CommandLines, ScriptedLines};
 pub use sibling::resolve_sibling_binary;
 
 use std::{
@@ -118,6 +120,7 @@ pub fn http_channel_label_with<const ENABLED: bool, L: ChannelLabeler + ?Sized>(
 }
 
 /// Raw output from a command, preserving stdout/stderr regardless of exit status.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandOutput {
     pub stdout: String,
     pub stderr: String,
@@ -210,6 +213,14 @@ pub trait CommandRunner: Send + Sync {
         _label: &ChannelLabel,
     ) -> Result<Box<dyn CommandProcess>, String> {
         Err("command runner does not support long-lived processes".to_string())
+    }
+
+    /// Start a command and read its stdout line by line as it arrives, for a
+    /// command that may never end on its own, such as `docker events`.
+    /// Dropping the returned stream stops the command; transparent wrappers
+    /// should forward this method to their inner runner.
+    async fn stream_lines(&self, _cmd: &str, _args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<Box<dyn CommandLines>, String> {
+        Err("command runner does not support line streams".to_string())
     }
 
     /// Run a command with bytes supplied on stdin. The input is deliberately
@@ -705,6 +716,10 @@ impl<G: CommandGuard> CommandRunner for ProcessRunner<G> {
             .spawn()
             .map_err(|error| error.to_string())?;
         Ok(Box::new(TokioCommandProcess { child }))
+    }
+
+    async fn stream_lines(&self, cmd: &str, args: &[&str], cwd: &Path, _label: &ChannelLabel) -> Result<Box<dyn CommandLines>, String> {
+        lines::spawn_lines(self, cmd, args, cwd).await
     }
 
     async fn run_with_input(&self, cmd: &str, args: &[&str], cwd: &Path, _label: &ChannelLabel, input: &[u8]) -> Result<String, String> {
