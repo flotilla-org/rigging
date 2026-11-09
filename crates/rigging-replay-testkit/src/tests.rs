@@ -48,6 +48,7 @@ fn replay_session_serves_in_order() {
             stderr: None,
             exit_code: Some(0),
             error: None,
+            ended: None,
         }],
     };
 
@@ -227,6 +228,7 @@ fn round_is_empty() {
         stderr: None,
         exit_code: Some(0),
         error: None,
+        ended: None,
     }]);
     assert!(!round.is_empty());
 }
@@ -246,6 +248,7 @@ fn recorder_saves_single_round() {
         stderr: None,
         exit_code: Some(0),
         error: None,
+        ended: None,
     });
     recorder.save();
 
@@ -273,6 +276,7 @@ fn recorder_applies_masks() {
         stderr: None,
         exit_code: Some(0),
         error: None,
+        ended: None,
     });
     recorder.save();
 
@@ -489,5 +493,78 @@ async fn command_execution_error_survives_record_replay() {
     let actual = ReplayRunner::new(session.clone()).run_output("pgrep", &["-x", "example-daemon"], Path::new("/"), &label).await.err();
     assert_eq!(actual, expected);
     assert_eq!(actual.as_deref(), Some("cannot execute in /private/runtime"));
+    session.finish();
+}
+
+/// Reads `stream` to its end: its lines, then how it ended.
+async fn read_to_end(stream: &mut dyn rigging_process::CommandLines) -> (Vec<String>, Result<(), String>) {
+    let mut lines = Vec::new();
+    loop {
+        match stream.next_line().await {
+            Ok(Some(line)) => lines.push(line),
+            Ok(None) => return (lines, Ok(())),
+            Err(error) => return (lines, Err(error)),
+        }
+    }
+}
+
+// A line-streamed command that fails is recorded as a command, and replays its lines and its
+// error, masked.
+#[tokio::test]
+async fn an_ended_line_stream_survives_record_replay() {
+    let temp = tempfile::tempdir().expect("recording directory");
+    let path = temp.path().join("lines.yaml");
+    let mut masks = Masks::new();
+    masks.add("/private/runtime", "{runtime}");
+    let args = ["-c", "echo 'pulled /private/runtime/a'; echo second; echo 'no /private/runtime' >&2; exit 4"];
+    let label = rigging_process::command_channel_label("sh", &args);
+    let session = Session::recording(&path, masks.clone());
+    let recording = RecordingRunner::new(session.clone(), Arc::new(rigging_process::ProcessCommandRunner));
+    let expected = read_to_end(&mut *recording.stream_lines("sh", &args, Path::new("/"), &label).await.expect("live")).await;
+    session.finish();
+    let fixture = std::fs::read_to_string(&path).expect("recording");
+    assert!(fixture.contains("ended: true") && !fixture.contains("/private/runtime"), "{fixture}");
+    assert_eq!(expected, (vec!["pulled /private/runtime/a".to_string(), "second".into()], Err("no /private/runtime\n".into())));
+    let session = Session::replaying(&path, masks);
+    let mut replayed = ReplayRunner::new(session.clone()).stream_lines("sh", &args, Path::new("/"), &label).await.expect("replay");
+    assert_eq!(read_to_end(&mut *replayed).await, expected);
+    session.finish();
+}
+
+// A never-ending command its consumer stopped records no end, and its replay waits after the
+// lines it read, as the live command would have.
+#[tokio::test]
+async fn a_stopped_line_stream_replays_waiting_after_its_lines() {
+    let temp = tempfile::tempdir().expect("recording directory");
+    let path = temp.path().join("endless.yaml");
+    let args = ["-c", "echo one; exec sleep 30"];
+    let label = rigging_process::command_channel_label("sh", &args);
+    let session = Session::recording(&path, Masks::new());
+    let recording = RecordingRunner::new(session.clone(), Arc::new(rigging_process::ProcessCommandRunner));
+    let mut live = recording.stream_lines("sh", &args, Path::new("/"), &label).await.expect("live");
+    assert_eq!(live.next_line().await, Ok(Some("one".into())));
+    drop(live);
+    session.finish();
+    let session = Session::replaying(&path, Masks::new());
+    let mut replayed = ReplayRunner::new(session.clone()).stream_lines("sh", &args, Path::new("/"), &label).await.expect("replay");
+    assert_eq!(replayed.next_line().await, Ok(Some("one".into())));
+    let waited = tokio::time::timeout(std::time::Duration::from_millis(50), replayed.next_line()).await;
+    assert!(waited.is_err(), "a stopped command never ends in replay");
+    session.finish();
+}
+
+// A command that cannot start records the error, and replays it.
+#[tokio::test]
+async fn a_line_stream_that_cannot_start_survives_record_replay() {
+    let temp = tempfile::tempdir().expect("recording directory");
+    let path = temp.path().join("missing.yaml");
+    let label = rigging_process::command_channel_label("definitely-not-a-command", &[]);
+    let session = Session::recording(&path, Masks::new());
+    let recording = RecordingRunner::new(session.clone(), Arc::new(rigging_process::ProcessCommandRunner));
+    let expected = recording.stream_lines("definitely-not-a-command", &[], Path::new("/"), &label).await.err().expect("cannot start");
+    session.finish();
+    let session = Session::replaying(&path, Masks::new());
+    let actual = ReplayRunner::new(session.clone()).stream_lines("definitely-not-a-command", &[], Path::new("/"), &label).await.err();
+    assert_eq!(actual, Some(expected));
     session.finish();
 }

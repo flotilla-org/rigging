@@ -61,6 +61,7 @@ fn extension_round_trip_preserves_schema_masks_and_order(tc: hegel::TestCase) {
                 stderr: None,
                 exit_code: Some(0),
                 error: None,
+                ended: None,
             });
         }
         recording.barrier();
