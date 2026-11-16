@@ -204,8 +204,22 @@ impl SshSession for OpenSsh {
         self.check()?;
         mux(&self.control).arg("-T").arg(&self.destination).arg(command).output().await
     }
-    async fn exec_with_input(&self, _command: &str, _input: &mut (dyn AsyncRead + Send + Unpin)) -> io::Result<Output> {
-        Err(io::ErrorKind::Unsupported.into())
+    async fn exec_with_input(&self, command: &str, input: &mut (dyn AsyncRead + Send + Unpin)) -> io::Result<Output> {
+        self.check()?;
+        let mut child = mux(&self.control).arg("-T").arg(&self.destination).arg(command).stdin(Stdio::piped()).spawn()?;
+        let mut stdin = child.stdin.take().unwrap();
+        let feed = async {
+            let copied = tokio::io::copy(input, &mut stdin).await;
+            drop(stdin);
+            copied
+        };
+        let (fed, output) = tokio::join!(feed, child.wait_with_output());
+        let output = output?;
+        match fed {
+            // The command may legitimately exit before reading all its input.
+            Err(error) if error.kind() != io::ErrorKind::BrokenPipe => Err(error),
+            _ => Ok(output),
+        }
     }
     async fn open_unix(&self, path: &Path) -> io::Result<ByteStream> {
         self.check()?;

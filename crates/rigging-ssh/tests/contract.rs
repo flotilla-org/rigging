@@ -245,6 +245,30 @@ async fn exec_status_and_stderr() {
     assert!(s.exec("exit 0").await.unwrap().status.success());
 }
 
+// Input is sent whole and then stdin is closed: `cat` only finishes at end of
+// input, and the status and stderr come back as they do from exec.
+#[tokio::test]
+async fn exec_with_input_delivers_bytes_and_closes_stdin() {
+    let f = Fixture::new().await;
+    let s = f.session().await;
+    let payload = b"\0binary\xff\nbytes";
+    let output = tokio::time::timeout(BUDGET, s.exec_with_input("cat; printf err >&2; exit 5", &mut &payload[..])).await.unwrap().unwrap();
+    assert_eq!(output.stdout, payload);
+    assert_eq!(output.stderr, b"err");
+    assert_eq!(output.status.code(), Some(5));
+}
+
+// Far larger than any pipe or channel buffer, so it can only arrive intact if
+// the input is streamed while the command consumes it.
+#[tokio::test]
+async fn exec_with_input_streams_large_input_intact() {
+    let f = Fixture::new().await;
+    let s = f.session().await;
+    let payload: Vec<u8> = (0..32 * 1024 * 1024u32).map(|i| (i.wrapping_mul(31) >> 3) as u8).collect();
+    let output = tokio::time::timeout(BUDGET, s.exec_with_input("cat", &mut &payload[..])).await.unwrap().unwrap();
+    assert!(output.stdout == payload, "echoed input differs from what was sent");
+}
+
 // Seed contract: dropping the owner closes remote listeners and active streams;
 // a listener handle must not accidentally keep the session master alive.
 #[tokio::test]
