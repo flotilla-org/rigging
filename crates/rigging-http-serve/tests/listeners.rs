@@ -128,6 +128,7 @@ async fn socket_hygiene_and_custom_identity() {
         let error = UnixServer::bind(&path, mode).await.err().unwrap();
         assert_eq!(error.kind(), ErrorKind::InvalidInput);
         assert!(!path.exists());
+        assert!(!dir.path().join("http.sock.lock").exists());
     }
     assert!(TcpServer::bind("0.0.0.0:0".parse().unwrap(), dir.path().join("token")).await.is_err());
     drop(StdUnixListener::bind(&path).unwrap());
