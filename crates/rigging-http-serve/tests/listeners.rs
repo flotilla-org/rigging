@@ -3,13 +3,18 @@ use axum::{Extension, Router, routing::get};
 use rigging_http_serve::{Caller, TcpServer, UnixServer};
 use std::{
     fs,
-    os::unix::fs::{MetadataExt, PermissionsExt, symlink},
+    io::ErrorKind,
+    os::unix::{
+        fs::{MetadataExt, PermissionsExt, symlink},
+        net::UnixListener as StdUnixListener,
+    },
+    sync::Arc,
     time::Duration,
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpStream, UnixStream},
-    sync::oneshot,
+    sync::{Barrier, oneshot},
 };
 
 async fn exchange(mut stream: impl AsyncRead + AsyncWrite + Unpin, headers: &str) -> String {
@@ -121,11 +126,11 @@ async fn socket_hygiene_and_custom_identity() {
     // Invalid modes must fail before creating or removing an endpoint.
     for mode in [0o1000, 0o1777, u32::MAX] {
         let error = UnixServer::bind(&path, mode).await.err().unwrap();
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(error.kind(), ErrorKind::InvalidInput);
         assert!(!path.exists());
     }
     assert!(TcpServer::bind("0.0.0.0:0".parse().unwrap(), dir.path().join("token")).await.is_err());
-    drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
+    drop(StdUnixListener::bind(&path).unwrap());
     let server = UnixServer::bind(&path, 0o600).await.unwrap();
     assert!(UnixServer::bind(&path, 0o600).await.is_err());
     assert!(path.exists());
@@ -138,7 +143,7 @@ async fn socket_hygiene_and_custom_identity() {
     // Replace the pathname while the original listener is alive: cleanup must
     // preserve this different socket inode.
     fs::remove_file(&path).unwrap();
-    let replacement = std::os::unix::net::UnixListener::bind(&path).unwrap();
+    let replacement = StdUnixListener::bind(&path).unwrap();
     stop.send(()).unwrap();
     task.await.unwrap().unwrap();
     assert!(path.exists());
@@ -159,7 +164,6 @@ async fn socket_hygiene_and_custom_identity() {
 // Shutdown must wait for an admitted request to finish, preserving its response.
 #[tokio::test]
 async fn graceful_shutdown_drains_requests() {
-    use std::sync::Arc;
     use tokio::sync::Notify;
     let dir = tempfile::tempdir().unwrap();
     fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
@@ -233,4 +237,59 @@ async fn ipv6_and_token_symlink_replacement() {
     assert!(response.starts_with("HTTP/1.1 401"), "{response}");
     stop.send(()).unwrap();
     task.await.unwrap().unwrap();
+}
+
+// Concurrent binders racing to reclaim one stale socket: the path lock admits
+// exactly one, and the losers must not unlink the winner's live socket.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn concurrent_stale_reclaim_has_one_owner() {
+    const BINDERS: usize = 8;
+    let dir = tempfile::tempdir().unwrap();
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let path = dir.path().join("http.sock");
+    for _ in 0..40 {
+        drop(StdUnixListener::bind(&path).unwrap());
+        let barrier = Arc::new(Barrier::new(BINDERS));
+        let binders: Vec<_> = (0..BINDERS)
+            .map(|_| {
+                let (barrier, path) = (barrier.clone(), path.clone());
+                tokio::spawn(async move {
+                    barrier.wait().await;
+                    UnixServer::bind(path, 0o600).await
+                })
+            })
+            .collect();
+        let mut winners = Vec::new();
+        for binder in binders {
+            match binder.await.unwrap() {
+                Ok(server) => winners.push(server),
+                Err(error) => assert_eq!(error.kind(), ErrorKind::AddrInUse, "{error}"),
+            }
+        }
+        assert_eq!(winners.len(), 1);
+        UnixStream::connect(&path).await.unwrap();
+        drop(winners);
+        assert!(!path.exists());
+    }
+}
+
+// The lock, not the socket, decides ownership; a leftover lock file is reusable.
+#[tokio::test]
+async fn held_lock_refuses_and_leftover_lock_file_does_not() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let path = dir.path().join("http.sock");
+    let lock = dir.path().join("http.sock.lock");
+    let first = UnixServer::bind(&path, 0o600).await.unwrap();
+    assert_eq!(fs::metadata(&lock).unwrap().mode() & 0o777, 0o600);
+    // Even with the socket gone, a held lock means another owner is running.
+    fs::remove_file(&path).unwrap();
+    assert_eq!(UnixServer::bind(&path, 0o600).await.err().unwrap().kind(), ErrorKind::AddrInUse);
+    assert!(!path.exists());
+    drop(first);
+    assert!(lock.exists());
+    let second = UnixServer::bind(&path, 0o600).await.unwrap();
+    UnixStream::connect(&path).await.unwrap();
+    drop(second);
+    assert!(lock.exists());
 }

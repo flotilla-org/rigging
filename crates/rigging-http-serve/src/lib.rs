@@ -20,11 +20,15 @@ use axum::{
 use hyper::server::conn::http1;
 use sha2::{Digest, Sha256};
 use std::{
-    fs,
+    ffi::OsString,
+    fs::{self, File, OpenOptions},
     future::Future,
     io::{self, Write},
     net::SocketAddr,
-    os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt},
+    os::{
+        fd::AsRawFd,
+        unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
+    },
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -60,10 +64,36 @@ fn private_parent(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Exclusive ownership of `<path>.lock`, released when the descriptor closes.
+fn lock_owner(path: &Path) -> io::Result<File> {
+    let mut lock_path = OsString::from(path);
+    lock_path.push(".lock");
+    // Never unlink the lock file: a newcomer could then lock a fresh inode
+    // while the current owner still holds the old one.
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(lock_path)?;
+    // SAFETY: the descriptor is open for the duration of the call.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let error = io::Error::last_os_error();
+        return Err(if error.kind() == io::ErrorKind::WouldBlock {
+            io::Error::new(io::ErrorKind::AddrInUse, "socket path is locked by another server")
+        } else {
+            error
+        });
+    }
+    Ok(file)
+}
+
 struct SocketGuard {
     path: PathBuf,
     dev: u64,
     ino: u64,
+    _lock: File,
 }
 impl SocketGuard {
     fn matches(&self) -> bool {
@@ -84,16 +114,19 @@ pub struct UnixServer {
     guard: SocketGuard,
 }
 impl UnixServer {
-    /// Refuses live sockets, symlinks and non-sockets. Only a connection-refused
-    /// socket in a private parent is considered stale. Mode is set before serving;
-    /// the private parent prevents access during bind/chmod. The stale-check/unlink
-    /// sequence assumes the owning user does not replace the path concurrently.
+    /// Takes an exclusive `flock` on `<path>.lock` (0600, same parent) for the
+    /// server's lifetime; if another server holds it, bind fails with `AddrInUse`.
+    /// Under the lock, refuses live sockets, symlinks and non-sockets; only a
+    /// connection-refused socket is stale and reclaimed. The lock file is left in
+    /// place after shutdown. Mode is set before serving; the private parent
+    /// prevents access during bind/chmod.
     pub async fn bind(path: impl AsRef<Path>, mode: u32) -> io::Result<Self> {
         let path = path.as_ref();
         private_parent(path)?;
         if mode & !0o777 != 0 {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid socket mode"));
         }
+        let lock = lock_owner(path)?;
         match fs::symlink_metadata(path) {
             Ok(meta) => {
                 if !meta.file_type().is_socket() {
@@ -117,7 +150,7 @@ impl UnixServer {
         }
         let listener = UnixListener::bind(path)?;
         let meta = fs::symlink_metadata(path)?;
-        let guard = SocketGuard { path: path.to_owned(), dev: meta.dev(), ino: meta.ino() };
+        let guard = SocketGuard { path: path.to_owned(), dev: meta.dev(), ino: meta.ino(), _lock: lock };
         fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
         Ok(Self { listener, guard })
     }
