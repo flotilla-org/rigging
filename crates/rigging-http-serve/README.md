@@ -70,10 +70,10 @@ connection-refused socket files are reclaimed; live sockets, ordinary files,
 symlinks and other connection errors are preserved. The lock file is never
 removed, so an empty `<path>.lock` remains after shutdown. The name is reserved
 for this lock: nothing else should write `<path>.lock`. `flock` is advisory and
-needs a local filesystem; keep socket directories off NFS and similar mounts. Cleanup checks device
-and inode so it preserves a replacement endpoint. Shutdown futures stop new
-accepts and drain HTTP requests; applications manage upgraded sessions and any
-shutdown deadline themselves.
+needs a local filesystem; keep socket directories off NFS and similar mounts.
+Cleanup checks device and inode so it preserves a replacement endpoint.
+Shutdown futures stop new accepts and drain HTTP requests; applications manage
+upgraded sessions and any shutdown deadline themselves.
 
 Linux uses tokio's SO_PEERCRED implementation. macOS uses its getpeereid
 implementation; PID is optional and must never be assumed available. This crate
