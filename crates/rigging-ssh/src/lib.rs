@@ -47,7 +47,8 @@ pub trait SshSession: Send + Sync {
     /// end of input finishes. Returns the same output and status as `exec`. If
     /// the command exits without reading all of `input`, the unread rest is
     /// dropped and the exit status is still returned; an error reading `input`
-    /// fails the call. Cancellation behaves as for `exec`.
+    /// kills the exec client and fails the call, so the command never sees the
+    /// truncated stream as a clean end. Cancellation behaves as for `exec`.
     async fn exec_with_input(&self, command: &str, input: &mut (dyn AsyncRead + Send + Unpin)) -> io::Result<Output>;
     async fn open_unix(&self, path: &Path) -> io::Result<ByteStream>;
     /// Returns only after the server acknowledges the remote forward.
