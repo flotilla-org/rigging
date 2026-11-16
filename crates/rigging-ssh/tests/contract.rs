@@ -245,6 +245,81 @@ async fn exec_status_and_stderr() {
     assert!(s.exec("exit 0").await.unwrap().status.success());
 }
 
+// Input is sent whole and then stdin is closed: `cat` only finishes at end of
+// input, and the status and stderr come back as they do from exec.
+#[tokio::test]
+async fn exec_with_input_delivers_bytes_and_closes_stdin() {
+    let f = Fixture::new().await;
+    let s = f.session().await;
+    let payload = b"\0binary\xff\nbytes";
+    let output = tokio::time::timeout(BUDGET, s.exec_with_input("cat; printf err >&2; exit 5", &mut &payload[..])).await.unwrap().unwrap();
+    assert_eq!(output.stdout, payload);
+    assert_eq!(output.stderr, b"err");
+    assert_eq!(output.status.code(), Some(5));
+}
+
+// Far larger than any pipe or channel buffer, so it can only arrive intact if
+// the input is streamed while the command consumes it.
+#[tokio::test]
+async fn exec_with_input_streams_large_input_intact() {
+    let f = Fixture::new().await;
+    let s = f.session().await;
+    let payload: Vec<u8> = (0..32 * 1024 * 1024u32).map(|i| (i.wrapping_mul(31) >> 3) as u8).collect();
+    let output = tokio::time::timeout(BUDGET, s.exec_with_input("cat", &mut &payload[..])).await.unwrap().unwrap();
+    assert!(output.stdout == payload, "echoed input differs from what was sent");
+}
+
+// A command that exits without reading its input still reports its status.
+#[tokio::test]
+async fn exec_with_input_early_exit_returns_status() {
+    let f = Fixture::new().await;
+    let s = f.session().await;
+    let payload = vec![7u8; 16 * 1024 * 1024];
+    let output = tokio::time::timeout(BUDGET, s.exec_with_input("head -c1; exit 3", &mut &payload[..])).await.unwrap().unwrap();
+    assert_eq!(output.status.code(), Some(3));
+    assert_eq!(output.stdout, [7]);
+}
+
+struct FailingReader(bool);
+impl tokio::io::AsyncRead for FailingReader {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        if std::mem::replace(&mut self.0, true) {
+            return std::task::Poll::Ready(Err(io::Error::other("input failed")));
+        }
+        buf.put_slice(b"partial");
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+// A read error fails the call and kills the command, which would otherwise
+// finish on the truncated input and commit it.
+#[tokio::test]
+async fn exec_with_input_read_error_kills_command() {
+    let f = Fixture::new().await;
+    let s = f.session().await;
+    let marker = f.path("committed");
+    let command = format!("cat >/dev/null; touch {}", marker.display());
+    let error = tokio::time::timeout(BUDGET, s.exec_with_input(&command, &mut FailingReader(false))).await.unwrap().unwrap_err();
+    assert_eq!(error.to_string(), "input failed");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!marker.exists());
+    assert!(s.exec("true").await.unwrap().status.success());
+}
+
+// Cancelling a command that never reads leaves the session usable.
+#[tokio::test]
+async fn exec_with_input_can_be_cancelled_without_closing_session() {
+    let f = Fixture::new().await;
+    let s = f.session().await;
+    let payload = vec![0u8; 16 * 1024 * 1024];
+    assert!(tokio::time::timeout(Duration::from_millis(300), s.exec_with_input("sleep 5", &mut &payload[..])).await.is_err());
+    assert!(s.exec("true").await.unwrap().status.success());
+}
+
 // Seed contract: dropping the owner closes remote listeners and active streams;
 // a listener handle must not accidentally keep the session master alive.
 #[tokio::test]

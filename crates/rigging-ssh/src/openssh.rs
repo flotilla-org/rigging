@@ -17,6 +17,7 @@ use std::{
     time::Duration,
 };
 use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     net::{UnixListener, UnixStream},
     process::Command,
     sync::{Mutex, OnceCell, oneshot, watch},
@@ -202,6 +203,29 @@ impl SshSession for OpenSsh {
     async fn exec(&self, command: &str) -> io::Result<Output> {
         self.check()?;
         mux(&self.control).arg("-T").arg(&self.destination).arg(command).output().await
+    }
+    async fn exec_with_input(&self, command: &str, input: &mut (dyn AsyncRead + Send + Unpin)) -> io::Result<Output> {
+        self.check()?;
+        let mut child = mux(&self.control).arg("-T").arg(&self.destination).arg(command).stdin(Stdio::piped()).spawn()?;
+        let mut stdin = child.stdin.take().expect("stdin is piped");
+        // A read error must not look like a clean end of input: try_join drops
+        // the wait on the first error, and dropping the child kills it.
+        let feed = async move {
+            let mut chunk = vec![0; 64 * 1024];
+            loop {
+                let n = input.read(&mut chunk).await?;
+                if n == 0 {
+                    return Ok(());
+                }
+                match stdin.write_all(&chunk[..n]).await {
+                    // The command may legitimately exit before reading all its input.
+                    Err(error) if error.kind() == io::ErrorKind::BrokenPipe => return Ok(()),
+                    result => result?,
+                }
+            }
+        };
+        let (_, output) = tokio::try_join!(feed, child.wait_with_output())?;
+        Ok(output)
     }
     async fn open_unix(&self, path: &Path) -> io::Result<ByteStream> {
         self.check()?;
