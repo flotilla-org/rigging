@@ -17,6 +17,7 @@ use std::{
     time::Duration,
 };
 use tokio::{
+    io::AsyncRead,
     net::{UnixListener, UnixStream},
     process::Command,
     sync::{Mutex, OnceCell, oneshot, watch},
@@ -202,6 +203,9 @@ impl SshSession for OpenSsh {
     async fn exec(&self, command: &str) -> io::Result<Output> {
         self.check()?;
         mux(&self.control).arg("-T").arg(&self.destination).arg(command).output().await
+    }
+    async fn exec_with_input(&self, _command: &str, _input: &mut (dyn AsyncRead + Send + Unpin)) -> io::Result<Output> {
+        Err(io::ErrorKind::Unsupported.into())
     }
     async fn open_unix(&self, path: &Path) -> io::Result<ByteStream> {
         self.check()?;

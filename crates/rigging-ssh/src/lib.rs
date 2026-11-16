@@ -8,6 +8,7 @@ use std::{
     process::Output,
     time::Duration,
 };
+use tokio::io::AsyncRead;
 
 #[cfg(unix)]
 mod openssh;
@@ -41,6 +42,13 @@ pub trait SshSession: Send + Sync {
     /// `tokio::time::timeout`; cancellation kills the local exec client without
     /// closing the session. Remote termination depends on SSH and the command.
     async fn exec(&self, command: &str) -> io::Result<Output>;
+    /// Like `exec`, but the command's stdin is `input`, copied as it is read
+    /// (never buffered whole) and closed at its end, so a command that reads to
+    /// end of input finishes. Returns the same output and status as `exec`. If
+    /// the command exits without reading all of `input`, the unread rest is
+    /// dropped and the exit status is still returned; an error reading `input`
+    /// fails the call. Cancellation behaves as for `exec`.
+    async fn exec_with_input(&self, command: &str, input: &mut (dyn AsyncRead + Send + Unpin)) -> io::Result<Output>;
     async fn open_unix(&self, path: &Path) -> io::Result<ByteStream>;
     /// Returns only after the server acknowledges the remote forward.
     async fn listen_unix(&self, path: &Path) -> io::Result<Box<dyn SshListener>>;
