@@ -214,9 +214,13 @@ impl SshSession for OpenSsh {
             let mut chunk = vec![0; 64 * 1024];
             loop {
                 let n = input.read(&mut chunk).await?;
-                // The command may legitimately exit before reading all its input.
-                if n == 0 || stdin.write_all(&chunk[..n]).await.is_err() {
+                if n == 0 {
                     return Ok(());
+                }
+                match stdin.write_all(&chunk[..n]).await {
+                    // The command may legitimately exit before reading all its input.
+                    Err(error) if error.kind() == io::ErrorKind::BrokenPipe => return Ok(()),
+                    result => result?,
                 }
             }
         };

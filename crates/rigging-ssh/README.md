@@ -48,7 +48,8 @@ buffered `std::process::Output` with separate stdout/stderr and remote status;
 `exec_with_input` does the same with a caller-owned `AsyncRead` streamed to the
 command's stdin and closed at its end (an unread remainder is dropped if the
 command exits early; an input read error kills the exec client and fails the
-call, so the remote never sees a truncated stream as a clean end). There is no implicit exec deadline. Callers can use
+call, so the remote never sees a truncated stream as a clean end). There is no
+implicit exec deadline. Callers can use
 `tokio::time::timeout(budget, session.exec(command))` to bound their wait.
 Cancellation kills the local exec client without closing the session; remote
 process termination is governed by SSH and the command. An optional built-in
