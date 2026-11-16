@@ -63,11 +63,17 @@ no group/other permissions. Symlink parents are refused; ancestors must be
 trusted. Concurrent pathname replacement by the owning user is outside the
 threat model. No process-global umask is changed. Socket permissions are applied
 before requests are served, protected during bind/chmod by the private parent.
-Only connection-refused socket files are reclaimed; live sockets, ordinary
-files, symlinks and other connection errors are preserved. Cleanup checks device
-and inode so it preserves a replacement endpoint. Shutdown futures stop new
-accepts and drain HTTP requests; applications manage upgraded sessions and any
-shutdown deadline themselves.
+`UnixServer::bind` holds an exclusive `flock` on `<path>.lock` (0600, beside the
+socket) until the server is dropped or its process exits; a second bind of the
+same path fails with `AddrInUse` while it is held. Under that lock, only
+connection-refused socket files are reclaimed; live sockets, ordinary files,
+symlinks and other connection errors are preserved. The lock file is never
+removed, so an empty `<path>.lock` remains after shutdown. The name is reserved
+for this lock: nothing else should write `<path>.lock`. `flock` is advisory and
+needs a local filesystem; keep socket directories off NFS and similar mounts.
+Cleanup checks device and inode so it preserves a replacement endpoint.
+Shutdown futures stop new accepts and drain HTTP requests; applications manage
+upgraded sessions and any shutdown deadline themselves.
 
 Linux uses tokio's SO_PEERCRED implementation. macOS uses its getpeereid
 implementation; PID is optional and must never be assumed available. This crate
