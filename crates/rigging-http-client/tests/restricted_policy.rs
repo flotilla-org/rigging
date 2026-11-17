@@ -1,3 +1,5 @@
+#![cfg(feature = "tls")]
+
 use rigging_http_client::{HttpClient, ReqwestHttpClient, http_channel_label};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 

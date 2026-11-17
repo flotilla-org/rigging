@@ -7,6 +7,7 @@ pub use rigging_process::{
 };
 use std::path::Path;
 
+#[cfg(feature = "tls")]
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Execute an HTTP request with an automatically derived channel label.
@@ -108,6 +109,7 @@ impl ReqwestHttpClient {
     /// roots; built-in trust roots remain enabled. Authorization stays with callers.
     /// Construction errors redact configuration values. Execution errors retain the
     /// HttpClient String port and can contain request URLs; callers must sanitize them.
+    #[cfg(feature = "tls")]
     pub fn restricted(proxy_url: Option<&str>, ca_pem: Option<&[u8]>) -> Result<Self, String> {
         let mut builder = rigging_tls::client_builder()
             .no_proxy()
@@ -134,7 +136,7 @@ impl ReqwestHttpClient {
     /// retries, and no request deadline, so streams can run for as long as they last;
     /// bound a request with `RequestBuilder::timeout` where one is wanted.
     pub fn local(endpoint: &Path) -> Result<Self, String> {
-        let builder = rigging_tls::client_builder().no_proxy().redirect(reqwest::redirect::Policy::none()).retry(reqwest::retry::never());
+        let builder = client_builder().no_proxy().redirect(reqwest::redirect::Policy::none()).retry(reqwest::retry::never());
         #[cfg(unix)]
         let builder = builder.unix_socket(endpoint);
         #[cfg(windows)]
@@ -148,16 +150,29 @@ impl ReqwestHttpClient {
     /// Panics if TLS provider initialization or reqwest client construction fails.
     /// See [`rigging_tls::install_default_provider`] for the process-wide provider
     /// initialization requirements.
+    #[cfg(feature = "tls")]
     pub fn new() -> Self {
         let client = rigging_tls::client_builder().timeout(REQUEST_TIMEOUT).build().expect("build HTTP client");
         Self { client }
     }
 }
 
+#[cfg(feature = "tls")]
 impl Default for ReqwestHttpClient {
     fn default() -> Self {
         Self::new()
     }
+}
+
+#[cfg(feature = "tls")]
+fn client_builder() -> reqwest::ClientBuilder {
+    rigging_tls::client_builder()
+}
+
+// Matches rigging-tls's User-Agent so a Local Endpoint sees the same client either way.
+#[cfg(not(feature = "tls"))]
+fn client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder().user_agent(concat!("rigging/", env!("CARGO_PKG_VERSION")))
 }
 
 #[async_trait]
