@@ -1,6 +1,6 @@
 // OpenSSH process/forward lifecycle seeded from drydock-transport b076dbea.
 use crate::{
-    SshListener, SshSession, Target,
+    SshListener, SshSession, Target, UnixForward, args,
     process::{SetupGuard, StderrTail, validate_host_key},
 };
 use async_trait::async_trait;
@@ -247,6 +247,14 @@ impl SshSession for OpenSsh {
             .await?;
         Ok(Box::new(UnixStream::connect(local).await?))
     }
+    async fn forward_unix(&self, path: &Path) -> io::Result<Box<dyn UnixForward>> {
+        self.check()?;
+        let local = self.local_path();
+        // Armed for the forward's whole life: drop cancels it, like a cancelled setup.
+        let cleanup = self.cleanup("-L", forward_spec(&local, path)?, local.clone());
+        self.forward("-L", &cleanup.spec).await?;
+        Ok(Box::new(Held { local, _cleanup: cleanup }))
+    }
     async fn listen_unix(&self, path: &Path) -> io::Result<Box<dyn SshListener>> {
         self.check()?;
         socket_path(path)?;
@@ -262,6 +270,15 @@ impl SshSession for OpenSsh {
     async fn closed(&self) {
         let mut ended = self.ended.clone();
         let _ = ended.wait_for(|ended| *ended).await;
+    }
+}
+struct Held {
+    local: PathBuf,
+    _cleanup: ForwardCleanup,
+}
+impl UnixForward for Held {
+    fn local_path(&self) -> &Path {
+        &self.local
     }
 }
 struct Incoming {
@@ -357,7 +374,9 @@ fn validate_destination(value: &str) -> io::Result<()> {
     }
 }
 fn forward_spec(local: &Path, remote: &Path) -> io::Result<String> {
-    Ok(format!("{}:{}", socket_path(local)?, socket_path(remote)?))
+    socket_path(local)?;
+    socket_path(remote)?;
+    Ok(args::forward_spec(local, remote))
 }
 fn socket_path(path: &Path) -> io::Result<&str> {
     path.to_str()

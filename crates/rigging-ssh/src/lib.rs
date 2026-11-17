@@ -10,6 +10,7 @@ use std::{
 };
 use tokio::io::AsyncRead;
 
+pub mod args;
 #[cfg(unix)]
 mod openssh;
 #[cfg(unix)]
@@ -33,6 +34,15 @@ pub trait SshListener: Send + Sync {
     async fn accept(&self) -> io::Result<ByteStream>;
 }
 
+/// A local Unix socket held for its owner: each connection to `local_path` opens
+/// a fresh channel to one remote socket. Unlike `open_unix`'s cached forward, it
+/// exists for clients that dial a path themselves. Dropping it stops new
+/// connections; established streams keep their channels while the session lives.
+/// If the process is killed, the socket stays in the session's private directory.
+pub trait UnixForward: Send + Sync {
+    fn local_path(&self) -> &Path;
+}
+
 /// Keep the session alive while using its streams/listeners. Concurrent opens
 /// are independent channels. Dropping it closes all channels and reaps the master.
 #[async_trait]
@@ -51,6 +61,8 @@ pub trait SshSession: Send + Sync {
     /// truncated stream as a clean end. Cancellation behaves as for `exec`.
     async fn exec_with_input(&self, command: &str, input: &mut (dyn AsyncRead + Send + Unpin)) -> io::Result<Output>;
     async fn open_unix(&self, path: &Path) -> io::Result<ByteStream>;
+    /// Returns only after the session has bound the local socket.
+    async fn forward_unix(&self, path: &Path) -> io::Result<Box<dyn UnixForward>>;
     /// Returns only after the server acknowledges the remote forward.
     async fn listen_unix(&self, path: &Path) -> io::Result<Box<dyn SshListener>>;
     /// Completes when the session closes; safe to call repeatedly or concurrently.

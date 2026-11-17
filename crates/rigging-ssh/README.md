@@ -1,7 +1,8 @@
 # rigging-ssh
 
-`SshSession` covers non-PTY exec, opening remote Unix streams, accepting streams
-on a remote Unix listener, and session closure. `SshListener` is the accept port.
+`SshSession` covers non-PTY exec, opening remote Unix streams, holding a local
+socket forwarded to a remote one, accepting streams on a remote Unix listener,
+and session closure. `SshListener` is the accept port.
 Both are object-safe async traits. `rigging-stream` owns the shared byte types.
 PTY attach remains native `ssh -tt` in the consumer.
 
@@ -60,7 +61,11 @@ drop. Opening that path creates a new independent SSH channel and dials the
 current remote socket, so replacing the remote listener at the same path needs
 no cache invalidation. As with ordinary
 OpenSSH local forwarding, opening the local socket can succeed before a refused
-remote target is observed as stream EOF/reset. Socket paths must be absolute and
+remote target is observed as stream EOF/reset. `forward_unix` binds a fresh local socket for one remote path and returns it
+as a `UnixForward` whose `local_path` clients can dial themselves, such as
+Tender's `UnixDial` or a socket-only CLI. Its lifetime is the holder's, not the
+cache's: dropping it cancels the forward and removes the socket, while
+established streams keep their channels until the session closes. Socket paths must be absolute and
 contain no colon, whitespace, or NUL. Remote listener paths must be unique to the
 caller; replacing stale sockets is the server/operator's `StreamLocalBindUnlink`
 policy. Listener creation waits for remote acknowledgement. Listener drop cancels
@@ -74,11 +79,19 @@ There is no automatic reconnect. `closed()` completes for all observers when the
 master exits. The port compiles on other platforms, but this backend needs Unix
 sockets and OpenSSH on PATH.
 
+`args` is for callers that run a forwarding-only `ssh` process with their own
+runner instead of `OpenSsh`. It builds forward specifications and the
+argument lists for local and reverse stream-local forwards, and its
+`wait_for_socket` waits for the forward's local socket, failing early when the
+caller's process probe reports an exit. Those callers still own destination,
+authentication and the process. The builders do not validate paths, unlike
+`OpenSsh`'s forwards.
+
 ## Contract suite
 
 `tests/contract.rs` lifts drydock#12's routing, conservation, half-close,
 concurrency, stall isolation, key refusal, forward refusal and drop scenarios,
-then adds exec status/stderr, cancelled hanging exec, listener lifetime, remote
+then adds exec status/stderr, cancelled hanging exec, listener and held-forward lifetime, remote
 socket replacement and closing notification. Additional regressions delay one
 first-open while another completes, and drop setup/listener values after their
 runtime shuts down. Routing uses two socket destinations in place of drydock's project-specific purposes.

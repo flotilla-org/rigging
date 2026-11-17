@@ -1,0 +1,42 @@
+[package]
+name = "tender"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+rigging-stream = { path = "../rigging-stream" }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = "1"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+# ed25519-dalek 2 takes rand_core 0.6, beside the 0.9 other crates use.
+rand_core = { version = "0.6", features = ["getrandom"] }
+sha2 = "0.10"
+tempfile = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+rigging-ssh = { path = "../rigging-ssh" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+hegeltest.workspace = true
+
+[features]
+# Dedicated provisioned Linux CI job; normal contracts need neither cleat nor sshd.
+ssh-cleat-proof = []
+
+[[test]]
+name = "ssh_cleat"
+path = "tests/ssh_cleat.rs"
+required-features = ["ssh-cleat-proof"]
+
+[lints]
+workspace = true
