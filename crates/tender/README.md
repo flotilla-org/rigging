@@ -85,9 +85,11 @@ hosting application. Relays see plaintext: each link's transport, such as SSH,
 provides confidentiality.
 
 Container outward publication is slice 3. Windows local adapters and Flotilla
-resource consumption are later slices. See the
-[cleat client-path research and pending proof](https://github.com/flotilla-org/flotilla/blob/main/docs/research/tender-ssh-cleat-client-paths.md)
-for real-SSH checks and the installed CLI's connect-only limitations.
+resource consumption are later slices. Cleat reaches a Tender exposure only
+through its connect-only `packets --socket` and `attach --socket` clients
+([flotilla-org/cleat#303](https://github.com/flotilla-org/cleat/pull/303)). Its
+other commands select a daemon by runtime layout and may start one, so they
+cannot target an arbitrary socket. `ci/tender/README.md` describes the real-SSH proof.
 
 ## Hosting clocks and storage
 

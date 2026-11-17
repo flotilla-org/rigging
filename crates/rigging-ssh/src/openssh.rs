@@ -1,6 +1,6 @@
 // OpenSSH process/forward lifecycle seeded from drydock-transport b076dbea.
 use crate::{
-    SshListener, SshSession, Target, UnixForward,
+    SshListener, SshSession, Target, UnixForward, args,
     process::{SetupGuard, StderrTail, validate_host_key},
 };
 use async_trait::async_trait;
@@ -374,7 +374,9 @@ fn validate_destination(value: &str) -> io::Result<()> {
     }
 }
 fn forward_spec(local: &Path, remote: &Path) -> io::Result<String> {
-    Ok(format!("{}:{}", socket_path(local)?, socket_path(remote)?))
+    socket_path(local)?;
+    socket_path(remote)?;
+    Ok(args::forward_spec(local, remote))
 }
 fn socket_path(path: &Path) -> io::Result<&str> {
     path.to_str()

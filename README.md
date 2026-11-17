@@ -17,6 +17,8 @@ jackstay, wheelhouse, binnacle and the rest. The rules and their reasons are in
   of its consumers.
 - **HTTP serving uses axum** (hyper 1, tower 0.5) in every tokio project, and
   HTTP clients use reqwest.
+- **Crates take the `rigging-` prefix,** except named components with their own
+  glossary entry, such as `tender`.
 - Publishing to a Cargo registry with semver versions comes later.
 
 ## Crates
