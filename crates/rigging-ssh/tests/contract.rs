@@ -396,6 +396,7 @@ async fn invalid_paths_and_cancelled_accept() {
         let path = std::path::Path::new(path);
         assert_eq!(s.open_unix(path).await.err().unwrap().kind(), io::ErrorKind::InvalidInput);
         assert_eq!(s.listen_unix(path).await.err().unwrap().kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(s.forward_unix(path).await.err().unwrap().kind(), io::ErrorKind::InvalidInput);
     }
     let path = f.path("reverse");
     let listener = s.listen_unix(&path).await.unwrap();
@@ -585,6 +586,79 @@ async fn cached_forward_redials_replaced_remote_socket() {
             transfer(out, Box::new(listener.accept().await.unwrap().0), payload).await;
             drop(listener);
             tokio::fs::remove_file(&path).await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+}
+
+// A held forward gives each connection to its local path a fresh channel to the
+// remote socket, so a replaced remote listener receives later connections.
+#[tokio::test]
+async fn held_forward_routes_each_connection() {
+    tokio::time::timeout(BUDGET, async {
+        let f = Fixture::new().await;
+        let s = f.session().await;
+        let path = f.path("held");
+        let forward = s.forward_unix(&path).await.unwrap();
+        for payload in [b"original".as_slice(), b"replacement".as_slice()] {
+            let listener = UnixListener::bind(&path).unwrap();
+            let out = UnixStream::connect(forward.local_path()).await.unwrap();
+            transfer(Box::new(out), Box::new(listener.accept().await.unwrap().0), payload).await;
+            drop(listener);
+            tokio::fs::remove_file(&path).await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+}
+
+// Dropping a held forward stops new connections but leaves an established
+// stream and the session itself usable.
+#[tokio::test]
+async fn held_forward_drop_preserves_established_stream() {
+    let f = Fixture::new().await;
+    let s = f.session().await;
+    let path = f.path("held");
+    let listener = UnixListener::bind(&path).unwrap();
+    let forward = s.forward_unix(&path).await.unwrap();
+    let local = forward.local_path().to_owned();
+    let out = UnixStream::connect(&local).await.unwrap();
+    let incoming = listener.accept().await.unwrap().0;
+    drop(forward);
+    tokio::time::timeout(BUDGET, async {
+        // Polling with connect would queue channels at the remote listener.
+        while tokio::fs::try_exists(&local).await.unwrap() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(UnixStream::connect(&local).await.is_err());
+        transfer(Box::new(out), Box::new(incoming), b"survives").await;
+        let again = s.open_unix(&path).await.unwrap();
+        transfer(again, Box::new(listener.accept().await.unwrap().0), b"session").await;
+    })
+    .await
+    .unwrap();
+}
+
+// A held forward never outlives its session: closing the session ends its
+// established streams, so an owner cuts a route by dropping the session.
+#[tokio::test]
+async fn session_drop_ends_held_forward_streams() {
+    let f = Fixture::new().await;
+    let s = f.session().await;
+    let path = f.path("held");
+    let listener = UnixListener::bind(&path).unwrap();
+    let forward = s.forward_unix(&path).await.unwrap();
+    let mut out = UnixStream::connect(forward.local_path()).await.unwrap();
+    let _incoming = listener.accept().await.unwrap();
+    drop(s);
+    tokio::time::timeout(BUDGET, async {
+        let mut bytes = Vec::new();
+        let ended = out.read_to_end(&mut bytes).await;
+        assert!(bytes.is_empty());
+        assert!(ended.is_ok() || ended.unwrap_err().kind() == io::ErrorKind::ConnectionReset);
+        while UnixStream::connect(forward.local_path()).await.is_ok() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
