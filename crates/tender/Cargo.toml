@@ -14,6 +14,7 @@ tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = "1"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
+# ed25519-dalek 2 takes rand_core 0.6, beside the 0.9 other crates use.
 rand_core = { version = "0.6", features = ["getrandom"] }
 sha2 = "0.10"
 tempfile = { workspace = true }

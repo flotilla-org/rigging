@@ -657,7 +657,8 @@ async fn session_drop_ends_held_forward_streams() {
         let ended = out.read_to_end(&mut bytes).await;
         assert!(bytes.is_empty());
         assert!(ended.is_ok() || ended.unwrap_err().kind() == io::ErrorKind::ConnectionReset);
-        while UnixStream::connect(forward.local_path()).await.is_ok() {
+        // Session teardown removes the private directory holding the socket.
+        while tokio::fs::try_exists(forward.local_path()).await.unwrap() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })

@@ -37,6 +37,7 @@ pub trait SshListener: Send + Sync {
 /// a fresh channel to one remote socket. Unlike `open_unix`'s cached forward, it
 /// exists for clients that dial a path themselves. Dropping it stops new
 /// connections; established streams keep their channels while the session lives.
+/// If the process is killed, the socket stays in the session's private directory.
 pub trait UnixForward: Send + Sync {
     fn local_path(&self) -> &Path;
 }

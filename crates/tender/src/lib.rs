@@ -7,7 +7,7 @@
 //! A transport adapter authenticates the caller and the pinned host before
 //! constructing a [`Session`]. Serde derives support adapter control records;
 //! the hosting runtime has its own versioned policy document, independent of
-//! application resource schemas (flotilla ADR 0047). Each connection gets a separate
+//! application resource schemas. Each connection gets a separate
 //! ordered byte stream. Control and diagnostics never enter that stream.
 
 use std::{collections::BTreeSet, fmt, io, time::Duration};

@@ -326,7 +326,7 @@ struct Hosting {
 }
 
 // Version 1 is the first durable Tender shape. Future generations must decode
-// this shape (flotilla ADR 0047); wire records remain independent of storage versioning.
+// this shape, as `tests/fixtures/authority-v1.json` pins; wire records remain independent of storage versioning.
 #[derive(Serialize, Deserialize)]
 struct Stored {
     version: u32,
