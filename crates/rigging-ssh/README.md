@@ -79,6 +79,14 @@ There is no automatic reconnect. `closed()` completes for all observers when the
 master exits. The port compiles on other platforms, but this backend needs Unix
 sockets and OpenSSH on PATH.
 
+`args` is for callers that run a forwarding-only `ssh` process with their own
+runner instead of `OpenSsh`. It builds forward specifications and the
+argument lists for local and reverse stream-local forwards, and its
+`wait_for_socket` waits for the forward's local socket, failing early when the
+caller's process probe reports an exit. Those callers still own destination,
+authentication and the process. The builders do not validate paths, unlike
+`OpenSsh`'s forwards.
+
 ## Contract suite
 
 `tests/contract.rs` lifts drydock#12's routing, conservation, half-close,

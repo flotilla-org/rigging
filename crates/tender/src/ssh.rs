@@ -526,96 +526,6 @@ async fn forward(
     }
 }
 
-/// Generic stream-local forward specification extracted from the peer
-/// transport: it carries paths, not NodeId, peer messages, or daemon discovery.
-pub fn forward_spec(local: &Path, remote: &Path) -> String {
-    format!("{}:{}", local.display(), remote.display())
-}
-
-/// Whether an owned legacy forward may replace its stale socket file.
-#[derive(Clone, Copy)]
-pub enum ExistingSocket {
-    Refuse,
-    Unlink,
-}
-
-/// OpenSSH's forwarding-only argument list, shared with the retiring peer
-/// transport. Reverse forwarding is optional and carries only endpoint paths.
-pub fn forwarding_arguments(
-    destination: &str,
-    local: &Path,
-    remote: &Path,
-    reverse: Option<(&Path, &Path)>,
-    existing_socket: ExistingSocket,
-) -> Vec<String> {
-    let mut args = vec!["-N".into(), "-L".into(), forward_spec(local, remote)];
-    if let Some((remote_listener, local_endpoint)) = reverse {
-        args.extend(["-R".into(), forward_spec(remote_listener, local_endpoint)]);
-    }
-    args.extend([
-        "-o".into(),
-        "ExitOnForwardFailure=yes".into(),
-        "-o".into(),
-        format!(
-            "StreamLocalBindUnlink={}",
-            match existing_socket {
-                ExistingSocket::Unlink => "yes",
-                ExistingSocket::Refuse => "no",
-            }
-        ),
-        "-o".into(),
-        "ServerAliveInterval=15".into(),
-        "-o".into(),
-        "ServerAliveCountMax=3".into(),
-        destination.into(),
-    ]);
-    args
-}
-
-/// OpenSSH arguments that publish a local endpoint at a remote socket path and
-/// nothing else: no local forward and no remote command. The remote listener is
-/// bound by sshd, whose own `StreamLocalBindUnlink` decides whether a stale file
-/// is replaced, so callers remove a stale remote socket before dialling.
-pub fn reverse_forwarding_arguments(destination: &str, remote_listener: &Path, local_endpoint: &Path) -> Vec<String> {
-    vec![
-        "-N".into(),
-        "-T".into(),
-        "-R".into(),
-        forward_spec(remote_listener, local_endpoint),
-        "-o".into(),
-        "ExitOnForwardFailure=yes".into(),
-        "-o".into(),
-        "BatchMode=yes".into(),
-        "-o".into(),
-        "ServerAliveInterval=15".into(),
-        "-o".into(),
-        "ServerAliveCountMax=3".into(),
-        destination.into(),
-    ]
-}
-
-/// Wait for a local forward, detecting early process exit. The process probe
-/// keeps this reusable by Flotilla's injected runner without importing it.
-pub async fn wait_for_socket(
-    socket: &Path,
-    bound: Duration,
-    mut process_status: impl FnMut() -> Result<Option<std::process::ExitStatus>, String>,
-) -> Result<(), String> {
-    let deadline = Instant::now() + bound;
-    loop {
-        if let Some(status) = process_status()? {
-            return Err(format!("ssh exited prematurely with {status}"));
-        }
-        if socket.exists() {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            return Err(format!("timed out waiting for forwarded socket at {}", socket.display()));
-        }
-        sleep(Duration::from_millis(20)).await;
-    }
-}
-
 /// A held SSH route: its own session and a stream-local forward to the remote
 /// Tender listener. The private forward is separate from stable public exposures
 /// so an SSH outage cannot rebind an exposure to a different service.
@@ -1021,20 +931,6 @@ impl Tender for SshTender {
 mod tests {
     use super::*;
 
-    // flotilla-org/flotilla#3618: a reverse forward publishes only the remote listener. It carries
-    // no local forward or remote command, and the destination is the last word.
-    #[test]
-    fn reverse_forward_carries_only_the_remote_listener() {
-        let args = reverse_forwarding_arguments("b1", Path::new("/run/user/1000/f.sock"), Path::new("/tmp/env/f.sock"));
-        assert_eq!(args.iter().filter(|arg| *arg == "-R").count(), 1);
-        assert!(!args.iter().any(|arg| arg == "-L"));
-        assert_eq!(args[args.iter().position(|arg| arg == "-R").expect("-R") + 1], "/run/user/1000/f.sock:/tmp/env/f.sock");
-        assert!(args.windows(2).any(|pair| pair == ["-o", "ExitOnForwardFailure=yes"]));
-        assert!(args.windows(2).any(|pair| pair == ["-o", "BatchMode=yes"]));
-        assert_eq!(args.last().map(String::as_str), Some("b1"));
-        assert_eq!(args[0], "-N");
-    }
-
     // A failed partial write must not install an invalid permanent key file.
     #[test]
     fn failed_key_write_leaves_no_destination() {
@@ -1121,18 +1017,6 @@ mod tests {
             drop(client);
             let _ = timeout(Duration::from_secs(1), pending).await.expect("host closes");
         }
-    }
-
-    // A stale file cannot hide a dead forward, and process-probe errors are
-    // surfaced instead of falsely certifying readiness from the file alone.
-    #[tokio::test]
-    async fn socket_waiter_checks_process_before_stale_file() {
-        use std::os::unix::process::ExitStatusExt;
-        let directory = tempfile::tempdir().expect("directory");
-        let socket = directory.path().join("stale");
-        std::fs::write(&socket, b"").expect("stale file");
-        assert!(wait_for_socket(&socket, Duration::from_secs(1), || Ok(Some(std::process::ExitStatus::from_raw(256)))).await.is_err());
-        assert_eq!(wait_for_socket(&socket, Duration::from_secs(1), || Err("probe failed".into())).await, Err("probe failed".into()));
     }
 
     // Both cancellation sources interrupt even the maximum outage backoff;

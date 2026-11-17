@@ -10,6 +10,7 @@ use std::{
 };
 use tokio::io::AsyncRead;
 
+pub mod args;
 #[cfg(unix)]
 mod openssh;
 #[cfg(unix)]

@@ -29,10 +29,7 @@ its stream-local forward (`SshSession::forward_unix`). The `rigging_ssh::Target`
 uses ordinary SSH account and ProxyJump configuration, or a pinned host key and
 identity. rigging-ssh runs batch authentication, keeps the forward in a private
 directory and never runs a remote command for it. `Forward::stop` closes only
-that SSH session. The OpenSSH forward arguments, path specifications and
-socket/process waiter remain here for Flotilla's retiring peer transport, which
-runs `ssh` through its own command runner; Flotilla discovery, hello messages,
-reverse-path naming and domain recovery stay with that caller.
+that SSH session.
 
 `ssh::SshTender` implements `Tender` over that forward, or over any `Dial`
 (`SshTender::with_dial`). A dialer opens one fresh byte stream toward a named

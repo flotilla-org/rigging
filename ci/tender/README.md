@@ -1,10 +1,15 @@
 # Cleat through Tender over real SSH
 
-The dedicated `tender-ssh-cleat.yml` job implements [flotilla-org/flotilla#2562](https://github.com/flotilla-org/flotilla/issues/2562).
-It builds cleat `00c072b207dc943f6c93fe3b6b09abaa257695a6` with its pinned Rust,
-Zig (checksum verified) and Ghostty revisions and a static Ghostty VT library.
-The provenance artifact records source revisions, toolchain configuration,
-binary version/hash and installed OpenSSH package versions.
+`.github/workflows/tender-ssh-cleat.yml` implements [flotilla-org/flotilla#2562](https://github.com/flotilla-org/flotilla/issues/2562).
+It runs on pull requests and pushes to `main` that touch Tender, `rigging-ssh`,
+`rigging-stream`, this directory, the toolchain pin or the workflow, and on
+manual dispatch. On Ubuntu 24.04 it installs OpenSSH, stops the system sshd and
+runs `build-cleat.sh`, which builds cleat `00c072b207dc943f6c93fe3b6b09abaa257695a6`
+with its pinned Rust, Zig (checksum verified) and Ghostty revisions and a static
+Ghostty VT library. It then runs clippy for Tender with `ssh-cleat-proof`, the
+real-sshd Forward test and the cleat proof below. The uploaded provenance
+artifact records source revisions, toolchain configuration, binary
+version/hash and installed OpenSSH package versions.
 
 Normal workspace tests run the local Unix socket adapter contracts and one
 real-sshd Forward smoke test, which needs OpenSSH client and server as
