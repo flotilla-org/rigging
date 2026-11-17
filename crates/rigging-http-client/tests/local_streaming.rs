@@ -9,7 +9,7 @@ use tokio::net::UnixListener;
 use tokio::sync::oneshot;
 use tokio::time::timeout;
 
-// A local client reaches its socket whatever the URL's host, and a streamed body yields each
+// A local client reaches its socket whatever the URL's host, identifies itself as rigging, and a streamed body yields each
 // chunk as the server writes it: the second chunk is held back until the first has arrived.
 #[tokio::test]
 async fn a_local_stream_yields_chunks_as_they_are_written() {
@@ -48,7 +48,9 @@ async fn a_local_stream_yields_chunks_as_they_are_written() {
     first_read.send(()).unwrap();
     assert_eq!(body.chunk().await.unwrap().as_deref(), Some(&b"second\n"[..]));
     assert_eq!(body.chunk().await.unwrap(), None);
-    assert!(server.await.unwrap().starts_with("GET /threads/t1/events HTTP/1.1\r\n"));
+    let head = server.await.unwrap();
+    assert!(head.starts_with("GET /threads/t1/events HTTP/1.1\r\n"));
+    assert!(head.contains(concat!("user-agent: rigging/", env!("CARGO_PKG_VERSION"), "\r\n")), "{head}");
 }
 
 struct Canned;

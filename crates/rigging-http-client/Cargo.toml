@@ -6,6 +6,11 @@ license.workspace = true
 repository.workspace = true
 publish = false
 
+[features]
+default = ["tls"]
+# HTTPS through rigging-tls; `local` needs neither.
+tls = ["dep:rigging-tls", "reqwest/rustls-no-provider"]
+
 [dependencies]
 async-trait.workspace = true
 tokio.workspace = true
@@ -13,7 +18,7 @@ reqwest = { workspace = true, features = ["charset", "http2", "json", "system-pr
 http.workspace = true
 bytes.workspace = true
 rigging-process = { path = "../rigging-process" }
-rigging-tls = { path = "../rigging-tls" }
+rigging-tls = { path = "../rigging-tls", optional = true }
 
 [lints]
 workspace = true

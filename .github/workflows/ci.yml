@@ -29,6 +29,11 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Test
         run: cargo test --workspace --locked
+      # The workspace build unifies rigging-http-client's default `tls` feature on.
+      - name: Clippy rigging-http-client without TLS
+        run: cargo clippy -p rigging-http-client --no-default-features --all-targets --locked -- -D warnings
+      - name: Test rigging-http-client without TLS
+        run: cargo test -p rigging-http-client --no-default-features --locked
 
   # Compile gate for the non-Unix paths (sysinfo, Windows volume APIs, the
   # child-kill branch); the process scenarios themselves run on Linux.
