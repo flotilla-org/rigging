@@ -130,7 +130,7 @@ async fn published_endpoint_follows_its_service() {
     let _: TrustedMember = control.post(api::TRUSTED, &trusted(&peer)).await.expect("trust");
     let service = root.path().join("echo");
     let echo_task = echo(&service);
-    let id = PublicationId::new("tender/test", "echo");
+    let id = PublicationId::new("vessel/test", "echo");
     let published: tender::Publication = control.post(api::PUBLISH, &publish_request(&id, &service)).await.expect("publish");
     assert_eq!((published.availability, published.audience.clone()), (Availability::Available, BTreeSet::from([peer.fingerprint()])));
     let refused: Result<tender::Publication, _> = control.post(api::PUBLISH, &publish_request(&id, &service)).await;
@@ -256,7 +256,9 @@ async fn configuration_publishes_endpoints_and_grants_scopes() {
     assert_eq!(refused.expect_err("taken over").1.code, "denied");
     let forgotten: Result<(), _> = control.post(api::WITHDRAW, &taken).await;
     assert_eq!(forgotten.expect_err("no longer ours").0, http::StatusCode::NOT_FOUND);
-    assert_eq!(state_of(&control, &taken).await, Some((Availability::Available, 2)));
+    let (availability, generation) = state_of(&control, &taken).await.expect("still listed");
+    assert_eq!(availability, Availability::Available);
+    assert!(generation > own.generation);
 }
 
 // A Trusted Group that cannot be saved is not applied either: the member

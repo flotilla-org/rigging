@@ -27,7 +27,7 @@ use tokio::{
 
 pub use self::config::{Config, ConfiguredGrant, ConfiguredPublication, TrustedFile};
 use crate::{
-    Availability, ByteStream, Error, Fingerprint, Grant, Label, Lease, Publication, PublicationId, PublishRequest, Session, Tender,
+    Availability, ByteStream, Error, Fingerprint, Grant, Label, Lease, Publication, PublicationId, PublishRequest, Scope, Session, Tender,
     api::{Instance, PublicationEntry, PublishEndpoint, TrustedInstance, TrustedMember},
     memory::MemoryTender,
     runtime::Clock,
@@ -230,7 +230,7 @@ impl Inner {
 
     fn configured(&self, configured: ConfiguredPublication) -> PublishEndpoint {
         PublishEndpoint {
-            id: PublicationId::new(configured.scope.unwrap_or_else(|| format!("tender/{}", self.fingerprint().0)), configured.name),
+            id: PublicationId { scope: configured.scope.map_or_else(|| Scope::instance(self.fingerprint()), Scope), name: configured.name },
             label: Label(configured.label),
             display: configured.display,
             endpoint: configured.endpoint,
@@ -501,7 +501,7 @@ mod tests {
         let daemon = Daemon::start(paths).await.expect("start");
         let endpoint = root.path().join("service");
         let _listener = UnixListener::bind(&endpoint).expect("service");
-        let id = PublicationId::new("scope", "service");
+        let id = PublicationId::new("vessel/scope", "service");
         let request = PublishEndpoint { id: id.clone(), label: Label("echo".into()), display: String::new(), endpoint, audience: None };
         let inner = daemon.inner.clone();
         let mut state = inner.state.lock().await;
