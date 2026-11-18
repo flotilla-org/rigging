@@ -2,20 +2,24 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    fs::Permissions,
     os::unix::fs::PermissionsExt,
     path::PathBuf,
     sync::Arc,
     time::Duration,
 };
 
+use hegel::TestCase;
 use sha2::{Digest, Sha256};
+use tempfile::{Builder, TempDir};
 use tender::{
-    Error, Fingerprint, Grant, Namespace, PublishRequest, Session, Tender,
+    Error, Fingerprint, Grant, Label, PublicationId, PublishRequest, Scope, Session, Tender,
     memory::MemoryTender,
     ssh::{Identity, Server, SshTender},
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
+    runtime,
     time::timeout,
 };
 
@@ -39,13 +43,13 @@ struct Mesh {
     host_id: Fingerprint,
     paths: Arc<BTreeMap<Fingerprint, PathBuf>>,
     servers: Vec<Server>,
-    _directory: tempfile::TempDir,
+    _directory: TempDir,
 }
 
 /// Bind a host and relays `relay-0..n`, where `routes[i]` is relay i's next
 /// hop toward the host (`None` leaves it without a router).
 fn mesh(relays: &[RelaySpec], routes: &[Option<Fingerprint>], upstream_of: impl Fn(usize) -> Fingerprint) -> Mesh {
-    let directory = tempfile::Builder::new().permissions(std::fs::Permissions::from_mode(0o700)).tempdir().expect("private directory");
+    let directory = Builder::new().permissions(Permissions::from_mode(0o700)).tempdir().expect("private directory");
     let host_identity = identity("host");
     let host_id = host_identity.fingerprint();
     let host = MemoryTender::new(host_id.clone());
@@ -85,12 +89,12 @@ fn relay_id(index: usize) -> Fingerprint {
 // caller: trust in an earlier relay is not enough. Otherwise the first refusal
 // reaches the caller unchanged. An opened stream carries bytes both ways.
 #[hegel::test]
-fn relay_chain_opens_only_through_admitted_and_trusted_hops(tc: hegel::TestCase) {
+fn relay_chain_opens_only_through_admitted_and_trusted_hops(tc: TestCase) {
     use hegel::generators as gs;
     let count = tc.draw(gs::integers::<usize>().min_value(0).max_value(4));
     let relays: Vec<_> =
         (0..count).map(|_| RelaySpec { admits_upstream: tc.draw(gs::booleans()), trusted_by_host: tc.draw(gs::booleans()) }).collect();
-    tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+    runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
         let caller = identity("caller");
         let publisher = identity("publisher");
         let upstream = |index: usize| if index == 0 { caller.fingerprint() } else { relay_id(index - 1) };
@@ -100,12 +104,12 @@ fn relay_chain_opens_only_through_admitted_and_trusted_hops(tc: hegel::TestCase)
             routes.push(Some(host));
         }
         let mesh = mesh(&relays, &routes, upstream);
-        let namespace = Namespace("services".into());
+        let scope = Scope("services".into());
         mesh.host.allow_connect(caller.fingerprint()).expect("host policy");
         mesh.host
             .grant(Grant {
                 grantee: publisher.fingerprint(),
-                namespace: namespace.clone(),
+                scope: scope.clone(),
                 audience_ceiling: BTreeSet::from([caller.fingerprint()]),
                 expires_at: 100,
             })
@@ -115,7 +119,12 @@ fn relay_chain_opens_only_through_admitted_and_trusted_hops(tc: hegel::TestCase)
             .host
             .publish(
                 &publishing,
-                PublishRequest { namespace, name: "service".into(), audience: BTreeSet::from([caller.fingerprint()]), reclaim: None },
+                PublishRequest {
+                    id: PublicationId { scope, name: "service".into() },
+                    label: Label("echo".into()),
+                    display: "Service".into(),
+                    audience: Some(BTreeSet::from([caller.fingerprint()])),
+                },
             )
             .await
             .expect("publish");
@@ -131,7 +140,7 @@ fn relay_chain_opens_only_through_admitted_and_trusted_hops(tc: hegel::TestCase)
             None if relays.last().is_some_and(|relay| !relay.trusted_by_host) => Err(Error::UntrustedIntermediary),
             None => Ok(()),
         };
-        let opened = timeout(Duration::from_secs(5), client.connect(&session, published.lease.id)).await.expect("open deadline");
+        let opened = timeout(Duration::from_secs(5), client.connect(&session, &published.lease.id)).await.expect("open deadline");
         match (opened, expected) {
             (Ok(mut stream), Ok(())) => {
                 let mut service = published.incoming.recv().await.expect("accepted stream");

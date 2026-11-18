@@ -35,7 +35,7 @@ Private directories use the default temp location.
 
 The server publishes cleat's independently owned daemon socket as an ordinary
 endpoint. SSH forwards the Tender server, and Tender owns the stable local
-exposure used by `cleat packets --socket` and `cleat attach --socket`. The packet
+Binding used by `cleat packets --socket` and `cleat attach --socket`. The packet
 client must find the session in its directory and receive an initial render;
 an absent session must be refused. The attach client runs inside a separate
 private cleat daemon, providing a real PTY and Ghostty screen capture. No cleat
