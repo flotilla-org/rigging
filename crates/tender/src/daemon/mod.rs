@@ -1,3 +1,4 @@
+mod bindings;
 mod config;
 mod control;
 
@@ -14,7 +15,7 @@ use std::{
 use libc::geteuid;
 use rand_core::{OsRng, RngCore};
 use rigging_http_serve::{Caller, UnixServer};
-use rigging_paths::{PathPolicy, runtime_dir};
+use rigging_paths::PathPolicy;
 use rigging_process::EnvVars;
 use tokio::{
     io::copy_bidirectional,
@@ -29,6 +30,7 @@ use tokio::{
     time::{interval, sleep, timeout},
 };
 
+use self::bindings::{BINDING_GRACE, Bindings, Endpoints};
 pub use self::config::{Config, ConfiguredGrant, ConfiguredPublication, TrustedFile};
 #[cfg(target_os = "linux")]
 use crate::runtime::BootClock;
@@ -36,8 +38,9 @@ use crate::runtime::BootClock;
 use crate::runtime::ProcessClock;
 use crate::{
     Availability, ByteStream, Error, Fingerprint, Grant, Label, Lease, Publication, PublicationId, PublishRequest, Scope, Session, Tender,
-    api::{Instance, PublicationEntry, PublicationList, PublishEndpoint, TrustedInstance, TrustedMember},
+    api::{BindingEntry, Instance, PeerStatus, PublicationEntry, PublicationList, PublishEndpoint, TrustedInstance, TrustedMember},
     memory::MemoryTender,
+    paths,
     runtime::Clock,
     ssh::{Identity, Server},
 };
@@ -60,20 +63,19 @@ pub struct Paths {
 
 impl Paths {
     /// Configuration and state follow `rigging-paths`; the runtime directory
-    /// is its per-user one, [`runtime_dir`], which every client finds too.
+    /// is [`paths::runtime_dir`], which every client uses too.
     pub fn from_env(env: &dyn EnvVars) -> Result<Self, String> {
         let policy = PathPolicy::from_env("tender", env)?;
-        // SAFETY: geteuid has no preconditions.
-        let runtime = runtime_dir("tender", unsafe { geteuid() }, env)?;
+        let runtime = paths::runtime_dir(env)?;
         Ok(Self { config: policy.config_dir, state: policy.state_dir, runtime })
     }
 
     pub fn control_socket(&self) -> PathBuf {
-        self.runtime.join("control")
+        paths::control_socket(&self.runtime)
     }
 
     pub fn peer_socket(&self) -> PathBuf {
-        self.runtime.join("peer")
+        paths::peer_socket(&self.runtime)
     }
 
     pub fn config_file(&self) -> PathBuf {
@@ -118,6 +120,8 @@ pub(crate) struct Inner {
     session: Session,
     server: Server,
     state: Mutex<State>,
+    endpoints: Endpoints,
+    bindings: Bindings,
 }
 
 struct State {
@@ -155,8 +159,15 @@ impl Daemon {
         let server = Server::open(paths.peer_socket(), &paths.state, clock()?)?;
         let identity = server.identity().clone();
         let fingerprint = identity.fingerprint();
-        let session = Session { caller: fingerprint.clone(), pinned_host: fingerprint, via: None };
+        let session = Session { caller: fingerprint.clone(), pinned_host: fingerprint.clone(), via: None };
         let control = UnixServer::bind(paths.control_socket(), 0o600).await?;
+        let state = State { trusted: trusted.instances, grants: config.grants, local: BTreeMap::new() };
+        apply_trust(&server.policy, &fingerprint, &state).map_err(io::Error::other)?;
+        let endpoints = Endpoints::default();
+        let own = server.policy.watch(&session).await.map_err(io::Error::other)?;
+        let grace = config.binding_grace_seconds.map_or(BINDING_GRACE, Duration::from_secs);
+        let bindings = Bindings::start(&paths.runtime, identity.clone(), server.policy.clone(), endpoints.clone(), own, grace)?;
+        bindings.trust(state.trusted.clone());
         let mut epoch = [0; 16];
         OsRng.fill_bytes(&mut epoch);
         let inner = Arc::new(Inner {
@@ -165,9 +176,10 @@ impl Daemon {
             identity,
             session,
             server,
-            state: Mutex::new(State { trusted: trusted.instances, grants: config.grants, local: BTreeMap::new() }),
+            state: Mutex::new(state),
+            endpoints,
+            bindings,
         });
-        inner.apply_trust(&*inner.state.lock().await).map_err(io::Error::other)?;
         let (configured, relative): (Vec<_>, Vec<_>) = config
             .publications
             .into_iter()
@@ -232,7 +244,46 @@ fn clock() -> io::Result<Arc<dyn Clock>> {
     Ok(Arc::new(ProcessClock::default()))
 }
 
+/// Trusted Group members may browse and connect, and a request naming no
+/// audience reaches them and this instance itself, whose Bindings include its
+/// own publications. Configured grants admit their grantees for the same
+/// group; grants no longer configured are revoked.
+fn apply_trust(policy: &MemoryTender, own: &Fingerprint, state: &State) -> Result<(), Error> {
+    let mut group: BTreeSet<Fingerprint> = state.trusted.iter().filter_map(|member| member.key.fingerprint()).collect();
+    group.insert(own.clone());
+    policy.set_access(group.clone())?;
+    policy.set_trusted_group(group.clone())?;
+    for stale in policy.grants() {
+        if !state.grants.iter().any(|grant| grant.grantee == stale.grantee && grant.scope == stale.scope) {
+            policy.revoke(&stale.grantee, &stale.scope)?;
+        }
+    }
+    for grant in &state.grants {
+        policy.grant(Grant {
+            grantee: grant.grantee.clone(),
+            scope: grant.scope.clone(),
+            audience_ceiling: group.clone(),
+            expires_at: u64::MAX,
+        })?;
+    }
+    Ok(())
+}
+
 impl Inner {
+    fn apply_trust(&self, state: &State) -> Result<(), Error> {
+        apply_trust(self.policy(), self.fingerprint(), state)?;
+        self.bindings.trust(state.trusted.clone());
+        Ok(())
+    }
+
+    pub(crate) fn bindings(&self) -> Vec<BindingEntry> {
+        self.bindings.bindings()
+    }
+
+    pub(crate) fn peers(&self) -> Vec<PeerStatus> {
+        self.bindings.peers()
+    }
+
     fn policy(&self) -> &MemoryTender {
         &self.server.policy
     }
@@ -253,30 +304,6 @@ impl Inner {
             endpoint: configured.endpoint,
             audience: configured.audience,
         }
-    }
-
-    /// Trusted Group members may browse and connect, and a request naming no
-    /// audience reaches them. Configured grants admit their grantees for the
-    /// same group; grants no longer configured are revoked.
-    fn apply_trust(&self, state: &State) -> Result<(), Error> {
-        let group: BTreeSet<Fingerprint> = state.trusted.iter().filter_map(|member| member.key.fingerprint()).collect();
-        let policy = self.policy();
-        policy.set_access(group.clone())?;
-        policy.set_trusted_group(group.clone())?;
-        for stale in policy.grants() {
-            if !state.grants.iter().any(|grant| grant.grantee == stale.grantee && grant.scope == stale.scope) {
-                policy.revoke(&stale.grantee, &stale.scope)?;
-            }
-        }
-        for grant in &state.grants {
-            policy.grant(Grant {
-                grantee: grant.grantee.clone(),
-                scope: grant.scope.clone(),
-                audience_ceiling: group.clone(),
-                expires_at: u64::MAX,
-            })?;
-        }
-        Ok(())
     }
 
     /// The endpoint is probed first, outside the state lock, so a slow
@@ -304,6 +331,10 @@ impl Inner {
         } else {
             (self.policy().reserve(&self.session, claim)?, None)
         };
+        // Only an accepted publication's socket reaches the Binder, so a
+        // refused one never redirects the incumbent's Binding.
+        self.endpoints.lock().expect("endpoints lock").insert(request.id.clone(), (lease.generation, request.endpoint.clone()));
+        self.bindings.endpoints_changed();
         // Replacing an earlier Local drops it, which stops its pump; its
         // streams already open keep running on their own tasks.
         state.local.insert(request.id.clone(), Local { lease: lease.clone(), request, pump });

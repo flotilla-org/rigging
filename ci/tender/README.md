@@ -33,9 +33,12 @@ host/client keys and connects through a `rigging_ssh::Target::Pinned`, which
 pins the host key and disables ambient SSH configuration and agent identities.
 Private directories use the default temp location.
 
-The server publishes cleat's independently owned daemon socket as an ordinary
-endpoint. SSH forwards the Tender server, and Tender owns the stable local
-Binding used by `cleat packets --socket` and `cleat attach --socket`. The packet
+Two `tender serve` daemons stand in for two machines. The far one publishes
+cleat's independently owned daemon socket from its `config.toml`. The near one
+pairs with it with `tender trust pair` over the loopback sshd, through an
+`ssh` wrapper on its PATH that plays the operator's ssh_config, and keeps an
+eager Binding at the computed path used by `cleat packets --socket` and
+`cleat attach --socket`. The packet
 client must find the session in its directory and receive an initial render;
 an absent session must be refused. The attach client runs inside a separate
 private cleat daemon, providing a real PTY and Ghostty screen capture. No cleat
@@ -43,9 +46,11 @@ framing or packet codec is implemented here. Client HOME/runtime/state directori
 and must remain empty.
 
 A fixture service disables echo, responds to input, and appends each received
-line to a log. The test checks render after input, closes only the SSH session,
-observes Tender Unavailable and refusal by a fresh cleat client, and captures
-the still-living service directly. Replacing the SSH route lets fresh clients
+line to a log. The test checks render after input, then loses only SSH: the
+wrapper refuses new connections and the near daemon's SSH session is ended. It
+observes the Binding's `RouteUnavailable` and refusal by a fresh cleat client,
+and captures the still-living service directly. Restoring SSH lets the daemon
+open a fresh forward, and fresh clients
 discover and render the same session, then deliver new input. The exact service
 log proves neither previous input nor reconnect input was replayed. Test
 subprocess deadlines, child guards and private-daemon teardown bound failures

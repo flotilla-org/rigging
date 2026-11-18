@@ -1,10 +1,15 @@
 #![cfg(target_os = "linux")]
 
+#[allow(dead_code)]
+#[path = "common/control.rs"]
+mod control;
+#[allow(dead_code)]
+#[path = "common/node.rs"]
+mod node;
 #[path = "common/ssh.rs"]
 mod ssh_fixture;
 
 use std::{
-    collections::BTreeSet,
     env,
     fs::{self, Permissions},
     os::unix::fs::PermissionsExt,
@@ -14,13 +19,10 @@ use std::{
 };
 
 use libc::{SIGTERM, kill};
-use tempfile::{Builder, TempDir};
 
-use tender::{
-    Availability, Grant, Label, PublicationId, PublishRequest, Scope, Session, Tender,
-    memory::MemoryTender,
-    ssh::{Forward, Identity, Server, SshTender},
-};
+use node::{Node, SshAlias, eventually};
+use tempfile::{Builder, TempDir};
+use tender::{BindingState, PublicationId, UnavailableReason, api::BindingEntry, paths};
 use tokio::{
     process::Command,
     time::{sleep, timeout},
@@ -147,56 +149,40 @@ async fn cleat_survives_ssh_loss_and_fresh_client_recovers() {
     };
     fs::create_dir(terminal.root.path().join("empty-client")).expect("empty attach client home");
     let service_socket = cleat.socket();
+    // The far daemon publishes cleat's own socket from configuration; the near
+    // one pairs with it over SSH and binds it, as a client machine would.
     let sshd = ssh_fixture::Sshd::start().await;
-    let host = Identity::generate();
-    let caller = Identity::generate();
-    let policy = MemoryTender::new(host.fingerprint());
-    policy.allow_browse(caller.fingerprint()).expect("browse policy");
-    policy.allow_connect(caller.fingerprint()).expect("connect policy");
-    policy
-        .grant(Grant {
-            grantee: caller.fingerprint(),
-            scope: Scope("services".into()),
-            audience_ceiling: BTreeSet::from([caller.fingerprint()]),
-            expires_at: 100,
-        })
-        .expect("grant");
-    let session = Session { caller: caller.fingerprint(), pinned_host: host.fingerprint(), via: None };
-    let endpoint = sshd.directory.path().join("tender");
-    let server = Server::bind(endpoint.clone(), host.clone(), policy).expect("Tender server");
-    let lease = server
-        .publish_endpoint(
-            &session,
-            PublishRequest {
-                id: PublicationId::new("services", "cleat"),
-                label: Label("cleat".into()),
-                display: "Proof cleat daemon".into(),
-                audience: Some(BTreeSet::from([caller.fingerprint()])),
-            },
-            service_socket,
-        )
-        .await
-        .expect("existing cleat publication");
-    let mut forward = Forward::start(sshd.target.clone(), &endpoint).await.expect("real SSH route");
-    let adapter = SshTender::new(forward.socket().to_owned(), host.fingerprint(), vec![caller]).expect("adapter");
-    let binding = adapter.bind(&session, &lease.id).await.expect("Tender-owned binding");
-    let mut watch = adapter.watch(&session).await.expect("availability watch");
-    assert_eq!(watch.recv().await.expect("initial availability")[0].availability, Availability::Available);
-    let packet = cleat.packets(&binding.local_endpoint, SESSION).await;
+    let alias = SshAlias::new(&sshd);
+    let far = Node::start(&format!(
+        "[[publication]]\nscope = \"vessel/proof\"\nname = \"cleat/default\"\nlabel = \"cleat\"\ndisplay = \"Proof cleat daemon\"\nendpoint = \"{}\"\n",
+        service_socket.display()
+    ))
+    .await;
+    let near = Node::start_with("", alias.env.clone()).await;
+    let remote = format!("env TENDER_ROOT={} {}", far.root.path().display(), env!("CARGO_BIN_EXE_tender"));
+    near.cli(&["trust", "pair", "tender-peer", "--remote-tender", &remote, "--expect-fingerprint", &far.instance.fingerprint.0]).await;
+    let id = PublicationId::new("vessel/proof", "cleat/default");
+    let state = |binding: Option<BindingEntry>| binding.map(|binding| binding.state);
+    eventually("the near daemon binds the cleat publication", || async {
+        matches!(state(near.binding(&id).await), Some(BindingState::Available { .. }))
+    })
+    .await;
+    let binding = paths::binding_path(&near.runtime(), &id).to_str().expect("binding path").to_owned();
+    let packet = cleat.packets(&binding, SESSION).await;
     assert!(packet.status.success(), "directory/session/render: {}", String::from_utf8_lossy(&packet.stderr));
     assert!(String::from_utf8_lossy(&packet.stdout).contains("mode_changes=initial"));
-    let missing = cleat.packets(&binding.local_endpoint, "absent-session").await;
+    let missing = cleat.packets(&binding, "absent-session").await;
     assert!(!missing.status.success());
     assert!(String::from_utf8_lossy(&missing.stderr).contains("not present in packet directory"));
-    terminal.attach(&binding.local_endpoint, "client-before").await;
+    terminal.attach(&binding, "client-before").await;
     terminal.rendered("client-before", "READY").await;
     terminal.output(&["send", "client-before", "before"]).await;
     terminal.rendered("client-before", "REPLY:before").await;
     let before = cleat.output(&["capture", SESSION]).await;
     assert_eq!(fs::read_to_string(&log).expect("input log"), "before\n");
 
-    // Kill only SSH; the existing daemon/session and its screen stay alive.
-    forward.stop();
+    // Lose only SSH; the existing daemon/session and its screen stay alive.
+    alias.sever();
     timeout(DEADLINE, async {
         loop {
             let state = timeout(DEADLINE, terminal.command().args(["inspect", "client-before", "--json"]).output())
@@ -216,21 +202,22 @@ async fn cleat_survives_ssh_loss_and_fresh_client_recovers() {
     })
     .await
     .expect("old attach exits without reconnect");
-    assert_eq!(
-        timeout(DEADLINE, watch.recv()).await.expect("outage watch deadline").expect("outage snapshot")[0].availability,
-        Availability::Unavailable
-    );
-    assert_eq!(adapter.browse(&session).await.expect("cached unavailable")[0].availability, Availability::Unavailable);
+    eventually("the Binding reports the lost route", || async {
+        matches!(state(near.binding(&id).await), Some(BindingState::Unavailable { reason: UnavailableReason::RouteUnavailable, .. }))
+    })
+    .await;
     assert_eq!(cleat.output(&["capture", SESSION]).await, before, "cleat screen survives SSH loss");
-    let unavailable = cleat.packets(&binding.local_endpoint, SESSION).await;
+    let unavailable = cleat.packets(&binding, SESSION).await;
     assert!(!unavailable.status.success(), "socket-only client must refuse an unavailable route");
-    assert!(Path::new(&binding.local_endpoint).exists(), "stable Tender binding survives route loss");
+    assert!(Path::new(&binding).exists(), "the Binding keeps its Local Endpoint through route loss");
 
-    let restored = Forward::start(sshd.target.clone(), &endpoint).await.expect("fresh SSH route");
-    adapter.replace_route(restored.socket().to_owned());
-    assert_eq!(adapter.browse(&session).await.expect("recovered browse")[0].availability, Availability::Available);
-    assert!(cleat.packets(&binding.local_endpoint, SESSION).await.status.success(), "fresh packet client discovers living session");
-    terminal.attach(&binding.local_endpoint, "client-after").await;
+    alias.restore();
+    eventually("a fresh SSH forward restores the Binding", || async {
+        matches!(state(near.binding(&id).await), Some(BindingState::Available { .. }))
+    })
+    .await;
+    assert!(cleat.packets(&binding, SESSION).await.status.success(), "fresh packet client discovers living session");
+    terminal.attach(&binding, "client-after").await;
     terminal.rendered("client-after", "REPLY:before").await;
     assert_eq!(fs::read_to_string(&log).expect("no replay log"), "before\n", "fresh initial render does not replay old input");
     terminal.output(&["send", "client-after", "after"]).await;

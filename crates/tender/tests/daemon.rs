@@ -21,6 +21,7 @@ use tender::{
     Availability, Error, Fingerprint, Label, PublicKey, Publication, PublicationId, PublishRequest, Scope, Session, Tender,
     api::{self, Instance, PublicationList, PublishEndpoint, TrustedInstance, TrustedMember, Untrust},
     daemon::{Daemon, Paths},
+    paths::binding_path,
     ssh::{Identity, SshTender},
 };
 use tokio::{
@@ -144,11 +145,20 @@ async fn published_endpoint_follows_its_service() {
     let echo_task = echo(&service);
     let id = PublicationId::new("vessel/test", "echo");
     let published: Publication = control.post(api::PUBLISH, &publish_request(&id, &service)).await.expect("publish");
-    assert_eq!((published.availability, published.audience.clone()), (Availability::Available, BTreeSet::from([peer.fingerprint()])));
-    let refused: Result<Publication, _> = control.post(api::PUBLISH, &publish_request(&id, &service)).await;
+    let group = BTreeSet::from([peer.fingerprint(), host.clone()]);
+    assert_eq!((published.availability, published.audience.clone()), (Availability::Available, group));
+    let refused: Result<Publication, _> = control.post(api::PUBLISH, &publish_request(&id, &root.path().join("other"))).await;
     assert_eq!(refused.expect_err("live incumbent").1.code, "live_publisher");
+    // A later publication makes the Binder reconcile; the refused socket
+    // must not have reached it.
+    let unrelated = PublicationId::new("vessel/test", "unrelated");
+    let _: Publication = control.post(api::PUBLISH, &publish_request(&unrelated, &service)).await.expect("publish");
+    let binding = |id| fs::read_link(binding_path(&paths.runtime, id)).ok();
+    eventually("the later publication is bound", || async { binding(&unrelated) == Some(service.clone()) }).await;
+    assert_eq!(binding(&id), Some(service.clone()), "the incumbent's Binding still reaches its socket");
     let list: PublicationList = control.get(api::PUBLICATIONS).await.expect("publications");
-    assert_eq!(list.publications[0].endpoint.as_deref(), Some(service.as_path()));
+    let entry = list.publications.iter().find(|entry| entry.publication.id == id).expect("listed");
+    assert_eq!(entry.endpoint.as_deref(), Some(service.as_path()));
 
     let client = SshTender::new(paths.peer_socket(), host.clone(), vec![peer.clone()]).expect("peer client");
     let session = Session { caller: peer.fingerprint(), pinned_host: host, via: None };
@@ -163,12 +173,17 @@ async fn published_endpoint_follows_its_service() {
     })
     .await;
     let _echo = echo(&service);
-    eventually("recovered endpoint is published again", || async { state_of(&control, &id).await == Some((Availability::Available, 2)) })
-        .await;
+    eventually("recovered endpoint is published again", || async {
+        state_of(&control, &id)
+            .await
+            .is_some_and(|(availability, generation)| availability == Availability::Available && generation > published.generation)
+    })
+    .await;
+    let (_, recovered) = state_of(&control, &id).await.expect("listed");
     echoes(client.connect(&session, &id).await.expect("connect after recovery")).await;
 
     let _: () = control.post(api::WITHDRAW, &id).await.expect("withdraw");
-    assert_eq!(state_of(&control, &id).await, Some((Availability::Withdrawn, 2)));
+    assert_eq!(state_of(&control, &id).await, Some((Availability::Withdrawn, recovered)));
     assert_eq!(client.connect(&session, &id).await.err(), Some(Error::Withdrawn));
     let _: () = control.post(api::WITHDRAW, &id).await.expect("withdrawing again changes nothing");
     let unknown: Result<(), _> = control.post(api::WITHDRAW, &PublicationId::new("vessel/test", "never")).await;
@@ -245,7 +260,7 @@ async fn configuration_publishes_endpoints_and_grants_scopes() {
     let mut published = client.publish(&as_helper, request("vessel/7")).await.expect("granted publish");
     let visible = client.browse(&Session { caller: member.fingerprint(), pinned_host: host.clone(), via: None }).await.expect("browse");
     let vessel = visible.iter().find(|publication| publication.id == published.lease.id).expect("visible to the group");
-    assert_eq!(vessel.audience, BTreeSet::from([member.fingerprint()]));
+    assert_eq!(vessel.audience, BTreeSet::from([member.fingerprint(), host.clone()]));
     let as_member = Session { caller: member.fingerprint(), pinned_host: host, via: None };
     let stream = client.connect(&as_member, &published.lease.id).await.expect("member connects");
     let mut service = timeout(Duration::from_secs(5), published.incoming.recv()).await.expect("accept deadline").expect("accepted");

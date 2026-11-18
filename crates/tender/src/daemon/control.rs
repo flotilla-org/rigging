@@ -26,6 +26,7 @@ pub(super) fn router(inner: Arc<Inner>) -> Router {
         .route(api::TRUSTED, get(trusted).post(trust))
         .route(api::UNTRUST, post(untrust))
         .route(api::DIAGNOSTICS, get(diagnostics))
+        .route(api::BINDINGS, get(bindings))
         .with_state(inner)
 }
 
@@ -73,9 +74,21 @@ async fn untrust(State(inner): Daemon, encoding: Encoding, Wire(untrust): Wire<U
     }
 }
 
+async fn bindings(State(inner): Daemon, encoding: Encoding) -> Response {
+    encoding.ok(inner.bindings()).into_response()
+}
+
 async fn diagnostics(State(inner): Daemon, encoding: Encoding) -> Response {
     let publications = inner.publications().await.publications.len();
-    encoding.ok(Diagnostics { instance: inner.instance(), publications, trusted: inner.trusted_count().await }).into_response()
+    encoding
+        .ok(Diagnostics {
+            instance: inner.instance(),
+            publications,
+            trusted: inner.trusted_count().await,
+            bindings: inner.bindings().len(),
+            peers: inner.peers(),
+        })
+        .into_response()
 }
 
 /// The wire contract for each refusal: its status and stable code.

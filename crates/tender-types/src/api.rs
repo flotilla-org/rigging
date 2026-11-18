@@ -5,7 +5,7 @@ use std::{collections::BTreeSet, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Fingerprint, Label, PublicKey, Publication, PublicationId};
+use crate::{BindingState, Fingerprint, Label, PublicKey, Publication, PublicationId};
 
 pub const IDENTITY: &str = "/v1/identity";
 pub const PUBLICATIONS: &str = "/v1/publications";
@@ -14,6 +14,7 @@ pub const WITHDRAW: &str = "/v1/withdraw";
 pub const TRUSTED: &str = "/v1/trusted";
 pub const UNTRUST: &str = "/v1/trusted/remove";
 pub const DIAGNOSTICS: &str = "/v1/diagnostics";
+pub const BINDINGS: &str = "/v1/bindings";
 
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
 pub struct Instance {
@@ -84,11 +85,46 @@ pub struct Untrust {
     pub fingerprint: Fingerprint,
 }
 
+/// One of this machine's Bindings. Its Local Endpoint is
+/// [`crate::paths::binding_path`] of its identity, whatever its state.
+#[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
+pub struct BindingEntry {
+    pub publication: PublicationId,
+    pub label: Label,
+    pub display: String,
+    pub local_endpoint: PathBuf,
+    pub state: BindingState,
+}
+
+/// How this instance's following of one Trusted Group member stands.
+#[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
+#[serde(rename_all = "snake_case", tag = "state")]
+pub enum PeerState {
+    /// The member has no route from here, so it is trusted but not followed.
+    NoRoute,
+    Connecting,
+    Following {
+        publications: usize,
+    },
+    Unreachable {
+        reason: String,
+    },
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
+pub struct PeerStatus {
+    pub fingerprint: Fingerprint,
+    pub name: String,
+    pub state: PeerState,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
 pub struct Diagnostics {
     pub instance: Instance,
     pub publications: usize,
     pub trusted: usize,
+    pub bindings: usize,
+    pub peers: Vec<PeerStatus>,
 }
 
 /// The `{"code", "message"}` shape of every error body.

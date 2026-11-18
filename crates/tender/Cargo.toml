@@ -8,17 +8,17 @@ publish = false
 
 [dependencies]
 rigging-stream = { path = "../rigging-stream" }
+tender-types = { path = "../tender-types" }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
-serde_json = "1"
+serde_json = { workspace = true }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 # ed25519-dalek 2 takes rand_core 0.6, beside the 0.9 other crates use.
 rand_core = { version = "0.6", features = ["getrandom"] }
-sha2 = "0.10"
+sha2 = { workspace = true }
 tempfile = { workspace = true }
-clap = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
@@ -27,9 +27,12 @@ rigging-http-serve = { path = "../rigging-http-serve" }
 rigging-http-wire = { path = "../rigging-http-wire" }
 rigging-paths = { path = "../rigging-paths" }
 rigging-process = { path = "../rigging-process" }
+clap = { workspace = true }
 axum = { workspace = true }
 toml = { workspace = true }
 libc = { workspace = true }
+rigging-http-client = { path = "../rigging-http-client", default-features = false }
+reqwest = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

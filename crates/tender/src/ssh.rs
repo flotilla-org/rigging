@@ -37,6 +37,7 @@ use crate::{
     Binding, BindingState, ByteStream, Dial, Error, Fingerprint, Lease, PublicKey, Publication, PublicationId, PublishRequest, Published,
     Router, Session, Tender, UnavailableReason, Watch,
     memory::MemoryTender,
+    paths::MAX_SOCKET_PATH,
     runtime::{Clock, FileStore},
 };
 
@@ -45,9 +46,6 @@ const MAX_CONTROL: usize = 64 * 1024;
 const MAX_CHANNELS: usize = 256;
 /// Bounds a relay chain, so a routing loop between relays fails promptly.
 const MAX_RELAY_HOPS: u8 = 8;
-/// The longest Unix socket path every platform accepts: `sun_path` holds 104
-/// bytes with its terminating NUL on macOS.
-const MAX_SOCKET_PATH: usize = 103;
 /// A Binding listener's name, its number in hex.
 const MAX_BINDING_NAME: usize = 16;
 
@@ -685,6 +683,33 @@ impl SshTender {
         })
         .await
         .map_err(|_| Error::Deadline)?
+    }
+
+    /// Like [`Tender::watch`], but the receiver closes when the control stream
+    /// does, instead of reconnecting: the caller learns the route failed and
+    /// restores it, perhaps through a new forward, before subscribing again.
+    pub async fn subscribe(&self, session: &Session) -> Result<Watch, Error> {
+        let mut stream = self.request(session, Request::Watch).await?;
+        let first = timeout(OPEN_TIMEOUT, read_control(&mut stream)).await.map_err(|_| Error::Deadline)?.map_err(|_| Error::Unavailable)?;
+        let first = match first {
+            Response::Publications(publications) => publications,
+            Response::Error(error) => return Err(error),
+            _ => return Err(Error::Unavailable),
+        };
+        let (sender, receiver) = mpsc::unbounded_channel();
+        sender.send(first).expect("new watch receiver");
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = sender.closed() => break,
+                    response = read_control(&mut stream) => match response {
+                        Ok(Response::Publications(publications)) => if sender.send(publications).is_err() { break },
+                        _ => break,
+                    },
+                }
+            }
+        });
+        Ok(receiver)
     }
 
     async fn reply(&self, session: &Session, request: Request) -> Result<Response, Error> {
