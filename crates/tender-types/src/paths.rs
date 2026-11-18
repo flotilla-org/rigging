@@ -154,6 +154,9 @@ mod tests {
         let long = binding_path(runtime, &PublicationId::new("vessel/abc", "x".repeat(80)));
         assert!(long.file_name().unwrap().to_str().unwrap().starts_with('~'));
         assert_ne!(long, binding_path(runtime, &PublicationId::new("vessel/abc", "x".repeat(81))));
+        // `~` is escaped, so a readable name never looks like a hashed one.
+        let tilde = binding_path(runtime, &PublicationId::new("~", "~"));
+        assert_eq!(tilde.file_name().unwrap(), "%7E,%7E");
     }
 
     #[test]

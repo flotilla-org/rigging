@@ -90,7 +90,9 @@ enum Trust {
         fingerprint: String,
     },
     /// Exchange keys with the instance at an SSH destination, so each trusts
-    /// the other and this one follows it over SSH.
+    /// the other and this one follows it over SSH. This trusts whatever key
+    /// the instance there presents: the SSH destination's own authentication
+    /// is all that vouches for it.
     Pair {
         destination: String,
         /// What this instance calls the other one. Default: the destination.
@@ -321,5 +323,38 @@ impl Control {
             });
             Err(format!("{}: {}", error.code, error.message))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Whatever a name holds, the far shell sees it as one literal word.
+    #[test]
+    fn quoted_values_stay_one_shell_word() {
+        for value in ["plain", "with space", "it's", "$(touch /tmp/x)", "'; rm -rf ~; '", ""] {
+            let output = std::process::Command::new("sh").args(["-c", &format!("printf %s {}", quote(value))]).output().expect("sh");
+            assert_eq!(String::from_utf8(output.stdout).expect("UTF-8"), value);
+        }
+    }
+
+    #[test]
+    fn routes_read_as_written() {
+        assert_eq!(route(&None), "not followed");
+        assert_eq!(route(&Some(PeerRoute { ssh: None, socket: "/run/peer".into() })), "/run/peer");
+        assert_eq!(route(&Some(PeerRoute { ssh: Some("me@kiwi".into()), socket: "/run/peer".into() })), "ssh me@kiwi /run/peer");
+    }
+
+    // An SSH destination needs the far socket too; pairing learns it instead.
+    #[test]
+    fn arguments() {
+        assert!(Cli::try_parse_from(["tender", "trust", "add", "key", "--ssh", "kiwi"]).is_err());
+        let Cli { command: Command::Trust(Trust::Pair { destination, remote_tender, .. }), json: true } =
+            Cli::try_parse_from(["tender", "trust", "pair", "kiwi", "--json"]).expect("pair")
+        else {
+            panic!("pair")
+        };
+        assert_eq!((destination.as_str(), remote_tender.as_str()), ("kiwi", "tender"));
     }
 }

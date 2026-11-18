@@ -16,7 +16,7 @@ use tokio::{
     net::UnixListener,
     sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
     task::JoinHandle,
-    time::sleep,
+    time::{Instant, sleep},
 };
 
 use crate::{
@@ -29,6 +29,7 @@ use crate::{
 
 const RETRY_FIRST: Duration = Duration::from_millis(100);
 const RETRY_LONGEST: Duration = Duration::from_secs(8);
+const ROUTE_SETTLED: Duration = Duration::from_secs(10);
 
 pub(super) enum Event {
     Local(Vec<Publication>),
@@ -49,8 +50,9 @@ pub(super) struct View {
     pub peers: Vec<PeerStatus>,
 }
 
-/// The daemon's handle on its Bindings. Dropping it stops following and
-/// removes every Binding's Local Endpoint.
+/// The daemon's handle on its Bindings. Dropping it stops following; the
+/// Local Endpoints go as the aborted tasks unwind, which a process exit may
+/// cut short, so `start` clears any a previous run left.
 pub(super) struct Bindings {
     events: UnboundedSender<Event>,
     view: Arc<Mutex<View>>,
@@ -78,12 +80,17 @@ impl Bindings {
     ) -> io::Result<Self> {
         let directory = paths::bindings_dir(runtime);
         // Bindings belong to a running daemon; a previous run's are stale.
+        // The daemon has already checked that the runtime directory is this
+        // user's own and private, so nobody else can plant what is removed.
         match std::fs::remove_dir_all(&directory) {
             Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
             _ => {}
         }
         std::fs::create_dir(&directory)?;
         std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?;
+        // Unbounded: senders are the followers and the local watch, each one
+        // snapshot per change, and the Binder drains every pending event
+        // before each rebind, so the backlog stays at a few snapshots.
         let (events, receiver) = unbounded_channel();
         let view = Arc::new(Mutex::new(View::default()));
         let own = identity.fingerprint();
@@ -379,7 +386,9 @@ fn place(bound: &mut Bound, id: &PublicationId, link: Option<PathBuf>, target: T
     match (&bound.endpoint, link) {
         (Some(Endpoint::Link(current)), Some(link)) if current == &link => Ok(()),
         (_, Some(link)) => {
-            let staging = bound.path.with_extension(format!("link-{}", std::process::id()));
+            let mut staging = bound.path.clone().into_os_string();
+            staging.push(format!(".link-{}", std::process::id()));
+            let staging = PathBuf::from(staging);
             let _ = std::fs::remove_file(&staging);
             std::os::unix::fs::symlink(&link, &staging)?;
             std::fs::rename(&staging, &bound.path)?;
@@ -456,7 +465,7 @@ async fn follow(fingerprint: Fingerprint, route: PeerRoute, identity: Identity, 
         .await;
         match attempt {
             Ok((adapter, mut watch, _forward)) => {
-                delay = RETRY_FIRST;
+                let connected = Instant::now();
                 if !send(PeerUpdate::Connected(adapter)) {
                     return;
                 }
@@ -468,6 +477,9 @@ async fn follow(fingerprint: Fingerprint, route: PeerRoute, identity: Identity, 
                 if !send(PeerUpdate::Lost("the route closed".into())) {
                     return;
                 }
+                // Only a route that stayed up earns a quick retry; one that
+                // drops as soon as it opens backs off like a failure.
+                delay = if connected.elapsed() >= ROUTE_SETTLED { RETRY_FIRST } else { (delay * 2).min(RETRY_LONGEST) };
             }
             Err(reason) => {
                 if !send(PeerUpdate::Lost(reason)) {

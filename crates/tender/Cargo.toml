@@ -13,11 +13,11 @@ tokio = { workspace = true }
 async-trait = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
-serde_json = "1"
+serde_json = { workspace = true }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 # ed25519-dalek 2 takes rand_core 0.6, beside the 0.9 other crates use.
 rand_core = { version = "0.6", features = ["getrandom"] }
-sha2 = "0.10"
+sha2 = { workspace = true }
 tempfile = { workspace = true }
 tracing-subscriber = { workspace = true }
 

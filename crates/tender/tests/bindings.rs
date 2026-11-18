@@ -9,7 +9,11 @@ mod node;
 #[path = "common/ssh.rs"]
 mod ssh_fixture;
 
-use std::{os::unix::fs::MetadataExt, path::Path, time::Duration};
+use std::{
+    os::unix::fs::{FileTypeExt, MetadataExt},
+    path::Path,
+    time::Duration,
+};
 
 use node::{Node, eventually};
 use tender::{
@@ -102,6 +106,11 @@ async fn bindings_follow_publications_between_paired_daemons() {
     })
     .await;
     assert!(refused_promptly(&path).await, "an unavailable Binding refuses or closes at once");
+    eventually("A's own link gives way to a refusing listener", || async {
+        std::fs::symlink_metadata(&own).is_ok_and(|metadata| metadata.file_type().is_socket())
+    })
+    .await;
+    assert!(refused_promptly(&own).await, "the withdrawn service is not reachable through its old link");
 
     // A helper granted the scope takes over; B's Binding follows in place.
     let client = SshTender::new(a.instance.peer_socket.clone(), a.instance.fingerprint.clone(), vec![helper.clone()]).expect("helper");
@@ -232,4 +241,30 @@ async fn pairing_over_ssh_binds_through_a_forward() {
     })
     .await;
     assert!(round_trip(&path, b"after the outage").await);
+}
+
+// Changing a member's route restarts its follower: a member trusted at a
+// wrong socket is unreachable until its route is corrected.
+#[tokio::test]
+async fn corrected_route_restarts_following() {
+    let host = Node::start("").await;
+    let viewer = Node::start("").await;
+    host.trust(&viewer).await;
+    let wrong = viewer.root.path().join("nowhere");
+    viewer.cli(&["trust", "add", &host.instance.key.0, "--socket", wrong.to_str().expect("path")]).await;
+    eventually("the wrong route is unreachable", || async {
+        let diagnostics: Diagnostics = viewer.control.get(api::DIAGNOSTICS).await.expect("diagnostics");
+        diagnostics.peers.iter().any(|peer| matches!(peer.state, PeerState::Unreachable { .. }))
+    })
+    .await;
+    let service = host.root.path().join("echo.sock");
+    let _echo = echo(&service);
+    host.cli(&["publish", "vessel/5", "echo", "--label", "echo", "--endpoint", service.to_str().expect("path")]).await;
+    viewer.trust(&host).await;
+    let id = PublicationId::new("vessel/5", "echo");
+    eventually("the corrected route is followed", || async {
+        viewer.binding(&id).await.is_some_and(|binding| matches!(binding.state, BindingState::Available { .. }))
+    })
+    .await;
+    assert!(round_trip(&paths::binding_path(&viewer.runtime(), &id), b"rerouted").await);
 }

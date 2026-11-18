@@ -113,7 +113,9 @@ asks for a Binding, and binding never starts anything on either side.
   `tender path` prints it and `GET /v1/bindings` lists it.
 - **Own publications.** When this instance publishes the identity from a
   local socket, the Binding is a symbolic link to that socket, with nothing
-  in between. Other publications hosted here, such as a granted helper's, are
+  in between, so it has exactly the socket's own access control; the
+  publisher is this account. When the publication is withdrawn or taken over,
+  the link gives way to a listener. Other publications hosted here, such as a granted helper's, are
   served through this instance's authority.
 - **Others.** A listener at the path opens each connection's stream into the
   publisher as it arrives. While the publication is unavailable, withdrawn or
