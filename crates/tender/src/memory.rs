@@ -277,8 +277,8 @@ impl MemoryTender {
     }
 }
 
-fn endpoint(host: &Fingerprint, id: &PublicationId) -> String {
-    format!("memory:{}/{id}", host.0)
+fn endpoint(host: &Fingerprint, caller: &Fingerprint, id: &PublicationId) -> String {
+    format!("memory:{}/{}/{id}", host.0, caller.0)
 }
 
 fn abort_streams(record: &mut Record) {
@@ -699,7 +699,11 @@ impl Tender for MemoryTender {
         let route = Route { instance: state.host.clone(), via: session.via.clone() };
         if !admitted {
             return if state.bound.contains(&key) {
-                Ok(Binding { publication: id.clone(), local_endpoint: endpoint(&state.host, id), state: BindingState::Revoked })
+                Ok(Binding {
+                    publication: id.clone(),
+                    local_endpoint: endpoint(&state.host, &session.caller, id),
+                    state: BindingState::Revoked,
+                })
             } else {
                 Err(Error::Denied)
             };
@@ -710,7 +714,7 @@ impl Tender for MemoryTender {
             Availability::Unavailable => BindingState::Unavailable { reason: UnavailableReason::PublisherUnavailable, route: Some(route) },
             Availability::Withdrawn => BindingState::Unavailable { reason: UnavailableReason::Withdrawn, route: Some(route) },
         };
-        Ok(Binding { publication: id.clone(), local_endpoint: endpoint(&state.host, id), state: binding_state })
+        Ok(Binding { publication: id.clone(), local_endpoint: endpoint(&state.host, &session.caller, id), state: binding_state })
     }
 
     async fn open_binding(&self, session: &Session, binding: &Binding) -> Result<ByteStream, Error> {

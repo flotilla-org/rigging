@@ -551,7 +551,7 @@ impl Forward {
     }
 }
 
-type BindingMap = BTreeMap<PublicationId, Arc<LocalBinding>>;
+type BindingMap = BTreeMap<(Fingerprint, PublicationId), Arc<LocalBinding>>;
 type Bindings = Arc<Mutex<BindingMap>>;
 
 /// Dials one Unix socket path whichever instance is named, such as an OpenSSH
@@ -579,9 +579,11 @@ pub struct SshTender {
     snapshots: Arc<Mutex<BTreeMap<Fingerprint, Vec<Publication>>>>,
 }
 
-/// A Binding's listener lives as long as its adapter: an unavailable,
-/// withdrawn or revoked publication keeps its Local Endpoint, which closes
-/// each fresh connection promptly.
+/// A Binding's listener is authorised as the caller that bound it, so each
+/// caller identity has its own; every local client of that caller shares it.
+/// It lives as long as its adapter: an unavailable, withdrawn or revoked
+/// publication keeps its Local Endpoint, which closes each fresh connection
+/// promptly.
 struct LocalBinding {
     path: PathBuf,
     task: JoinHandle<()>,
@@ -826,19 +828,23 @@ impl Tender for SshTender {
     }
 
     async fn bind(&self, session: &Session, id: &PublicationId) -> Result<Binding, Error> {
-        let existing = self.bindings.lock().expect("bindings lock").get(id).map(|binding| binding.path.clone());
+        let key = (session.caller.clone(), id.clone());
+        let existing = self.bindings.lock().expect("bindings lock").get(&key).map(|binding| binding.path.clone());
         let state = match self.reply(session, Request::Bind(id.clone())).await {
             Ok(Response::Binding(binding)) => binding.state,
             Ok(_) => return Err(Error::Unavailable),
             Err(Error::Unavailable | Error::Deadline) if existing.is_some() => {
                 BindingState::Unavailable { reason: UnavailableReason::RouteUnavailable, route: None }
             }
+            // The host forgets who bound what when it restarts; this adapter
+            // still holds the Binding, so losing admission is a revocation.
+            Err(Error::Denied) if existing.is_some() => BindingState::Revoked,
             Err(error) => return Err(error),
         };
         let path = match existing {
             Some(path) => path,
             None => {
-                let digest = Sha256::digest(serde_json::to_vec(id).map_err(|_| Error::Unavailable)?);
+                let digest = Sha256::digest(serde_json::to_vec(&key).map_err(|_| Error::Unavailable)?);
                 let path = self.directory.path().join(digest.iter().take(16).map(|byte| format!("{byte:02x}")).collect::<String>());
                 let listener = UnixListener::bind(&path).map_err(|_| Error::Unavailable)?;
                 std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).map_err(|_| Error::Unavailable)?;
@@ -865,7 +871,7 @@ impl Tender for SshTender {
                         }
                     }
                 });
-                self.bindings.lock().expect("bindings lock").insert(id.clone(), Arc::new(LocalBinding { path: path.clone(), task }));
+                self.bindings.lock().expect("bindings lock").insert(key, Arc::new(LocalBinding { path: path.clone(), task }));
                 path
             }
         };

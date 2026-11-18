@@ -168,8 +168,9 @@ pub enum BindingState {
     Revoked,
 }
 
-/// A Local Endpoint on this machine for a publication, keyed by its identity
-/// and shared by every client here. A takeover or new route keeps the endpoint.
+/// A Local Endpoint for a publication, keyed by its identity and the instance
+/// that bound it, and shared by every local client of that instance. A
+/// takeover or new route keeps the endpoint.
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
 pub struct Binding {
     pub publication: PublicationId,

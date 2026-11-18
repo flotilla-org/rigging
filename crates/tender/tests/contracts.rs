@@ -457,7 +457,9 @@ async fn narrowed_grant_revokes_binding(rig: Rig) {
     let mut watch = rig.tender.watch(&removed).await.expect("watch");
     assert_eq!(watch.recv().await.expect("initial").len(), 1);
     let binding = rig.tender.bind(&removed, &id).await.expect("bind");
-    assert_eq!(rig.tender.bind(&kept, &id).await.expect("shared binding").local_endpoint, binding.local_endpoint);
+    assert_eq!(rig.tender.bind(&removed, &id).await.expect("same binding").local_endpoint, binding.local_endpoint);
+    let kept_binding = rig.tender.bind(&kept, &id).await.expect("kept's own binding");
+    assert_ne!(kept_binding.local_endpoint, binding.local_endpoint, "a Binding is authorised as the instance that bound it");
     let mut old_stream = rig.tender.connect(&removed, &id).await.expect("old access");
     let _service = published.incoming.recv().await.expect("incoming");
     grant(&rig, "owner", "n", &["kept"], 100);
@@ -470,6 +472,7 @@ async fn narrowed_grant_revokes_binding(rig: Rig) {
     let mut byte = [0];
     assert_eq!(timeout(Duration::from_secs(1), old_stream.read(&mut byte)).await.expect("removed stream closes").expect("read"), 0);
     round_trip(&rig, &kept, &id, &mut published.incoming).await;
+    assert_eq!(rig.tender.bind(&kept, &id).await.expect("unaffected").state, available(&rig, None));
     grant(&rig, "owner", "n", &["kept", "removed"], 100);
     assert_eq!(watch.recv().await.expect("widened")[0].audience, set(&["kept", "removed"]));
     assert_eq!(rig.tender.bind(&removed, &id).await.expect("restored").state, available(&rig, None));

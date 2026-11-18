@@ -17,10 +17,14 @@ contract suite in `tests/contracts.rs` states each rule against both adapters.
   publish under a scope; the host publishes under any scope on its own
   authority. Publishing an identity whose publisher is unavailable or withdrawn
   takes it over at the next generation, whoever was there before; a live
-  incumbent wins with `LivePublisher`. Streams already open stay on the old
-  route and break with it; nothing is replayed or moved.
+  incumbent wins with `LivePublisher`. Withdrawal is not terminal: any
+  publisher granted the scope may publish a withdrawn identity again,
+  including one that is not the publisher that withdrew it, since withdrawal
+  ends a publisher's claim rather than the identity. Streams already open stay
+  on the old route and break with it; nothing is replayed or moved.
 - **Bindings.** `bind` gives a Local Endpoint keyed by publication identity
-  and shared by every client of the adapter. Its `BindingState` is available
+  and the instance that bound it. Its streams are authorised as that
+  instance, and every local client of the instance shares it. Its `BindingState` is available
   (with its `Route`: the carrying instance and any relay), unavailable (with
   an `UnavailableReason`) or revoked (the audience or grant no longer admits
   the caller). The state is for display; an unavailable or revoked Binding
@@ -70,8 +74,8 @@ checks host authority anew. Stream-local SSH channels provide multiplexing and
 flow control; local byte pumps use bounded buffers and preserve directional EOF.
 No control/error bytes enter an ordinary bound application connection.
 
-`bind` creates one private, user-only Unix socket per publication identity,
-shared by the adapter's callers. It stays bound for the adapter's lifetime,
+`bind` creates one private, user-only Unix socket per caller and publication
+identity. It stays bound for the adapter's lifetime,
 including while the publication is unavailable, withdrawn or revoked, and then
 closes fresh connections promptly. Expiry permits established streams to
 finish; explicit revocation closes streams at the host. Returned addresses

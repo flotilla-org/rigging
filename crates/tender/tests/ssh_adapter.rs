@@ -202,6 +202,45 @@ async fn exposure_failure_is_eof_without_protocol_bytes() {
     assert_eq!(withdrawn.local_endpoint, binding.local_endpoint);
 }
 
+// Only an existing Binding outlives a route outage, as RouteUnavailable; a
+// first bind needs the host. A host restarted without the caller in the
+// audience no longer remembers the Binding, but the adapter still reports it
+// as revoked.
+#[tokio::test]
+async fn binding_across_route_outage_and_host_restart() {
+    let root = tempfile::Builder::new().permissions(std::fs::Permissions::from_mode(0o700)).tempdir().expect("directory");
+    let host = Identity::generate();
+    let caller = Identity::generate();
+    let grant = Grant {
+        grantee: caller.fingerprint(),
+        scope: Scope("services".into()),
+        audience_ceiling: BTreeSet::from([caller.fingerprint()]),
+        expires_at: 100,
+    };
+    let session = Session { caller: caller.fingerprint(), pinned_host: host.fingerprint(), via: None };
+    let id = PublicationId::new("services", "ordinary");
+    let endpoint = root.path().join("server");
+    let adapter = SshTender::new(endpoint.clone(), host.fingerprint(), vec![caller.clone()]).expect("adapter");
+    assert_eq!(adapter.bind(&session, &id).await, Err(Error::Unavailable), "a first bind needs the host");
+    let policy = MemoryTender::new(host.fingerprint());
+    policy.allow_connect(caller.fingerprint()).expect("host policy");
+    policy.grant(grant.clone()).expect("host policy");
+    let _published = policy.publish(&session, request(caller.fingerprint())).await.expect("publish");
+    let server = Server::bind(endpoint.clone(), host.clone(), policy).expect("server");
+    let binding = adapter.bind(&session, &id).await.expect("binding");
+    drop(server);
+    let outage = adapter.bind(&session, &id).await.expect("binding outlives the route");
+    assert_eq!(outage.state, BindingState::Unavailable { reason: UnavailableReason::RouteUnavailable, route: None });
+    assert_eq!(outage.local_endpoint, binding.local_endpoint);
+    let restarted = MemoryTender::new(host.fingerprint());
+    restarted.allow_connect(caller.fingerprint()).expect("host policy");
+    restarted.grant(Grant { audience_ceiling: BTreeSet::new(), ..grant }).expect("host policy");
+    let _published = restarted.publish(&session, request(caller.fingerprint())).await.expect("publish");
+    let _server = Server::bind(endpoint, host.clone(), restarted).expect("restarted server");
+    let revoked = adapter.bind(&session, &id).await.expect("still bound");
+    assert_eq!((revoked.local_endpoint, revoked.state), (binding.local_endpoint, BindingState::Revoked));
+}
+
 // Ordinary services retain directional EOF: request half-close still permits
 // the service to write its response through the authenticated channel.
 #[tokio::test]

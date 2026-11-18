@@ -292,6 +292,29 @@ async fn stored_v1_and_v2_remain_decodable() {
     }
 }
 
+// Version 1 let several numeric identities share a scope and name. Each name
+// loads as its latest record, at the highest generation any of them reached.
+#[tokio::test]
+async fn v1_records_sharing_a_name_collapse_without_reissuing_a_generation() {
+    let mut value: serde_json::Value = serde_json::from_slice(include_bytes!("fixtures/authority-v1.json")).unwrap();
+    value["next_id"] = 4.into();
+    let mut later = value["records"][0].clone();
+    later["publication"]["id"] = 3.into();
+    later["publication"]["generation"] = 2.into();
+    later["publication"]["publisher"] = "later".into();
+    value["records"].as_array_mut().unwrap().push(later);
+    let store = Arc::new(MemoryStore::default());
+    store.save(&serde_json::to_vec(&value).unwrap()).unwrap();
+    let clock = Arc::new(ManualClock::new());
+    let host = Fingerprint("host".into());
+    let authority = MemoryTender::hosted(host.clone(), clock, store).unwrap();
+    let consumer = Session { caller: Fingerprint("consumer".into()), pinned_host: host, via: Some(Fingerprint("relay".into())) };
+    let visible = authority.browse(&consumer).await.unwrap();
+    assert_eq!(visible.len(), 2);
+    let service = visible.iter().find(|publication| publication.id == PublicationId::new("n", "service")).unwrap();
+    assert_eq!((service.publisher.0.as_str(), service.generation), ("later", 7));
+}
+
 // Epoch replacement and rollback both expire grants on reload, including tick
 // zero; no wall clock or restarted process can silently extend a deadline.
 #[tokio::test]
