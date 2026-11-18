@@ -2233,6 +2233,8 @@ version = "0.1.0"
 dependencies = [
  "hegeltest",
  "libc",
+ "rigging-paths",
+ "rigging-process",
  "serde",
  "serde_json",
  "sha2",

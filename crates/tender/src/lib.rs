@@ -137,9 +137,13 @@ pub trait Tender: Send + Sync {
     async fn connect_with_deadline(&self, session: &Session, id: &PublicationId, deadline: Duration) -> Result<ByteStream, Error> {
         tokio::time::timeout(deadline, self.connect(session, id)).await.map_err(|_| Error::Deadline)?
     }
-    /// Binding an identity again returns the same Local Endpoint with its
-    /// current state; once bound, a publication that stops admitting the caller
-    /// reports `Revoked` rather than disappearing.
+    /// A Local Endpoint for one identity over this adapter's one route, to the
+    /// host it is pinned to. This is a building block, not the daemon's
+    /// Binding: the daemon follows its whole Trusted Group, chooses a carrier
+    /// among the instances offering the identity, and owns the path clients
+    /// compute. Binding an identity again returns the same Local Endpoint with
+    /// its current state; once bound, a publication that stops admitting the
+    /// caller reports `Revoked` rather than disappearing.
     async fn bind(&self, session: &Session, id: &PublicationId) -> Result<Binding, Error>;
     async fn open_binding(&self, session: &Session, binding: &Binding) -> Result<ByteStream, Error>;
     async fn open_binding_with_deadline(&self, session: &Session, binding: &Binding, deadline: Duration) -> Result<ByteStream, Error> {

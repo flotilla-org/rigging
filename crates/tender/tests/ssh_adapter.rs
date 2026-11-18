@@ -3,21 +3,32 @@
 #[path = "common/ssh.rs"]
 mod ssh_fixture;
 
-use std::{collections::BTreeSet, os::unix::fs::PermissionsExt, time::Duration};
+use std::{
+    collections::BTreeSet,
+    fs::{self, Permissions},
+    io::ErrorKind,
+    os::unix::fs::PermissionsExt,
+    sync::{Arc, Barrier},
+    thread,
+    time::Duration,
+};
+
+use tempfile::Builder;
 
 use tender::{
-    Availability, BindingState, Error, Grant, Label, PublicationId, PublishRequest, Scope, Session, Tender, UnavailableReason,
+    Availability, BindingState, Error, Fingerprint, Grant, Label, PublicationId, PublishRequest, Scope, Session, Tender, UnavailableReason,
     memory::MemoryTender,
     ssh::{Forward, Identity, Server, SshTender},
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{UnixListener, UnixStream},
+    spawn,
     sync::mpsc::{UnboundedReceiver, unbounded_channel},
-    time::timeout,
+    time::{sleep, timeout},
 };
 
-fn request(audience: tender::Fingerprint) -> PublishRequest {
+fn request(audience: Fingerprint) -> PublishRequest {
     PublishRequest {
         id: PublicationId::new("services", "ordinary"),
         label: Label("echo".into()),
@@ -30,17 +41,17 @@ fn request(audience: tender::Fingerprint) -> PublishRequest {
 // listener and requests. Each response follows directional request EOF.
 #[tokio::test]
 async fn ordinary_service_survives_route_loss_and_fresh_client_recovers() {
-    let root = tempfile::Builder::new().permissions(std::fs::Permissions::from_mode(0o700)).tempdir().expect("directory");
+    let root = Builder::new().permissions(Permissions::from_mode(0o700)).tempdir().expect("directory");
     let service_path = root.path().join("ordinary");
     let listener = UnixListener::bind(&service_path).expect("ordinary listener");
     let (requests, mut observed) = unbounded_channel();
     let (progress, mut received) = unbounded_channel();
-    let service = tokio::spawn(async move {
+    let service = spawn(async move {
         loop {
             let (mut stream, _) = listener.accept().await.expect("service accept");
             let requests = requests.clone();
             let progress = progress.clone();
-            tokio::spawn(async move {
+            spawn(async move {
                 let mut input = Vec::new();
                 let mut buffer = [0; 1024];
                 loop {
@@ -105,7 +116,7 @@ async fn ordinary_service_survives_route_loss_and_fresh_client_recovers() {
     drop(server);
     let mut byte = [0];
     let closed = timeout(Duration::from_secs(2), held.read(&mut byte)).await.expect("closed route");
-    assert!(matches!(closed, Ok(0)) || matches!(closed, Err(ref error) if error.kind() == std::io::ErrorKind::ConnectionReset));
+    assert!(matches!(closed, Ok(0)) || matches!(closed, Err(ref error) if error.kind() == ErrorKind::ConnectionReset));
     assert_eq!(
         timeout(Duration::from_secs(2), watch.recv()).await.expect("unavailable deadline").expect("snapshot")[0].availability,
         Availability::Unavailable
@@ -135,7 +146,7 @@ async fn ordinary_service_survives_route_loss_and_fresh_client_recovers() {
     })
     .await
     .expect("prior requests");
-    let mut fresh = UnixStream::connect(&binding.local_endpoint).await.expect("fresh exposed client");
+    let mut fresh = UnixStream::connect(&binding.local_endpoint).await.expect("fresh Binding client");
     fresh.write_all(b"after").await.expect("fresh request");
     fresh.shutdown().await.expect("fresh EOF");
     let mut response = Vec::new();
@@ -149,7 +160,7 @@ async fn ordinary_service_survives_route_loss_and_fresh_client_recovers() {
 // SSH transport success cannot authorize a substituted Tender instance.
 #[tokio::test]
 async fn identity_pin_and_unknown_caller_are_refused_before_service_bytes() {
-    let root = tempfile::Builder::new().permissions(std::fs::Permissions::from_mode(0o700)).tempdir().expect("directory");
+    let root = Builder::new().permissions(Permissions::from_mode(0o700)).tempdir().expect("directory");
     let host = Identity::generate();
     let caller = Identity::generate();
     let policy = MemoryTender::new(host.fingerprint());
@@ -166,8 +177,8 @@ async fn identity_pin_and_unknown_caller_are_refused_before_service_bytes() {
 // An ordinary raw listener closes denied connections without inserting a
 // diagnostic frame into the application's stream.
 #[tokio::test]
-async fn exposure_failure_is_eof_without_protocol_bytes() {
-    let root = tempfile::Builder::new().permissions(std::fs::Permissions::from_mode(0o700)).tempdir().expect("directory");
+async fn binding_failure_is_eof_without_protocol_bytes() {
+    let root = Builder::new().permissions(Permissions::from_mode(0o700)).tempdir().expect("directory");
     let host = Identity::generate();
     let caller = Identity::generate();
     let policy = MemoryTender::new(host.fingerprint());
@@ -208,7 +219,7 @@ async fn exposure_failure_is_eof_without_protocol_bytes() {
 // as revoked.
 #[tokio::test]
 async fn binding_across_route_outage_and_host_restart() {
-    let root = tempfile::Builder::new().permissions(std::fs::Permissions::from_mode(0o700)).tempdir().expect("directory");
+    let root = Builder::new().permissions(Permissions::from_mode(0o700)).tempdir().expect("directory");
     let host = Identity::generate();
     let caller = Identity::generate();
     let grant = Grant {
@@ -245,10 +256,10 @@ async fn binding_across_route_outage_and_host_restart() {
 // the service to write its response through the authenticated channel.
 #[tokio::test]
 async fn endpoint_half_close_preserves_response() {
-    let root = tempfile::Builder::new().permissions(std::fs::Permissions::from_mode(0o700)).tempdir().expect("directory");
+    let root = Builder::new().permissions(Permissions::from_mode(0o700)).tempdir().expect("directory");
     let service_path = root.path().join("ordinary");
     let listener = UnixListener::bind(&service_path).expect("ordinary listener");
-    let service = tokio::spawn(async move {
+    let service = spawn(async move {
         let (mut stream, _) = listener.accept().await.expect("service accept");
         let mut input = Vec::new();
         stream.read_to_end(&mut input).await.expect("directional EOF");
@@ -285,14 +296,13 @@ async fn endpoint_half_close_preserves_response() {
 // private key. A separate first-run key is a separate identity.
 #[test]
 fn instance_key_persists_with_user_only_permissions() {
-    use std::os::unix::fs::PermissionsExt;
-    let root = tempfile::Builder::new().permissions(std::fs::Permissions::from_mode(0o700)).tempdir().expect("key directory");
+    let root = Builder::new().permissions(Permissions::from_mode(0o700)).tempdir().expect("key directory");
     let path = root.path().join("instance.key");
     let original = Identity::load_or_create(&path).expect("first run");
-    assert_eq!(std::fs::metadata(&path).expect("key metadata").permissions().mode() & 0o777, 0o600);
+    assert_eq!(fs::metadata(&path).expect("key metadata").permissions().mode() & 0o777, 0o600);
     assert_eq!(Identity::load_or_create(&path).expect("restart").fingerprint(), original.fingerprint());
     assert_ne!(Identity::load_or_create(&root.path().join("other.key")).expect("second instance").fingerprint(), original.fingerprint());
-    std::fs::write(&path, b"malformed").expect("corrupt key");
+    fs::write(&path, b"malformed").expect("corrupt key");
     assert!(Identity::load_or_create(&path).is_err(), "malformed key must not be silently replaced");
 }
 
@@ -300,7 +310,7 @@ fn instance_key_persists_with_user_only_permissions() {
 // A failed endpoint open closes without bytes and marks it unavailable.
 #[tokio::test]
 async fn missing_service_marks_publication_unavailable() {
-    let root = tempfile::Builder::new().permissions(std::fs::Permissions::from_mode(0o700)).tempdir().expect("directory");
+    let root = Builder::new().permissions(Permissions::from_mode(0o700)).tempdir().expect("directory");
     let host = Identity::generate();
     let caller = Identity::generate();
     let policy = MemoryTender::new(host.fingerprint());
@@ -339,7 +349,7 @@ async fn missing_service_marks_publication_unavailable() {
 // closing fresh connections, and serves again once the audience returns.
 #[tokio::test]
 async fn binding_is_revoked_and_restored_in_place() {
-    let root = tempfile::Builder::new().permissions(std::fs::Permissions::from_mode(0o700)).tempdir().expect("directory");
+    let root = Builder::new().permissions(Permissions::from_mode(0o700)).tempdir().expect("directory");
     let host = Identity::generate();
     let caller = Identity::generate();
     let policy = MemoryTender::new(host.fingerprint());
@@ -379,14 +389,14 @@ async fn binding_is_revoked_and_restored_in_place() {
 // complete key, never a partial file or a silently substituted instance.
 #[test]
 fn concurrent_first_run_keeps_one_complete_instance_key() {
-    let root = tempfile::Builder::new().permissions(std::fs::Permissions::from_mode(0o700)).tempdir().expect("directory");
+    let root = Builder::new().permissions(Permissions::from_mode(0o700)).tempdir().expect("directory");
     let path = root.path().join("instance.key");
-    let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+    let barrier = Arc::new(Barrier::new(8));
     let threads: Vec<_> = (0..8)
         .map(|_| {
             let path = path.clone();
             let barrier = barrier.clone();
-            std::thread::spawn(move || {
+            thread::spawn(move || {
                 barrier.wait();
                 Identity::load_or_create(&path).expect("atomic key creation").fingerprint()
             })
@@ -396,8 +406,7 @@ fn concurrent_first_run_keeps_one_complete_instance_key() {
     for thread in threads {
         assert_eq!(thread.join().expect("key creator"), expected);
     }
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("unsafe mode");
+    fs::set_permissions(&path, Permissions::from_mode(0o644)).expect("unsafe mode");
     assert!(Identity::load_or_create(&path).is_err(), "group/world-readable private key is refused");
 }
 
@@ -405,9 +414,8 @@ fn concurrent_first_run_keeps_one_complete_instance_key() {
 // chmod of the socket afterwards is insufficient for a shared directory.
 #[test]
 fn server_refuses_a_shared_parent_directory() {
-    use std::os::unix::fs::PermissionsExt;
-    let root = tempfile::Builder::new().permissions(std::fs::Permissions::from_mode(0o700)).tempdir().expect("directory");
-    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o755)).expect("shared parent");
+    let root = Builder::new().permissions(Permissions::from_mode(0o700)).tempdir().expect("directory");
+    fs::set_permissions(root.path(), Permissions::from_mode(0o755)).expect("shared parent");
     let host = Identity::generate();
     assert!(Server::bind(root.path().join("server"), host.clone(), MemoryTender::new(host.fingerprint())).is_err());
     assert!(!root.path().join("server").exists());
@@ -456,7 +464,7 @@ async fn forward_carries_contract_and_reclaims_after_route_replacement() {
     assert!(timeout(Duration::from_secs(2), first.incoming.recv()).await.expect("publisher receiver closes").is_none());
     timeout(Duration::from_secs(2), async {
         while policy.browse(&session).await.expect("host state")[0].availability != Availability::Unavailable {
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            sleep(Duration::from_millis(10)).await;
         }
     })
     .await

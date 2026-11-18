@@ -12,7 +12,7 @@ use serde::{Serialize, de::DeserializeOwned};
 use crate::{
     Fingerprint, Label, PublicKey, PublicationId,
     api::{
-        self, BindingEntry, Diagnostics, ErrorBody, Instance, PeerRoute, PublicationEntry, PublishEndpoint, TrustedInstance, TrustedMember,
+        self, BindingEntry, Diagnostics, ErrorBody, Instance, PeerRoute, PublicationList, PublishEndpoint, TrustedInstance, TrustedMember,
         Untrust,
     },
     paths,
@@ -146,9 +146,9 @@ pub async fn main() -> Result<(), String> {
             Ok(())
         }
         Command::Publications => {
-            let entries: Vec<PublicationEntry> = control.get(api::PUBLICATIONS).await?;
-            show(json, &entries, || {
-                entries
+            let list: PublicationList = control.get(api::PUBLICATIONS).await?;
+            show(json, &list, || {
+                list.publications
                     .iter()
                     .map(|entry| {
                         let publication = &entry.publication;

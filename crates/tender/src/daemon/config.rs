@@ -1,11 +1,14 @@
 use std::{
     collections::BTreeSet,
+    fs::{self, File, Permissions},
     io::{self, Write},
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
 };
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use tempfile::NamedTempFile;
+use toml::{from_str, to_string};
 
 use crate::{Fingerprint, Scope, api::TrustedInstance};
 
@@ -45,8 +48,8 @@ pub struct ConfiguredGrant {
 
 /// A missing file is the empty default.
 fn load<T: DeserializeOwned + Default>(path: &Path) -> io::Result<T> {
-    match std::fs::read_to_string(path) {
-        Ok(text) => toml::from_str(&text).map_err(|error| io::Error::other(format!("{}: {error}", path.display()))),
+    match fs::read_to_string(path) {
+        Ok(text) => from_str(&text).map_err(|error| io::Error::other(format!("{}: {error}", path.display()))),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(T::default()),
         Err(error) => Err(error),
     }
@@ -74,13 +77,13 @@ impl TrustedFile {
     }
 
     pub fn save(&self, path: &Path) -> io::Result<()> {
-        let text = toml::to_string(self).map_err(io::Error::other)?;
+        let text = to_string(self).map_err(io::Error::other)?;
         let parent = path.parent().ok_or_else(|| io::Error::other("trusted group file needs a parent directory"))?;
-        let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
-        temporary.as_file().set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        let mut temporary = NamedTempFile::new_in(parent)?;
+        temporary.as_file().set_permissions(Permissions::from_mode(0o600))?;
         temporary.write_all(text.as_bytes())?;
         temporary.as_file().sync_all()?;
         temporary.persist(path).map_err(|error| error.error)?;
-        std::fs::File::open(parent)?.sync_all()
+        File::open(parent)?.sync_all()
     }
 }

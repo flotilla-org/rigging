@@ -44,6 +44,27 @@ impl PublicKey {
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct Scope(pub String);
 
+impl Scope {
+    /// `tender/<fingerprint>`: the scope of one instance's own endpoints,
+    /// published by and followed from that instance alone.
+    pub fn instance(fingerprint: &Fingerprint) -> Self {
+        Self(format!("tender/{}", fingerprint.0))
+    }
+
+    /// The instance whose scope this is, for a `tender/<fingerprint>` scope.
+    /// Any other `tender/…` scope names no instance, and nobody publishes
+    /// under it without a grant.
+    pub fn owner(&self) -> Option<Fingerprint> {
+        let fingerprint = self.0.strip_prefix("tender/")?;
+        (!fingerprint.is_empty() && !fingerprint.contains('/')).then(|| Fingerprint(fingerprint.to_owned()))
+    }
+
+    /// A `vessel/…` scope, which whichever host holds the vessel publishes under.
+    pub fn is_vessel(&self) -> bool {
+        self.0.starts_with("vessel/")
+    }
+}
+
 /// A publication's identity. The name is chosen by whoever asks and is opaque
 /// to Tender; the publisher and its route are not part of the identity, so a
 /// publisher that moves keeps its publications (flotilla#3995).
@@ -119,4 +140,20 @@ pub enum BindingState {
     },
     /// The publication's audience or grant no longer admits this machine.
     Revoked,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Only `tender/<fingerprint>` names an instance.
+    #[test]
+    fn instance_scopes_name_one_instance() {
+        let fingerprint = Fingerprint("ab12".into());
+        assert_eq!(Scope::instance(&fingerprint).owner(), Some(fingerprint));
+        for other in ["tender/", "tender/a/b", "vessel/7", "tenderab12"] {
+            assert_eq!(Scope(other.into()).owner(), None, "{other}");
+        }
+        assert!(Scope("vessel/7".into()).is_vessel() && !Scope("vessels/7".into()).is_vessel());
+    }
 }

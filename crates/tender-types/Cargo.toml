@@ -6,13 +6,16 @@ license.workspace = true
 repository.workspace = true
 publish = false
 
-# Kept light for every Tender client: serde and a hash, no HTTP stack.
+# Kept light for every Tender client: serde, a hash and the shared path
+# rules, no HTTP stack.
 [dependencies]
 serde = { workspace = true }
 sha2 = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
+rigging-paths = { path = "../rigging-paths" }
+rigging-process = { path = "../rigging-process" }
 
 [dev-dependencies]
 hegeltest.workspace = true

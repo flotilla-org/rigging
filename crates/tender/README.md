@@ -14,16 +14,28 @@ contract suite in `tests/contracts.rs` states each rule against both adapters.
 - **Identity is scope and name.** A `PublicationId` is a `Scope` (a vessel, or
   the publishing instance for a host endpoint) plus a name chosen by whoever
   asks. The publisher and its route are not part of it. A `Grant` names who may
-  publish under a scope; the host publishes under any scope on its own
-  authority. Publishing an identity whose publisher is unavailable or withdrawn
-  takes it over at the next generation, whoever was there before; a live
-  incumbent wins with `LivePublisher`. Withdrawal is not terminal: any
-  publisher granted the scope may publish a withdrawn identity again,
-  including one that is not the publisher that withdrew it, since withdrawal
-  ends a publisher's claim rather than the identity. Streams already open stay
-  on the old route and break with it; nothing is replayed or moved.
-- **Bindings.** `bind` gives a Local Endpoint keyed by publication identity
-  and the instance that bound it. Its streams are authorised as that
+  publish under a scope. The host publishes on its own authority under its
+  instance scope, `tender/<fingerprint>` (`Scope::instance`), and under
+  `vessel/…` scopes; any other scope needs a grant, which the host may hold
+  too. Only the instance a `tender/<fingerprint>` scope names ever publishes
+  under it, whatever grants say. Both kinds of scope are part of Tender's
+  identity model (flotilla#3995), not a convention of one consumer. Tender
+  cannot tell which vessels a host holds: what it checks is that only the
+  host's own key publishes as the host, which in a daemon means the host
+  account's own control socket. A live incumbent still wins. Publishing an identity whose publisher is
+  unavailable or withdrawn takes it over at a new generation, whoever was
+  there before; a live incumbent wins with `LivePublisher`. Withdrawal is not
+  terminal: any publisher granted the scope may publish a withdrawn identity
+  again, including one that is not the publisher that withdrew it, since
+  withdrawal ends a publisher's claim rather than the identity. The authority
+  forgets a withdrawn publication after `WITHDRAWN_RETENTION` (a minute), and
+  generations come from one counter, so none is ever reissued. Once forgotten,
+  it reads as never published, to callers that had bound it too. Streams already
+  open stay on the old route and break with it; nothing is replayed or moved.
+- **Bindings.** An adapter's `bind` gives a Local Endpoint over its one route,
+  keyed by publication identity and the instance that bound it. It is a
+  building block: the daemon's Bindings choose among the Trusted Group's
+  instances and live at a computed path. Its streams are authorised as that
   instance, and every local client of the instance shares it. Its `BindingState` is available
   (with its `Route`: the carrying instance and any relay), unavailable (with
   an `UnavailableReason`) or revoked (the audience or grant no longer admits
@@ -42,9 +54,13 @@ contract suite in `tests/contracts.rs` states each rule against both adapters.
 `tender serve` runs one instance per OS account (`daemon::serve`, Unix only).
 Directories come from `daemon::Paths::from_env`: configuration and state
 follow `rigging-paths` (`TENDER_ROOT`, then XDG), and sockets live in the
-runtime directory, `tender_types::paths::runtime_dir`: `$TENDER_ROOT/runtime`,
-else `$XDG_RUNTIME_DIR/tender`, else `tender-<uid>` in the temporary
-directory. All three are created 0700.
+runtime directory, `tender_types::paths::runtime_dir`, which is
+`rigging_paths::runtime_dir("tender", uid, env)`: `$TENDER_ROOT/runtime`, else
+`$XDG_RUNTIME_DIR/tender` when this user owns it, else
+`/run/user/<uid>/tender` when this user owns `/run/user/<uid>`, else
+`tender-<uid>` in the temporary directory. Clients use the same function, so
+a cron job or a `sudo -u` shell finds the same daemon. All three are created
+0700.
 
 - **State:** the instance key (`identity`) and the authority store, as for
   `ssh::Server::open`. The key is the instance's identity for as long as the
@@ -59,9 +75,9 @@ directory. All three are created 0700.
   | Route | Body | Answer |
   |---|---|---|
   | `GET /v1/identity` | | `Instance`: public key, fingerprint, peer socket |
-  | `GET /v1/publications` | | every `PublicationEntry` this instance hosts |
-  | `POST /v1/publish` | `PublishEndpoint` | the `Publication`; 409 `live_publisher` while one is live |
-  | `POST /v1/withdraw` | `PublicationId` | 404 unless this instance published it; a publication already withdrawn or taken over is forgotten with its error, so a repeat answers 404 |
+  | `GET /v1/publications` | | `PublicationList`: the start `epoch` and every `PublicationEntry` this instance hosts |
+  | `POST /v1/publish` | `PublishEndpoint` | the `Publication`, unavailable when the endpoint does not answer yet; 400 `relative_endpoint`; 409 `live_publisher` while one is live |
+  | `POST /v1/withdraw` | `PublicationId` | withdraws a publication this instance published, again harmlessly; 403 `denied` once another publisher has taken it over; 404 when the authority has no such publication |
   | `GET /v1/trusted` | | the Trusted Group, as `TrustedMember`s |
   | `POST /v1/trusted` | `TrustedInstance` | adds or replaces a member |
   | `POST /v1/trusted/remove` | `Untrust` | 404 unless a member |
@@ -70,7 +86,7 @@ directory. All three are created 0700.
 
 - **`config.toml`** (read at start) lists `[[publication]]`s, each with an
   optional `scope` (default `tender/<fingerprint>`), `name`, `label`,
-  `display`, `endpoint` and optional `audience`, and `[[grant]]`s letting
+  `display`, `endpoint` (an absolute path) and optional `audience`, and `[[grant]]`s letting
   another instance's key publish into this one under a `scope`, for the
   Trusted Group. Grants no longer configured are revoked at start.
 - **`trusted.toml`** holds the Trusted Group as `[[instance]]`s with `key`,
@@ -78,13 +94,16 @@ directory. All three are created 0700.
   changes through the control API.
 
 The daemon publishes a local socket as itself and never starts or stops the
-service behind it. A connection that cannot open the endpoint makes the
+service behind it. It probes the endpoint first: one that does not answer is
+published unavailable, never announced as available. A connection that cannot
+open the endpoint after a few tries over about half a second makes the
 publication unavailable; the daemon checks unavailable endpoints once a second
-and publishes again, at the next generation, once one answers. A publication
+and publishes again, at a new generation, once one answers. A publication
 taken over by another publisher, or withdrawn, is no longer the daemon's.
-Shutting down leaves its publications unavailable and their identities kept;
-publications from `config.toml` are published again at the next start, and
-those from the control API wait for their publisher.
+Shutting down leaves its publications unavailable. The next start publishes
+the `config.toml` entries again and withdraws every other publication this
+instance made, including all from the control API, which do not persist; the
+new `epoch` in the listing tells their publisher to publish them again.
 
 ```toml
 # config.toml

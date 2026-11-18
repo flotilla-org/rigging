@@ -2,11 +2,16 @@
 //! computes a Binding's Local Endpoint without asking for it.
 
 use std::{
-    ffi::OsString,
     fmt::Write,
     path::{Path, PathBuf},
 };
 
+#[cfg(unix)]
+use libc::geteuid;
+#[cfg(unix)]
+use rigging_paths::runtime_dir as user_runtime_dir;
+#[cfg(unix)]
+use rigging_process::{EnvVars, ProcessEnvVars};
 use sha2::{Digest, Sha256};
 
 use crate::PublicationId;
@@ -15,34 +20,19 @@ use crate::PublicationId;
 /// 104 bytes with its terminating NUL on macOS, and 108 on Linux.
 pub const MAX_SOCKET_PATH: usize = 103;
 
-/// `$TENDER_ROOT/runtime`, else `$XDG_RUNTIME_DIR/tender`, else `tender-<uid>`
-/// in the temporary directory. `env` reads one environment variable.
-pub fn runtime_dir(env: impl Fn(&str) -> Option<OsString>) -> Result<PathBuf, String> {
-    let set = |key: &str| env(key).filter(|value| !value.is_empty()).map(PathBuf::from);
-    if let Some(root) = set("TENDER_ROOT") {
-        // A relative root would put sockets wherever the process started.
-        return if root.is_absolute() { Ok(root.join("runtime")) } else { Err("TENDER_ROOT must be an absolute path".into()) };
-    }
-    if let Some(base) = set("XDG_RUNTIME_DIR").filter(|base| base.is_absolute()) {
-        return Ok(base.join("tender"));
-    }
-    Ok(std::env::temp_dir().join(fallback_name()))
+/// The account's runtime directory: `rigging-paths`' per-user one for
+/// `tender`, keyed on this process's effective uid, so the daemon, a cron job
+/// and a `sudo -u` shell all find the same one.
+#[cfg(unix)]
+pub fn runtime_dir(env: &dyn EnvVars) -> Result<PathBuf, String> {
+    // SAFETY: geteuid has no preconditions.
+    user_runtime_dir("tender", unsafe { geteuid() }, env)
 }
 
 /// [`runtime_dir`] from this process's environment.
-pub fn runtime_dir_from_env() -> Result<PathBuf, String> {
-    runtime_dir(|key| std::env::var_os(key))
-}
-
 #[cfg(unix)]
-fn fallback_name() -> String {
-    // SAFETY: geteuid has no preconditions.
-    format!("tender-{}", unsafe { libc::geteuid() })
-}
-
-#[cfg(not(unix))]
-fn fallback_name() -> String {
-    "tender".into()
+pub fn runtime_dir_from_env() -> Result<PathBuf, String> {
+    runtime_dir(&ProcessEnvVars)
 }
 
 /// The control API's Local Endpoint.
@@ -180,16 +170,5 @@ mod tests {
         assert_eq!(tilde.file_name().unwrap(), "%7E,%7E");
         let upper = binding_path(runtime, &PublicationId::new("scope", "Build"));
         assert_eq!(upper.file_name().unwrap(), "scope,%42uild");
-    }
-
-    #[test]
-    fn runtime_directory_precedence() {
-        let env = |pairs: &'static [(&'static str, &'static str)]| {
-            move |key: &str| pairs.iter().find(|(k, _)| *k == key).map(|(_, v)| OsString::from(v))
-        };
-        assert_eq!(runtime_dir(env(&[("TENDER_ROOT", "/root"), ("XDG_RUNTIME_DIR", "/run/user/1")])).unwrap(), Path::new("/root/runtime"));
-        assert!(runtime_dir(env(&[("TENDER_ROOT", "relative")])).is_err());
-        assert_eq!(runtime_dir(env(&[("XDG_RUNTIME_DIR", "/run/user/1")])).unwrap(), Path::new("/run/user/1/tender"));
-        assert!(runtime_dir(env(&[("XDG_RUNTIME_DIR", "relative")])).unwrap().starts_with(std::env::temp_dir()));
     }
 }

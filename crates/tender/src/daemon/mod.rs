@@ -1,35 +1,44 @@
-//! The `tender serve` daemon: one per OS account, publishing that account's
-//! local endpoints behind a control API on its Local Endpoint.
-
 mod bindings;
 mod config;
 mod control;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    io,
+    fs::{self, DirBuilder, Permissions},
+    io, mem,
     os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
 
+use libc::geteuid;
+use rand_core::{OsRng, RngCore};
 use rigging_http_serve::{Caller, UnixServer};
 use rigging_paths::PathPolicy;
 use rigging_process::EnvVars;
 use tokio::{
+    io::copy_bidirectional,
     net::UnixStream,
-    signal::unix::{SignalKind, signal},
+    signal::{
+        ctrl_c,
+        unix::{SignalKind, signal},
+    },
+    spawn,
     sync::{Mutex, mpsc, oneshot},
     task::JoinHandle,
-    time::timeout,
+    time::{interval, sleep, timeout},
 };
 
 use self::bindings::{Bindings, Endpoints};
 pub use self::config::{Config, ConfiguredGrant, ConfiguredPublication, TrustedFile};
+#[cfg(target_os = "linux")]
+use crate::runtime::BootClock;
+#[cfg(not(target_os = "linux"))]
+use crate::runtime::ProcessClock;
 use crate::{
-    Availability, ByteStream, Error, Fingerprint, Grant, Label, Lease, Publication, PublicationId, PublishRequest, Session, Tender,
-    api::{BindingEntry, Instance, PeerStatus, PublicationEntry, PublishEndpoint, TrustedInstance, TrustedMember},
+    Availability, ByteStream, Error, Fingerprint, Grant, Label, Lease, Publication, PublicationId, PublishRequest, Scope, Session, Tender,
+    api::{BindingEntry, Instance, PeerStatus, PublicationEntry, PublicationList, PublishEndpoint, TrustedInstance, TrustedMember},
     memory::MemoryTender,
     paths,
     runtime::Clock,
@@ -38,6 +47,10 @@ use crate::{
 
 const ENDPOINT_TIMEOUT: Duration = Duration::from_secs(10);
 const MAINTENANCE: Duration = Duration::from_secs(1);
+/// Opens a stream tries before the endpoint counts as gone, so a service
+/// restarting or briefly slow does not make its publication flap.
+const OPEN_ATTEMPTS: u32 = 3;
+const OPEN_RETRY: Duration = Duration::from_millis(200);
 
 /// The account's directories. Configuration and state follow `rigging-paths`
 /// (`TENDER_ROOT`, then XDG); sockets live in the runtime directory.
@@ -49,10 +62,11 @@ pub struct Paths {
 }
 
 impl Paths {
-    /// The runtime directory follows [`paths::runtime_dir`], which clients share.
+    /// Configuration and state follow `rigging-paths`; the runtime directory
+    /// is [`paths::runtime_dir`], which every client uses too.
     pub fn from_env(env: &dyn EnvVars) -> Result<Self, String> {
-        let runtime = paths::runtime_dir(|key| env.get_os(key))?;
         let policy = PathPolicy::from_env("tender", env)?;
+        let runtime = paths::runtime_dir(env)?;
         Ok(Self { config: policy.config_dir, state: policy.state_dir, runtime })
     }
 
@@ -78,14 +92,14 @@ impl Paths {
 
 /// Create a directory owned by this user with mode 0700, or check an existing one.
 fn private_directory(path: &Path) -> io::Result<()> {
-    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(path)?;
-    let metadata = std::fs::symlink_metadata(path)?;
+    DirBuilder::new().recursive(true).mode(0o700).create(path)?;
+    let metadata = fs::symlink_metadata(path)?;
     // SAFETY: geteuid has no preconditions.
-    if !metadata.is_dir() || metadata.uid() != unsafe { libc::geteuid() } {
+    if !metadata.is_dir() || metadata.uid() != unsafe { geteuid() } {
         return Err(io::Error::other(format!("{} must be a directory owned by this user", path.display())));
     }
     if metadata.mode() & 0o077 != 0 {
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+        fs::set_permissions(path, Permissions::from_mode(0o700))?;
     }
     Ok(())
 }
@@ -99,6 +113,9 @@ pub struct Daemon {
 
 pub(crate) struct Inner {
     paths: Paths,
+    /// Changes at every start, so a publisher sees that its API
+    /// publications were withdrawn and publishes them again.
+    epoch: String,
     identity: Identity,
     session: Session,
     server: Server,
@@ -113,16 +130,19 @@ struct State {
     local: BTreeMap<PublicationId, Local>,
 }
 
-/// A publication of this instance's own, from a local socket.
+/// A publication of this instance's own, from a local socket. One reserved
+/// while its endpoint did not answer has no pump.
 struct Local {
     lease: Lease,
     request: PublishEndpoint,
-    pump: JoinHandle<()>,
+    pump: Option<JoinHandle<()>>,
 }
 
 impl Drop for Local {
     fn drop(&mut self) {
-        self.pump.abort();
+        if let Some(pump) = &self.pump {
+            pump.abort();
+        }
     }
 }
 
@@ -147,21 +167,40 @@ impl Daemon {
         let own = server.policy.watch(&session).await.map_err(io::Error::other)?;
         let bindings = Bindings::start(&paths.runtime, identity.clone(), server.policy.clone(), endpoints.clone(), own)?;
         bindings.trust(state.trusted.clone());
-        let inner = Arc::new(Inner { paths, identity, session, server, state: Mutex::new(state), endpoints, bindings });
-        for configured in config.publications {
-            let request = inner.configured(configured);
+        let mut epoch = [0; 16];
+        OsRng.fill_bytes(&mut epoch);
+        let inner = Arc::new(Inner {
+            paths,
+            epoch: epoch.iter().map(|byte| format!("{byte:02x}")).collect(),
+            identity,
+            session,
+            server,
+            state: Mutex::new(state),
+            endpoints,
+            bindings,
+        });
+        let (configured, relative): (Vec<_>, Vec<_>) = config
+            .publications
+            .into_iter()
+            .map(|configured| inner.configured(configured))
+            .partition(|request| request.endpoint.is_absolute());
+        for request in relative {
+            tracing::warn!(id = %request.id, endpoint = %request.endpoint.display(), "configured endpoint is not an absolute path");
+        }
+        inner.withdraw_unconfigured(&configured.iter().map(|request| request.id.clone()).collect()).await;
+        for request in configured {
             if let Err(error) = inner.publish(request.clone()).await {
                 tracing::warn!(id = %request.id, %error, "configured publication refused");
             }
         }
         let (stop_control, stopped) = oneshot::channel();
         let router = control::router(inner.clone());
-        let control = tokio::spawn(control.serve(router, Caller::<()>::Unix, async {
+        let control = spawn(control.serve(router, Caller::<()>::Unix, async {
             let _ = stopped.await;
         }));
         let maintained = Arc::downgrade(&inner);
-        let maintenance = tokio::spawn(async move {
-            let mut tick = tokio::time::interval(MAINTENANCE);
+        let maintenance = spawn(async move {
+            let mut tick = interval(MAINTENANCE);
             loop {
                 tick.tick().await;
                 let Some(inner) = maintained.upgrade() else { break };
@@ -175,8 +214,8 @@ impl Daemon {
         self.inner.instance()
     }
 
-    /// Stop serving. Publications become unavailable, keeping their identities
-    /// for the next start; nothing is withdrawn.
+    /// Stop serving. Publications become unavailable; the next start
+    /// publishes the configured ones again and withdraws the rest.
     pub async fn shutdown(mut self) {
         if let Some(stop) = self.stop_control.take() {
             let _ = stop.send(());
@@ -196,12 +235,12 @@ impl Drop for Daemon {
 
 #[cfg(target_os = "linux")]
 fn clock() -> io::Result<Arc<dyn Clock>> {
-    Ok(Arc::new(crate::runtime::BootClock::new()?))
+    Ok(Arc::new(BootClock::new()?))
 }
 
 #[cfg(not(target_os = "linux"))]
 fn clock() -> io::Result<Arc<dyn Clock>> {
-    Ok(Arc::new(crate::runtime::ProcessClock::default()))
+    Ok(Arc::new(ProcessClock::default()))
 }
 
 /// Trusted Group members may browse and connect, and a request naming no
@@ -258,7 +297,7 @@ impl Inner {
 
     fn configured(&self, configured: ConfiguredPublication) -> PublishEndpoint {
         PublishEndpoint {
-            id: PublicationId::new(configured.scope.unwrap_or_else(|| format!("tender/{}", self.fingerprint().0)), configured.name),
+            id: PublicationId { scope: configured.scope.map_or_else(|| Scope::instance(self.fingerprint()), Scope), name: configured.name },
             label: Label(configured.label),
             display: configured.display,
             endpoint: configured.endpoint,
@@ -266,78 +305,83 @@ impl Inner {
         }
     }
 
-    /// The endpoint is probed outside the state lock, so a slow endpoint
-    /// never holds up other control requests.
+    /// The endpoint is probed first, outside the state lock, so a slow
+    /// endpoint never holds up other control requests. One that does not
+    /// answer is reserved, unavailable, until maintenance sees it answer.
     pub(crate) async fn publish(&self, request: PublishEndpoint) -> Result<Publication, Error> {
-        let (id, endpoint, lease) = {
-            let mut state = self.state.lock().await;
-            let lease = self.publish_locked(&mut state, request.clone()).await?;
-            (request.id, request.endpoint, lease)
-        };
-        if !reachable(&endpoint).await {
-            self.disconnect_if_current(&id, &lease).await;
-        }
+        let live = reachable(&request.endpoint).await;
+        let id = request.id.clone();
+        self.publish_locked(&mut *self.state.lock().await, request, live).await?;
         self.policy().publications().into_iter().find(|publication| publication.id == id).ok_or(Error::Unavailable)
     }
 
-    async fn publish_locked(&self, state: &mut State, request: PublishEndpoint) -> Result<Lease, Error> {
-        let published = self
-            .policy()
-            .publish(
-                &self.session,
-                PublishRequest {
-                    id: request.id.clone(),
-                    label: request.label.clone(),
-                    display: request.display.clone(),
-                    audience: request.audience.clone(),
-                },
-            )
-            .await?;
-        let lease = published.lease;
+    async fn publish_locked(&self, state: &mut State, request: PublishEndpoint, live: bool) -> Result<Lease, Error> {
+        let claim = PublishRequest {
+            id: request.id.clone(),
+            label: request.label.clone(),
+            display: request.display.clone(),
+            audience: request.audience.clone(),
+        };
+        let (lease, pump) = if live {
+            let published = self.policy().publish(&self.session, claim).await?;
+            let lease = published.lease;
+            let endpoint = request.endpoint.clone();
+            (lease.clone(), Some(spawn(pump(published.incoming, endpoint, self.policy().clone(), self.session.clone(), lease))))
+        } else {
+            (self.policy().reserve(&self.session, claim)?, None)
+        };
         // Only an accepted publication's socket reaches the Binder, so a
         // refused one never redirects the incumbent's Binding.
         self.endpoints.lock().expect("endpoints lock").insert(request.id.clone(), (lease.generation, request.endpoint.clone()));
         self.bindings.endpoints_changed();
-        let pump =
-            tokio::spawn(pump(published.incoming, request.endpoint.clone(), self.policy().clone(), self.session.clone(), lease.clone()));
         // Replacing an earlier Local drops it, which stops its pump; its
         // streams already open keep running on their own tasks.
         state.local.insert(request.id.clone(), Local { lease: lease.clone(), request, pump });
         Ok(lease)
     }
 
-    async fn disconnect_if_current(&self, id: &PublicationId, lease: &Lease) {
-        let state = self.state.lock().await;
-        if state.local.get(id).is_some_and(|local| &local.lease == lease) {
-            // A failure leaves a stale or withdrawn lease, which maintenance forgets.
-            if let Err(error) = self.policy().disconnect(&self.session, lease).await {
-                tracing::debug!(%id, %error, "disconnecting an unreachable endpoint failed");
+    /// At start: the publications this instance made earlier and no longer
+    /// configures are withdrawn, API ones included, which do not persist.
+    async fn withdraw_unconfigured(&self, configured: &BTreeSet<PublicationId>) {
+        let own = self.policy().publications().into_iter().filter(|publication| {
+            &publication.publisher == self.fingerprint()
+                && publication.availability != Availability::Withdrawn
+                && !configured.contains(&publication.id)
+        });
+        for publication in own.collect::<Vec<_>>() {
+            let lease = Lease { id: publication.id.clone(), generation: publication.generation, publisher: self.fingerprint().clone() };
+            if let Err(error) = self.policy().withdraw(&self.session, &lease).await {
+                tracing::warn!(id = %publication.id, %error, "withdrawing an earlier publication failed");
             }
         }
     }
 
-    /// The daemon forgets a publication once the authority has withdrawn it,
-    /// or once it turns out no longer to be this instance's. Another
-    /// publisher's takeover is reported, not withdrawn on its behalf.
+    /// Any publication this instance published, from the API or from
+    /// configuration, before or since a restart. One another publisher has
+    /// taken over is reported as denied, not withdrawn on its behalf.
     pub(crate) async fn withdraw(&self, id: &PublicationId) -> Result<(), Error> {
         let mut state = self.state.lock().await;
-        let lease = state.local.get(id).ok_or(Error::UnknownPublication)?.lease.clone();
-        match self.policy().withdraw(&self.session, &lease).await {
-            Ok(()) | Err(Error::Withdrawn) => {
-                state.local.remove(id);
-                Ok(())
-            }
-            Err(error @ (Error::Denied | Error::StaleGeneration)) => {
-                state.local.remove(id);
-                Err(error)
-            }
-            Err(error) => Err(error),
+        let current = self.policy().publications().into_iter().find(|publication| &publication.id == id);
+        let Some(publication) = current else {
+            state.local.remove(id);
+            return Err(Error::UnknownPublication);
+        };
+        if &publication.publisher != self.fingerprint() {
+            state.local.remove(id);
+            return Err(Error::Denied);
         }
+        if publication.availability != Availability::Withdrawn {
+            let lease = Lease { id: id.clone(), generation: publication.generation, publisher: self.fingerprint().clone() };
+            self.policy().withdraw(&self.session, &lease).await?;
+        }
+        state.local.remove(id);
+        Ok(())
     }
 
-    pub(crate) async fn publications(&self) -> Vec<PublicationEntry> {
+    pub(crate) async fn publications(&self) -> PublicationList {
         let state = self.state.lock().await;
-        self.policy()
+        let publications = self
+            .policy()
             .publications()
             .into_iter()
             .map(|publication| {
@@ -348,7 +392,8 @@ impl Inner {
                     .map(|local| local.request.endpoint.clone());
                 PublicationEntry { publication, endpoint }
             })
-            .collect()
+            .collect();
+        PublicationList { epoch: self.epoch.clone(), publications }
     }
 
     pub(crate) async fn trusted(&self) -> Vec<TrustedMember> {
@@ -387,7 +432,7 @@ impl Inner {
     /// Apply, then persist; a failure at either step restores the previous
     /// group in the authority, and the file is only ever written whole.
     fn change_trust(&self, state: &mut State, trusted: Vec<TrustedInstance>) -> Result<(), TrustError> {
-        let previous = std::mem::replace(&mut state.trusted, trusted);
+        let previous = mem::replace(&mut state.trusted, trusted);
         let applied = self
             .apply_trust(state)
             .map_err(TrustError::Tender)
@@ -438,7 +483,7 @@ impl Inner {
                 continue;
             }
             let id = request.id.clone();
-            if let Err(error) = self.publish_locked(&mut state, request).await {
+            if let Err(error) = self.publish_locked(&mut state, request, true).await {
                 tracing::warn!(%id, %error, "republishing a recovered endpoint failed");
             }
         }
@@ -466,12 +511,12 @@ async fn pump(mut incoming: mpsc::UnboundedReceiver<ByteStream>, endpoint: PathB
         let policy = policy.clone();
         let session = session.clone();
         let lease = lease.clone();
-        tokio::spawn(async move {
-            match timeout(ENDPOINT_TIMEOUT, UnixStream::connect(&endpoint)).await {
-                Ok(Ok(mut service)) => {
-                    let _ = tokio::io::copy_bidirectional(&mut stream, &mut service).await;
+        spawn(async move {
+            match open(&endpoint).await {
+                Some(mut service) => {
+                    let _ = copy_bidirectional(&mut stream, &mut service).await;
                 }
-                _ => {
+                None => {
                     let _ = policy.disconnect(&session, &lease).await;
                 }
             }
@@ -479,14 +524,25 @@ async fn pump(mut incoming: mpsc::UnboundedReceiver<ByteStream>, endpoint: PathB
     }
 }
 
-/// Run until SIGINT or SIGTERM.
+async fn open(endpoint: &Path) -> Option<UnixStream> {
+    for attempt in 0..OPEN_ATTEMPTS {
+        if attempt > 0 {
+            sleep(OPEN_RETRY * attempt).await;
+        }
+        if let Ok(Ok(service)) = timeout(ENDPOINT_TIMEOUT, UnixStream::connect(endpoint)).await {
+            return Some(service);
+        }
+    }
+    None
+}
+
 pub async fn serve(paths: Paths) -> io::Result<()> {
     let daemon = Daemon::start(paths).await?;
     let instance = daemon.instance();
     tracing::info!(fingerprint = %instance.fingerprint.0, peer = %instance.peer_socket.display(), "tender serving");
     let mut terminate = signal(SignalKind::terminate())?;
     tokio::select! {
-        _ = tokio::signal::ctrl_c() => {}
+        _ = ctrl_c() => {}
         _ = terminate.recv() => {}
     }
     daemon.shutdown().await;
@@ -495,6 +551,7 @@ pub async fn serve(paths: Paths) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use tempfile::Builder;
     use tokio::net::UnixListener;
 
     use super::*;
@@ -504,21 +561,21 @@ mod tests {
     // it: maintenance compares against the authority as of holding the lock.
     #[tokio::test]
     async fn maintenance_keeps_a_concurrent_publish() {
-        let root = tempfile::Builder::new().prefix("td-").permissions(std::fs::Permissions::from_mode(0o700)).tempdir().expect("root");
+        let root = Builder::new().prefix("td-").permissions(Permissions::from_mode(0o700)).tempdir().expect("root");
         let paths = Paths { config: root.path().join("config"), state: root.path().join("state"), runtime: root.path().join("runtime") };
         let daemon = Daemon::start(paths).await.expect("start");
         let endpoint = root.path().join("service");
         let _listener = UnixListener::bind(&endpoint).expect("service");
-        let id = PublicationId::new("scope", "service");
+        let id = PublicationId::new("vessel/scope", "service");
         let request = PublishEndpoint { id: id.clone(), label: Label("echo".into()), display: String::new(), endpoint, audience: None };
         let inner = daemon.inner.clone();
         let mut state = inner.state.lock().await;
-        let maintaining = tokio::spawn({
+        let maintaining = spawn({
             let inner = inner.clone();
             async move { inner.maintain().await }
         });
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        inner.publish_locked(&mut state, request).await.expect("publish");
+        sleep(Duration::from_millis(50)).await;
+        inner.publish_locked(&mut state, request, true).await.expect("publish");
         drop(state);
         maintaining.await.expect("maintain");
         assert!(inner.state.lock().await.local.contains_key(&id), "maintenance dropped a publish it raced");

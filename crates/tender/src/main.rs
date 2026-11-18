@@ -1,18 +1,24 @@
+use std::{io, process::ExitCode};
+
+#[cfg(unix)]
+use tender::cli;
+use tracing_subscriber::fmt;
+
 #[tokio::main]
-async fn main() -> std::process::ExitCode {
-    tracing_subscriber::fmt().with_writer(std::io::stderr).init();
+async fn main() -> ExitCode {
+    fmt().with_writer(io::stderr).init();
     match run().await {
-        Ok(()) => std::process::ExitCode::SUCCESS,
+        Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("tender: {error}");
-            std::process::ExitCode::FAILURE
+            ExitCode::FAILURE
         }
     }
 }
 
 #[cfg(unix)]
 async fn run() -> Result<(), String> {
-    tender::cli::main().await
+    cli::main().await
 }
 
 #[cfg(not(unix))]

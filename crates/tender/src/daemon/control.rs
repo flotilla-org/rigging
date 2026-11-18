@@ -39,6 +39,10 @@ async fn publications(State(inner): Daemon, encoding: Encoding) -> Response {
 }
 
 async fn publish(State(inner): Daemon, encoding: Encoding, Wire(request): Wire<PublishEndpoint>) -> Response {
+    // A relative path would resolve against the daemon's directory, not the caller's.
+    if request.endpoint.is_relative() {
+        return encoding.error_code(StatusCode::BAD_REQUEST, "relative_endpoint", "the endpoint must be an absolute path");
+    }
     match inner.publish(request).await {
         Ok(publication) => encoding.ok(publication).into_response(),
         Err(error) => refusal(encoding, error),
@@ -75,7 +79,7 @@ async fn bindings(State(inner): Daemon, encoding: Encoding) -> Response {
 }
 
 async fn diagnostics(State(inner): Daemon, encoding: Encoding) -> Response {
-    let publications = inner.publications().await.len();
+    let publications = inner.publications().await.publications.len();
     encoding
         .ok(Diagnostics {
             instance: inner.instance(),
