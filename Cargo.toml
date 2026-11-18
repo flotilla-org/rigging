@@ -29,3 +29,5 @@ hegeltest = "=0.48.1"
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json"] }
 serde_norway = "0.9.42"
 tracing-subscriber = { version = "0.3", features = ["fmt"] }
+clap = { version = "4", features = ["derive"] }
+toml = "1"

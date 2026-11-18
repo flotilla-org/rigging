@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::{Fingerprint, Scope, api::TrustedInstance};
 
@@ -43,17 +43,24 @@ pub struct ConfiguredGrant {
     pub scope: Scope,
 }
 
-impl Config {
-    pub fn load(path: &Path) -> io::Result<Self> {
-        match std::fs::read_to_string(path) {
-            Ok(text) => toml::from_str(&text).map_err(|error| io::Error::other(format!("{}: {error}", path.display()))),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(error) => Err(error),
-        }
+/// A missing file is the empty default.
+fn load<T: DeserializeOwned + Default>(path: &Path) -> io::Result<T> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => toml::from_str(&text).map_err(|error| io::Error::other(format!("{}: {error}", path.display()))),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(T::default()),
+        Err(error) => Err(error),
     }
 }
 
-/// `trusted.toml`: the Trusted Group, which the daemon rewrites as it changes.
+impl Config {
+    pub fn load(path: &Path) -> io::Result<Self> {
+        load(path)
+    }
+}
+
+/// `trusted.toml`: the Trusted Group. It is configuration, which people may
+/// edit while the daemon is stopped; the daemon rewrites it as the group
+/// changes through the control API.
 #[derive(Serialize, Deserialize, Default, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct TrustedFile {
@@ -63,11 +70,7 @@ pub struct TrustedFile {
 
 impl TrustedFile {
     pub fn load(path: &Path) -> io::Result<Self> {
-        match std::fs::read_to_string(path) {
-            Ok(text) => toml::from_str(&text).map_err(|error| io::Error::other(format!("{}: {error}", path.display()))),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(error) => Err(error),
-        }
+        load(path)
     }
 
     pub fn save(&self, path: &Path) -> io::Result<()> {

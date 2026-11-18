@@ -74,15 +74,22 @@ async fn diagnostics(State(inner): Daemon, encoding: Encoding) -> Response {
     encoding.ok(Diagnostics { instance: inner.instance(), publications, trusted: inner.trusted_count().await }).into_response()
 }
 
+/// The wire contract for each refusal: its status and stable code.
 fn refusal(encoding: Encoding, error: Error) -> Response {
-    let status = match error {
-        Error::Denied | Error::IdentityMismatch | Error::UntrustedIntermediary | Error::GrantExpired => StatusCode::FORBIDDEN,
-        Error::LivePublisher | Error::StaleGeneration => StatusCode::CONFLICT,
-        Error::UnknownPublication => StatusCode::NOT_FOUND,
-        Error::Withdrawn => StatusCode::GONE,
-        Error::Unavailable | Error::Deadline | Error::Storage => StatusCode::SERVICE_UNAVAILABLE,
+    let (status, code) = match error {
+        Error::Denied => (StatusCode::FORBIDDEN, "denied"),
+        Error::IdentityMismatch => (StatusCode::FORBIDDEN, "identity_mismatch"),
+        Error::UntrustedIntermediary => (StatusCode::FORBIDDEN, "untrusted_intermediary"),
+        Error::GrantExpired => (StatusCode::FORBIDDEN, "grant_expired"),
+        Error::LivePublisher => (StatusCode::CONFLICT, "live_publisher"),
+        Error::StaleGeneration => (StatusCode::CONFLICT, "stale_generation"),
+        Error::UnknownPublication => (StatusCode::NOT_FOUND, "unknown_publication"),
+        Error::Withdrawn => (StatusCode::GONE, "withdrawn"),
+        Error::Unavailable => (StatusCode::SERVICE_UNAVAILABLE, "unavailable"),
+        Error::Deadline => (StatusCode::SERVICE_UNAVAILABLE, "deadline"),
+        Error::Storage => (StatusCode::SERVICE_UNAVAILABLE, "storage"),
     };
-    encoding.error_code(status, &code(&error), error.to_string())
+    encoding.error_code(status, code, error.to_string())
 }
 
 fn trust_refusal(encoding: Encoding, error: TrustError) -> Response {
@@ -90,19 +97,7 @@ fn trust_refusal(encoding: Encoding, error: TrustError) -> Response {
         TrustError::InvalidKey => encoding.error_code(StatusCode::BAD_REQUEST, "invalid_key", "key must be 32 bytes of lowercase hex"),
         TrustError::OwnKey => encoding.error_code(StatusCode::BAD_REQUEST, "own_key", "an instance cannot trust itself"),
         TrustError::NotMember => encoding.error_code(StatusCode::NOT_FOUND, "not_member", "no such Trusted Group member"),
-        TrustError::Storage(error) => encoding.error_code(StatusCode::INTERNAL_SERVER_ERROR, "storage", error.to_string()),
+        TrustError::Storage(error) => encoding.error_code(StatusCode::SERVICE_UNAVAILABLE, "storage", error.to_string()),
         TrustError::Tender(error) => refusal(encoding, error),
     }
-}
-
-/// `LivePublisher` becomes `live_publisher`.
-fn code(error: &Error) -> String {
-    let mut code = String::new();
-    for (index, character) in format!("{error:?}").chars().enumerate() {
-        if character.is_uppercase() && index > 0 {
-            code.push('_');
-        }
-        code.push(character.to_ascii_lowercase());
-    }
-    code
 }

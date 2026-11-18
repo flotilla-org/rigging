@@ -18,17 +18,17 @@ ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 sha2 = "0.10"
 tempfile = { workspace = true }
-rigging-paths = { path = "../rigging-paths" }
-rigging-process = { path = "../rigging-process" }
-rigging-http-wire = { path = "../rigging-http-wire" }
-axum = { workspace = true }
-clap = { version = "4", features = ["derive"] }
-toml = "1"
+clap = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 rigging-ssh = { path = "../rigging-ssh" }
 rigging-http-serve = { path = "../rigging-http-serve" }
+rigging-http-wire = { path = "../rigging-http-wire" }
+rigging-paths = { path = "../rigging-paths" }
+rigging-process = { path = "../rigging-process" }
+axum = { workspace = true }
+toml = { workspace = true }
 libc = { workspace = true }
 
 [dev-dependencies]
@@ -38,6 +38,7 @@ rigging-http-client = { path = "../rigging-http-client", default-features = fals
 reqwest = { workspace = true }
 http = { workspace = true }
 flotilla-cbor = { path = "../flotilla-cbor" }
+rigging-process = { path = "../rigging-process" }
 
 [features]
 # Dedicated provisioned Linux CI job; normal contracts need neither cleat nor sshd.

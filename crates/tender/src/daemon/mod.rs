@@ -50,10 +50,15 @@ impl Paths {
     /// The runtime directory is `$TENDER_ROOT/runtime`, else
     /// `$XDG_RUNTIME_DIR/tender`, else `tender-<uid>` in the temporary directory.
     pub fn from_env(env: &dyn EnvVars) -> Result<Self, String> {
-        let policy = PathPolicy::from_env("tender", env)?;
         let nonempty = |value: OsString| (!value.is_empty()).then_some(value);
-        let runtime = if let Some(root) = env.get_os("TENDER_ROOT").and_then(nonempty) {
-            PathBuf::from(root).join("runtime")
+        let root = env.get_os("TENDER_ROOT").and_then(nonempty).map(PathBuf::from);
+        // A relative root would put sockets wherever the daemon was started.
+        if root.as_ref().is_some_and(|root| !root.is_absolute()) {
+            return Err("TENDER_ROOT must be an absolute path".into());
+        }
+        let policy = PathPolicy::from_env("tender", env)?;
+        let runtime = if let Some(root) = root {
+            root.join("runtime")
         } else if let Some(base) = env.get_os("XDG_RUNTIME_DIR").map(PathBuf::from).filter(|path| path.is_absolute()) {
             base.join("tender")
         } else {
@@ -75,6 +80,9 @@ impl Paths {
         self.config.join("config.toml")
     }
 
+    /// Configuration, not state: people may edit it while the daemon is
+    /// stopped, as they would `authorized_keys`, and the daemon rewrites it
+    /// when the group changes through the control API.
     pub fn trusted_file(&self) -> PathBuf {
         self.config.join("trusted.toml")
     }
@@ -139,7 +147,7 @@ impl Daemon {
             member.key.fingerprint().ok_or_else(|| io::Error::other(format!("invalid key in trusted group: {}", member.key.0)))?;
         }
         let server = Server::open(paths.peer_socket(), &paths.state, clock()?)?;
-        let identity = Identity::load_or_create(&paths.state.join("identity"))?;
+        let identity = server.identity().clone();
         let fingerprint = identity.fingerprint();
         let session = Session { caller: fingerprint.clone(), pinned_host: fingerprint, via: None };
         let control = UnixServer::bind(paths.control_socket(), 0o600).await?;
@@ -254,12 +262,21 @@ impl Inner {
         Ok(())
     }
 
+    /// The endpoint is probed outside the state lock, so a slow endpoint
+    /// never holds up other control requests.
     pub(crate) async fn publish(&self, request: PublishEndpoint) -> Result<Publication, Error> {
-        let mut state = self.state.lock().await;
-        self.publish_locked(&mut state, request).await
+        let (id, endpoint, lease) = {
+            let mut state = self.state.lock().await;
+            let lease = self.publish_locked(&mut state, request.clone()).await?;
+            (request.id, request.endpoint, lease)
+        };
+        if !reachable(&endpoint).await {
+            self.disconnect_if_current(&id, &lease).await;
+        }
+        self.policy().publications().into_iter().find(|publication| publication.id == id).ok_or(Error::Unavailable)
     }
 
-    async fn publish_locked(&self, state: &mut State, request: PublishEndpoint) -> Result<Publication, Error> {
+    async fn publish_locked(&self, state: &mut State, request: PublishEndpoint) -> Result<Lease, Error> {
         let published = self
             .policy()
             .publish(
@@ -275,17 +292,25 @@ impl Inner {
         let lease = published.lease;
         let pump =
             tokio::spawn(pump(published.incoming, request.endpoint.clone(), self.policy().clone(), self.session.clone(), lease.clone()));
-        if !reachable(&request.endpoint).await {
-            self.policy().disconnect(&self.session, &lease).await?;
-        }
-        let id = request.id.clone();
-        state.local.insert(id.clone(), Local { lease, request, pump });
-        self.policy().publications().into_iter().find(|publication| publication.id == id).ok_or(Error::Unavailable)
+        state.local.insert(request.id.clone(), Local { lease: lease.clone(), request, pump });
+        Ok(lease)
     }
 
+    async fn disconnect_if_current(&self, id: &PublicationId, lease: &Lease) {
+        let state = self.state.lock().await;
+        if state.local.get(id).is_some_and(|local| &local.lease == lease) {
+            // A failure leaves a stale or withdrawn lease, which maintenance forgets.
+            let _ = self.policy().disconnect(&self.session, lease).await;
+        }
+    }
+
+    /// The daemon forgets a publication only once the authority has withdrawn it.
     pub(crate) async fn withdraw(&self, id: &PublicationId) -> Result<(), Error> {
-        let local = self.state.lock().await.local.remove(id).ok_or(Error::UnknownPublication)?;
-        self.policy().withdraw(&self.session, &local.lease).await
+        let mut state = self.state.lock().await;
+        let lease = state.local.get(id).ok_or(Error::UnknownPublication)?.lease.clone();
+        self.policy().withdraw(&self.session, &lease).await?;
+        state.local.remove(id);
+        Ok(())
     }
 
     pub(crate) async fn publications(&self) -> Vec<PublicationEntry> {
@@ -323,23 +348,35 @@ impl Inner {
         let mut trusted = state.trusted.clone();
         trusted.retain(|member| member.key != instance.key);
         trusted.push(instance.clone());
-        TrustedFile { instances: trusted.clone() }.save(&self.paths.trusted_file()).map_err(TrustError::Storage)?;
-        state.trusted = trusted;
-        self.apply_trust(&state).map_err(TrustError::Tender)?;
+        self.change_trust(&mut state, trusted)?;
         Ok(TrustedMember { fingerprint, instance })
     }
 
     pub(crate) async fn untrust(&self, fingerprint: &Fingerprint) -> Result<(), TrustError> {
         let mut state = self.state.lock().await;
         let mut trusted = state.trusted.clone();
-        let before = trusted.len();
         trusted.retain(|member| member.key.fingerprint().as_ref() != Some(fingerprint));
-        if trusted.len() == before {
+        if trusted.len() == state.trusted.len() {
             return Err(TrustError::NotMember);
         }
-        TrustedFile { instances: trusted.clone() }.save(&self.paths.trusted_file()).map_err(TrustError::Storage)?;
-        state.trusted = trusted;
-        self.apply_trust(&state).map_err(TrustError::Tender)
+        self.change_trust(&mut state, trusted)
+    }
+
+    /// Apply, then persist; a failure at either step restores the previous
+    /// group in the authority, and the file is only ever written whole.
+    fn change_trust(&self, state: &mut State, trusted: Vec<TrustedInstance>) -> Result<(), TrustError> {
+        let previous = std::mem::replace(&mut state.trusted, trusted);
+        let applied = self
+            .apply_trust(state)
+            .map_err(TrustError::Tender)
+            .and_then(|()| TrustedFile { instances: state.trusted.clone() }.save(&self.paths.trusted_file()).map_err(TrustError::Storage));
+        if applied.is_err() {
+            state.trusted = previous;
+            if let Err(error) = self.apply_trust(state) {
+                tracing::warn!(%error, "restoring the previous Trusted Group failed");
+            }
+        }
+        applied
     }
 
     pub(crate) async fn trusted_count(&self) -> usize {
@@ -348,29 +385,38 @@ impl Inner {
 
     /// Republish an own publication once its endpoint answers again, and
     /// forget one that another publisher has taken over or that has gone.
+    /// Endpoints are probed outside the state lock.
     async fn maintain(&self) {
-        let mut state = self.state.lock().await;
         let records: BTreeMap<_, _> =
             self.policy().publications().into_iter().map(|publication| (publication.id.clone(), publication)).collect();
-        let ids: Vec<_> = state.local.keys().cloned().collect();
-        for id in ids {
-            let local = &state.local[&id];
-            let ours = records.get(&id).filter(|record| {
-                &record.publisher == self.fingerprint()
-                    && record.generation == local.lease.generation
-                    && record.availability != Availability::Withdrawn
+        let mut recovering = Vec::new();
+        {
+            let mut state = self.state.lock().await;
+            state.local.retain(|id, local| {
+                let ours = records.get(id).filter(|record| {
+                    &record.publisher == self.fingerprint()
+                        && record.generation == local.lease.generation
+                        && record.availability != Availability::Withdrawn
+                });
+                if let Some(record) = ours
+                    && record.availability == Availability::Unavailable
+                {
+                    recovering.push((local.lease.clone(), local.request.clone()));
+                }
+                ours.is_some()
             });
-            match ours {
-                None => {
-                    state.local.remove(&id);
-                }
-                Some(record) if record.availability == Availability::Unavailable && reachable(&local.request.endpoint).await => {
-                    let request = local.request.clone();
-                    if let Err(error) = self.publish_locked(&mut state, request).await {
-                        tracing::warn!(%id, %error, "republishing a recovered endpoint failed");
-                    }
-                }
-                Some(_) => {}
+        }
+        for (lease, request) in recovering {
+            if !reachable(&request.endpoint).await {
+                continue;
+            }
+            let mut state = self.state.lock().await;
+            if state.local.get(&request.id).is_none_or(|local| local.lease != lease) {
+                continue;
+            }
+            let id = request.id.clone();
+            if let Err(error) = self.publish_locked(&mut state, request).await {
+                tracing::warn!(%id, %error, "republishing a recovered endpoint failed");
             }
         }
     }

@@ -209,6 +209,7 @@ struct Registration {
 /// incoming callers are constructed from verified keys, never wire assertions.
 pub struct Server {
     pub policy: MemoryTender,
+    identity: Identity,
     task: JoinHandle<()>,
     path: PathBuf,
     router: Relays,
@@ -255,6 +256,7 @@ impl Server {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
         let registrations = Arc::new(Mutex::new(BTreeMap::new()));
         let authority = policy.clone();
+        let own = identity.clone();
         let router: Relays = Arc::new(Mutex::new(None));
         let relays = router.clone();
         let task = tokio::spawn(async move {
@@ -285,7 +287,11 @@ impl Server {
                 }
             }
         });
-        Ok(Self { policy, task, path, router })
+        Ok(Self { policy, identity: own, task, path, router })
+    }
+
+    pub fn identity(&self) -> &Identity {
+        &self.identity
     }
 
     /// Forward relay requests for other hosts along the hosting application's

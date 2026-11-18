@@ -245,6 +245,46 @@ async fn configuration_publishes_endpoints_and_grants_scopes() {
     pump.abort();
 }
 
+// A Trusted Group that cannot be saved is not applied either: the member
+// stays refused, the file keeps its last content, and the answer is 503.
+#[tokio::test]
+async fn unsaved_trust_change_is_rolled_back() {
+    let root = root();
+    let paths = paths(root.path());
+    let daemon = Daemon::start(paths.clone()).await.expect("daemon");
+    let control = Control::new(&paths.control_socket());
+    let member = Identity::generate();
+    std::fs::set_permissions(&paths.config, std::fs::Permissions::from_mode(0o500)).expect("read-only configuration");
+    let refused: Result<TrustedMember, _> = control.post(api::TRUSTED, &trusted(&member)).await;
+    std::fs::set_permissions(&paths.config, std::fs::Permissions::from_mode(0o700)).expect("writable again");
+    let (status, body) = refused.expect_err("save fails");
+    assert_eq!((status, body.code.as_str()), (http::StatusCode::SERVICE_UNAVAILABLE, "storage"));
+    let members: Vec<TrustedMember> = control.get(api::TRUSTED).await.expect("trusted group");
+    assert!(members.is_empty());
+    assert!(!paths.trusted_file().exists());
+    let client = SshTender::new(paths.peer_socket(), daemon.instance().fingerprint, vec![member.clone()]).expect("client");
+    let session = Session { caller: member.fingerprint(), pinned_host: daemon.instance().fingerprint, via: None };
+    assert_eq!(client.browse(&session).await, Err(Error::Denied));
+}
+
+// Sockets never depend on the directory the daemon starts in.
+#[test]
+fn relative_root_is_refused() {
+    struct Env(&'static str);
+    impl rigging_process::EnvVars for Env {
+        fn get(&self, key: &str) -> Option<String> {
+            match key {
+                "TENDER_ROOT" => Some(self.0.into()),
+                "HOME" => Some("/home/test".into()),
+                _ => None,
+            }
+        }
+    }
+    assert!(Paths::from_env(&Env("relative/root")).is_err());
+    let paths = Paths::from_env(&Env("/absolute")).expect("absolute root");
+    assert_eq!(paths, Paths { config: "/absolute/config".into(), state: "/absolute/state".into(), runtime: "/absolute/runtime".into() });
+}
+
 // The binary serves until SIGTERM, from TENDER_ROOT alone.
 #[tokio::test]
 async fn binary_serves_until_terminated() {
