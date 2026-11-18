@@ -1,8 +1,16 @@
+#[cfg(unix)]
+use std::{collections::BTreeMap, fs::Permissions, os::unix::fs::PermissionsExt, sync::Arc};
 use std::{collections::BTreeSet, time::Duration};
 
+#[cfg(unix)]
+use sha2::{Digest, Sha256};
+#[cfg(unix)]
+use tempfile::{Builder, TempDir};
+#[cfg(unix)]
+use tender::ssh::{Identity, Server, SshTender};
 use tender::{
-    Availability, BindingState, ByteStream, Error, Fingerprint, Grant, Label, PublicationId, PublishRequest, Route, Scope, Session, Tender,
-    UnavailableReason,
+    Availability, BindingState, ByteStream, Error, Fingerprint, Grant, Label, Lease, PublicationId, PublishRequest, Route, Scope, Session,
+    Tender, UnavailableReason,
     memory::{MemoryTender, WITHDRAWN_RETENTION},
 };
 #[cfg(unix)]
@@ -64,7 +72,7 @@ struct Rig {
     host: Box<dyn HostControls>,
     host_id: Fingerprint,
     #[cfg(unix)]
-    _server: Option<(Vec<tender::ssh::Server>, tempfile::TempDir)>,
+    _server: Option<(Vec<Server>, TempDir)>,
 }
 
 fn memory() -> Rig {
@@ -90,21 +98,19 @@ fn fp(value: &str) -> Fingerprint {
     }
 }
 #[cfg(unix)]
-fn identity(label: &str) -> tender::ssh::Identity {
-    use sha2::{Digest, Sha256};
-    tender::ssh::Identity::from_secret(Sha256::digest(label.as_bytes()).into())
+fn identity(label: &str) -> Identity {
+    Identity::from_secret(Sha256::digest(label.as_bytes()).into())
 }
 
 #[cfg(unix)]
 async fn local_adapter() -> Rig {
-    use std::os::unix::fs::PermissionsExt;
-    let directory = tempfile::Builder::new().permissions(std::fs::Permissions::from_mode(0o700)).tempdir().expect("private directory");
+    let directory = Builder::new().permissions(Permissions::from_mode(0o700)).tempdir().expect("private directory");
     let host_identity = identity("host-key");
     let host_id = host_identity.fingerprint();
     let host = MemoryTender::new(host_id.clone());
     let endpoint = directory.path().join("tender");
-    let server = tender::ssh::Server::bind(endpoint.clone(), host_identity, host.clone()).expect("Tender listener");
-    let adapter = tender::ssh::SshTender::new(endpoint, host_id.clone(), CALLERS.into_iter().map(identity).collect()).expect("adapter");
+    let server = Server::bind(endpoint.clone(), host_identity, host.clone()).expect("Tender listener");
+    let adapter = SshTender::new(endpoint, host_id.clone(), CALLERS.into_iter().map(identity).collect()).expect("adapter");
     Rig { tender: Box::new(adapter), host: Box::new(host), host_id, _server: Some((vec![server], directory)) }
 }
 
@@ -133,28 +139,27 @@ const CALLERS: [&str; 16] = [
 // both relays admit every caller and forward to the host.
 #[cfg(unix)]
 async fn relayed_adapter() -> Rig {
-    use std::{os::unix::fs::PermissionsExt, sync::Arc};
-    let directory = tempfile::Builder::new().permissions(std::fs::Permissions::from_mode(0o700)).tempdir().expect("private directory");
+    let directory = Builder::new().permissions(Permissions::from_mode(0o700)).tempdir().expect("private directory");
     let host_identity = identity("host-key");
     let host_id = host_identity.fingerprint();
     let host = MemoryTender::new(host_id.clone());
     let relays = ["relay-key", "impostor"];
-    let mut paths = std::collections::BTreeMap::from([(host_id.clone(), directory.path().join("host"))]);
+    let mut paths = BTreeMap::from([(host_id.clone(), directory.path().join("host"))]);
     for relay in relays {
         paths.insert(fp(relay), directory.path().join(relay));
     }
-    let links = Arc::new(Links { paths: Arc::new(paths), next: std::collections::BTreeMap::from([(host_id.clone(), host_id.clone())]) });
-    let mut servers = vec![tender::ssh::Server::bind(links.paths[&host_id].clone(), host_identity, host.clone()).expect("host listener")];
+    let links = Arc::new(Links { paths: Arc::new(paths), next: BTreeMap::from([(host_id.clone(), host_id.clone())]) });
+    let mut servers = vec![Server::bind(links.paths[&host_id].clone(), host_identity, host.clone()).expect("host listener")];
     for relay in relays {
         let policy = MemoryTender::new(fp(relay));
         for caller in CALLERS {
             policy.allow_connect(fp(caller)).expect("relay policy");
         }
-        let server = tender::ssh::Server::bind(links.paths[&fp(relay)].clone(), identity(relay), policy).expect("relay listener");
+        let server = Server::bind(links.paths[&fp(relay)].clone(), identity(relay), policy).expect("relay listener");
         server.route_relays(links.clone());
         servers.push(server);
     }
-    let adapter = tender::ssh::SshTender::with_dial(links, host_id.clone(), CALLERS.into_iter().map(identity).collect()).expect("adapter");
+    let adapter = SshTender::with_dial(links, host_id.clone(), CALLERS.into_iter().map(identity).collect()).expect("adapter");
     Rig { tender: Box::new(adapter), host: Box::new(host), host_id, _server: Some((servers, directory)) }
 }
 
@@ -276,9 +281,9 @@ async fn identity_is_scope_and_name(rig: Rig) {
     grant(&rig, "outsider", "elsewhere", &["consumer"], 100);
     let first = rig.tender.publish(&owner, request("n", "service", &["consumer"])).await.expect("first");
     assert_eq!(first.lease.id, id("n", "service"));
-    let forged = tender::Lease { id: first.lease.id.clone(), generation: 1, publisher: fp("contender") };
+    let forged = Lease { id: first.lease.id.clone(), generation: 1, publisher: fp("contender") };
     assert!(matches!(rig.tender.withdraw(&contender, &forged).await, Err(Error::Denied)));
-    let missing = tender::Lease { id: id("n", "missing"), generation: 1, publisher: fp("contender") };
+    let missing = Lease { id: id("n", "missing"), generation: 1, publisher: fp("contender") };
     assert!(matches!(rig.tender.withdraw(&contender, &missing).await, Err(Error::Denied)));
     assert!(matches!(rig.tender.publish(&owner, request("n", "service", &["consumer"])).await, Err(Error::LivePublisher)));
     assert!(matches!(rig.tender.publish(&contender, request("n", "service", &["consumer"])).await, Err(Error::LivePublisher)));
@@ -524,7 +529,7 @@ async fn narrowed_grant_revokes_binding(rig: Rig) {
     grant(&rig, "owner", "n", &["kept"], 100);
     assert!(watch.recv().await.expect("narrowed").is_empty());
     assert!(matches!(rig.tender.connect(&removed, &id).await, Err(Error::Denied)));
-    assert!(matches!(rig.tender.connect(&removed, &tender::PublicationId::new("n", "missing")).await, Err(Error::Denied)));
+    assert!(matches!(rig.tender.connect(&removed, &PublicationId::new("n", "missing")).await, Err(Error::Denied)));
     let revoked = rig.tender.bind(&removed, &id).await.expect("revoked binding");
     assert_eq!((revoked.local_endpoint.as_str(), &revoked.state), (binding.local_endpoint.as_str(), &BindingState::Revoked));
     assert!(matches!(rig.tender.open_binding(&removed, &binding).await, Err(Error::Denied)));

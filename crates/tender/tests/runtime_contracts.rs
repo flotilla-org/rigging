@@ -1,24 +1,44 @@
 use std::{
     collections::BTreeSet,
     io,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
+#[cfg(unix)]
+use std::{
+    fs::{self, Permissions},
+    os::unix::{fs::PermissionsExt, net::UnixListener},
+};
 
+use hegel::TestCase;
+use serde_json::{Value, from_slice, to_vec};
+#[cfg(unix)]
+use tempfile::{Builder, TempDir};
 use tender::{
     Availability, Error, Fingerprint, Grant, Label, PublicationId, PublishRequest, Scope, Session, Tender,
     memory::MemoryTender,
     runtime::{Clock, ClockReading, MemoryStore, Store},
 };
+#[cfg(unix)]
+use tender::{
+    runtime::FileStore,
+    ssh::{Identity, Server, SshTender},
+};
+#[cfg(unix)]
+use tokio::task::yield_now;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
+    runtime,
     time::timeout,
 };
 
-struct ManualClock(Mutex<ClockReading>, std::sync::atomic::AtomicBool);
+struct ManualClock(Mutex<ClockReading>, AtomicBool);
 impl ManualClock {
     fn new() -> Self {
-        Self(Mutex::new(ClockReading { epoch: "boot-one".into(), tick: 0 }), std::sync::atomic::AtomicBool::new(false))
+        Self(Mutex::new(ClockReading { epoch: "boot-one".into(), tick: 0 }), AtomicBool::new(false))
     }
     fn set(&self, tick: u64) {
         self.0.lock().unwrap().tick = tick;
@@ -26,7 +46,7 @@ impl ManualClock {
 }
 impl Clock for ManualClock {
     fn read(&self) -> io::Result<ClockReading> {
-        if self.1.load(std::sync::atomic::Ordering::SeqCst) {
+        if self.1.load(Ordering::SeqCst) {
             return Err(io::Error::other("clock unavailable"));
         }
         Ok(self.0.lock().unwrap().clone())
@@ -41,21 +61,18 @@ struct Rig {
     session: Session,
     socket: bool,
     #[cfg(unix)]
-    server: Option<tender::ssh::Server>,
+    server: Option<Server>,
     #[cfg(unix)]
-    directory: tempfile::TempDir,
+    directory: TempDir,
 }
 impl Rig {
     fn new(socket: bool, file: bool) -> Self {
         #[cfg(unix)]
-        let directory = {
-            use std::os::unix::fs::PermissionsExt;
-            tempfile::Builder::new().permissions(std::fs::Permissions::from_mode(0o700)).tempdir().unwrap()
-        };
+        let directory = { Builder::new().permissions(Permissions::from_mode(0o700)).tempdir().unwrap() };
         #[cfg(unix)]
-        let identity = tender::ssh::Identity::from_secret([1; 32]);
+        let identity = Identity::from_secret([1; 32]);
         #[cfg(unix)]
-        let caller = tender::ssh::Identity::from_secret([2; 32]);
+        let caller = Identity::from_secret([2; 32]);
         #[cfg(unix)]
         let session = Session { caller: caller.fingerprint(), pinned_host: identity.fingerprint(), via: None };
         #[cfg(not(unix))]
@@ -63,7 +80,7 @@ impl Rig {
         let clock = Arc::new(ManualClock::new());
         #[cfg(unix)]
         let store: Arc<dyn Store> = if file {
-            Arc::new(tender::runtime::FileStore::new(directory.path().join("authority.json")).unwrap())
+            Arc::new(FileStore::new(directory.path().join("authority.json")).unwrap())
         } else {
             Arc::new(MemoryStore::default())
         };
@@ -93,12 +110,8 @@ impl Rig {
         #[cfg(unix)]
         if self.socket {
             let path = self.directory.path().join("listener");
-            self.server =
-                Some(tender::ssh::Server::bind(path.clone(), tender::ssh::Identity::from_secret([1; 32]), self.authority.clone()).unwrap());
-            self.client = Box::new(
-                tender::ssh::SshTender::new(path, self.session.pinned_host.clone(), vec![tender::ssh::Identity::from_secret([2; 32])])
-                    .unwrap(),
-            );
+            self.server = Some(Server::bind(path.clone(), Identity::from_secret([1; 32]), self.authority.clone()).unwrap());
+            self.client = Box::new(SshTender::new(path, self.session.pinned_host.clone(), vec![Identity::from_secret([2; 32])]).unwrap());
         }
     }
     fn reload(&mut self) {
@@ -213,11 +226,11 @@ contract!(socket_file_restart, restart, true, true);
 // Generated sequences cross expiry (0..=12), duplicate ticks, clock regression,
 // and restart interleavings. A withdrawn publication can never regain reachability.
 #[hegel::test]
-fn expiry_never_resurrects(tc: hegel::TestCase) {
+fn expiry_never_resurrects(tc: TestCase) {
     use hegel::generators as gs;
     let count = tc.draw(gs::integers::<usize>().min_value(1).max_value(12));
     let steps: Vec<_> = (0..count).map(|_| (tc.draw(gs::integers::<u64>().min_value(0).max_value(12)), tc.draw(gs::booleans()))).collect();
-    tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+    runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
         let mut rig = Rig::new(false, false);
         rig.authorize(10);
         let published = rig.client.publish(&rig.session, rig.request("service")).await.unwrap();
@@ -297,7 +310,7 @@ async fn stored_v1_and_v2_remain_decodable() {
 // loads as its latest record, at the highest generation any of them reached.
 #[tokio::test]
 async fn v1_records_sharing_a_name_collapse_without_reissuing_a_generation() {
-    let mut value: serde_json::Value = serde_json::from_slice(include_bytes!("fixtures/authority-v1.json")).unwrap();
+    let mut value: Value = from_slice(include_bytes!("fixtures/authority-v1.json")).unwrap();
     value["next_id"] = 4.into();
     let mut later = value["records"][0].clone();
     later["publication"]["id"] = 3.into();
@@ -305,7 +318,7 @@ async fn v1_records_sharing_a_name_collapse_without_reissuing_a_generation() {
     later["publication"]["publisher"] = "later".into();
     value["records"].as_array_mut().unwrap().push(later);
     let store = Arc::new(MemoryStore::default());
-    store.save(&serde_json::to_vec(&value).unwrap()).unwrap();
+    store.save(&to_vec(&value).unwrap()).unwrap();
     let clock = Arc::new(ManualClock::new());
     let host = Fingerprint("host".into());
     let authority = MemoryTender::hosted(host.clone(), clock, store).unwrap();
@@ -342,14 +355,14 @@ async fn changed_epoch_and_backward_clock_expire_on_reload() {
 // already-open streams. Failure injection stands in for the filesystem seam.
 struct SwitchStore {
     inner: MemoryStore,
-    fail: std::sync::atomic::AtomicBool,
+    fail: AtomicBool,
 }
 impl Store for SwitchStore {
     fn load(&self) -> io::Result<Option<Vec<u8>>> {
         self.inner.load()
     }
     fn save(&self, bytes: &[u8]) -> io::Result<()> {
-        if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+        if self.fail.load(Ordering::SeqCst) {
             return Err(io::Error::other("disk full"));
         }
         self.inner.save(bytes)
@@ -357,7 +370,7 @@ impl Store for SwitchStore {
 }
 #[tokio::test]
 async fn storage_failure_closes_streams_and_refuses_new_work() {
-    let store = Arc::new(SwitchStore { inner: MemoryStore::default(), fail: std::sync::atomic::AtomicBool::new(false) });
+    let store = Arc::new(SwitchStore { inner: MemoryStore::default(), fail: AtomicBool::new(false) });
     let mut rig = Rig::new(false, false);
     rig.authority = MemoryTender::hosted(rig.session.pinned_host.clone(), rig.clock.clone(), store.clone()).unwrap();
     rig.attach();
@@ -365,7 +378,7 @@ async fn storage_failure_closes_streams_and_refuses_new_work() {
     let mut published = rig.client.publish(&rig.session, rig.request("service")).await.unwrap();
     let mut stream = rig.client.connect(&rig.session, &published.lease.id).await.unwrap();
     let _service = published.incoming.recv().await.unwrap();
-    store.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+    store.fail.store(true, Ordering::SeqCst);
     assert_eq!(rig.authority.allow_connect(Fingerprint("other".into())), Err(Error::Storage));
     assert!(matches!(rig.client.publish(&rig.session, rig.request("service")).await, Err(Error::Storage)));
     assert!(matches!(rig.client.connect(&rig.session, &published.lease.id).await, Err(Error::Storage)));
@@ -378,30 +391,29 @@ async fn storage_failure_closes_streams_and_refuses_new_work() {
 #[cfg(unix)]
 #[tokio::test]
 async fn durable_server_open_preserves_identity_and_refuses_competing_store() {
-    use std::os::unix::fs::PermissionsExt;
-    let directory = tempfile::Builder::new().permissions(std::fs::Permissions::from_mode(0o700)).tempdir().unwrap();
+    let directory = Builder::new().permissions(Permissions::from_mode(0o700)).tempdir().unwrap();
     let path = directory.path().join("listener");
     let clock = Arc::new(ManualClock::new());
-    let server = tender::ssh::Server::open(path.clone(), directory.path(), clock.clone()).unwrap();
+    let server = Server::open(path.clone(), directory.path(), clock.clone()).unwrap();
     let host = server.policy.host();
     let caller = Fingerprint("reader".into());
     server.policy.allow_browse(caller.clone()).unwrap();
-    assert!(tender::runtime::FileStore::new(directory.path().join("authority.json")).is_err());
+    assert!(FileStore::new(directory.path().join("authority.json")).is_err());
     drop(server);
     // The aborted listener task may retain its authority until cancellation is polled.
-    tokio::task::yield_now().await;
+    yield_now().await;
     // A crashed process leaves a socket inode. Its locked hosting runtime may
     // recover that dead socket, while refusing ordinary files and live sockets.
-    let stale = std::os::unix::net::UnixListener::bind(&path).unwrap();
+    let stale = UnixListener::bind(&path).unwrap();
     drop(stale);
-    let restored = tender::ssh::Server::open(path.clone(), directory.path(), clock.clone()).unwrap();
+    let restored = Server::open(path.clone(), directory.path(), clock.clone()).unwrap();
     assert_eq!(restored.policy.host(), host);
     assert!(restored.policy.browse(&Session { caller, pinned_host: host, via: None }).await.is_ok());
     drop(restored);
-    tokio::task::yield_now().await;
-    std::fs::write(directory.path().join("authority.json"), b"broken").unwrap();
-    assert!(tender::ssh::Server::open(path, directory.path(), clock).is_err());
-    assert_eq!(std::fs::read(directory.path().join("authority.json")).unwrap(), b"broken");
+    yield_now().await;
+    fs::write(directory.path().join("authority.json"), b"broken").unwrap();
+    assert!(Server::open(path, directory.path(), clock).is_err());
+    assert_eq!(fs::read(directory.path().join("authority.json")).unwrap(), b"broken");
 }
 
 // A reserved identity admits exactly one concurrent republish. Both adapters
@@ -451,8 +463,8 @@ async fn zero_maximum_and_renewal_boundaries() {
 // previous document untouched.
 #[test]
 fn corrupt_identities_and_versions_are_refused() {
-    let v1: serde_json::Value = serde_json::from_slice(include_bytes!("fixtures/authority-v1.json")).unwrap();
-    let v2: serde_json::Value = serde_json::from_slice(include_bytes!("fixtures/authority-v2.json")).unwrap();
+    let v1: Value = from_slice(include_bytes!("fixtures/authority-v1.json")).unwrap();
+    let v2: Value = from_slice(include_bytes!("fixtures/authority-v2.json")).unwrap();
     for variant in 0..6 {
         let mut value = if variant < 4 { v1.clone() } else { v2.clone() };
         match variant {
@@ -463,7 +475,7 @@ fn corrupt_identities_and_versions_are_refused() {
             4 => value["records"][1]["publication"]["generation"] = 0.into(),
             _ => value["records"][1]["publication"]["id"] = value["records"][0]["publication"]["id"].clone(),
         }
-        let bytes = serde_json::to_vec(&value).unwrap();
+        let bytes = to_vec(&value).unwrap();
         let store = Arc::new(MemoryStore::default());
         store.save(&bytes).unwrap();
         assert!(
@@ -481,13 +493,13 @@ async fn clock_failure(rig: Rig) {
     let mut published = rig.client.publish(&rig.session, rig.request("service")).await.unwrap();
     let mut stream = rig.client.connect(&rig.session, &published.lease.id).await.unwrap();
     let _service = timeout(Duration::from_secs(2), published.incoming.recv()).await.unwrap().unwrap();
-    rig.clock.1.store(true, std::sync::atomic::Ordering::SeqCst);
+    rig.clock.1.store(true, Ordering::SeqCst);
     assert!(matches!(rig.client.publish(&rig.session, rig.request("service")).await, Err(Error::Storage)));
     assert!(matches!(rig.client.connect(&rig.session, &published.lease.id).await, Err(Error::Storage)));
     let mut byte = [0];
     let closed = timeout(Duration::from_secs(2), stream.read(&mut byte)).await.unwrap();
     assert!(matches!(closed, Ok(0)) || closed.is_err());
-    rig.clock.1.store(false, std::sync::atomic::Ordering::SeqCst);
+    rig.clock.1.store(false, Ordering::SeqCst);
     assert_eq!(rig.authority.allow_browse(rig.session.caller.clone()), Err(Error::Storage));
     assert_eq!(rig.client.browse(&rig.session).await, Err(Error::Storage));
 }

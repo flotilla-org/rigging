@@ -1,25 +1,26 @@
 use std::{
+    env,
+    fs::{self, Permissions},
+    net::TcpListener,
     os::unix::fs::PermissionsExt,
     path::PathBuf,
-    process::{Child, Command},
+    process::{Child, Command, Stdio},
     time::Duration,
 };
 
 use rigging_ssh::Target;
+use tempfile::{Builder, TempDir};
+use tokio::{net::TcpStream, time::sleep};
 
 pub struct Sshd {
     _child: ChildGuard,
-    pub directory: tempfile::TempDir,
+    pub directory: TempDir,
     pub target: Target,
 }
 
 impl Sshd {
     pub async fn start() -> Self {
-        let directory = tempfile::Builder::new()
-            .prefix("tssh-")
-            .permissions(std::fs::Permissions::from_mode(0o700))
-            .tempdir()
-            .expect("fixture directory");
+        let directory = Builder::new().prefix("tssh-").permissions(Permissions::from_mode(0o700)).tempdir().expect("fixture directory");
         let root = directory.path();
         for key in ["host", "client"] {
             assert!(
@@ -31,7 +32,7 @@ impl Sshd {
                     .success()
             );
         }
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("loopback port");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("loopback port");
         let port = listener.local_addr().expect("listen address").port();
         drop(listener);
         let user = String::from_utf8(Command::new("id").arg("-un").output().expect("fixture username").stdout).expect("username UTF8");
@@ -41,21 +42,21 @@ impl Sshd {
             root.display(),
             root.display()
         );
-        std::fs::write(root.join("config"), config).expect("sshd config");
-        let host_key = std::fs::read_to_string(root.join("host.pub")).expect("host public key").trim().to_owned();
-        let binary = std::env::var_os("TENDER_TEST_SSHD").map(PathBuf::from).unwrap_or_else(|| "/usr/sbin/sshd".into());
+        fs::write(root.join("config"), config).expect("sshd config");
+        let host_key = fs::read_to_string(root.join("host.pub")).expect("host public key").trim().to_owned();
+        let binary = env::var_os("TENDER_TEST_SSHD").map(PathBuf::from).unwrap_or_else(|| "/usr/sbin/sshd".into());
         let mut child = ChildGuard(
             Command::new(binary)
                 .args(["-D", "-e", "-f"])
                 .arg(root.join("config"))
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
                 .spawn()
                 .expect("local sshd (set TENDER_TEST_SSHD if needed)"),
         );
         for _ in 0..100 {
             assert!(child.0.try_wait().expect("sshd status").is_none(), "sshd fixture exited");
-            if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+            if TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
                 return Self {
                     target: Target::Pinned {
                         host: "127.0.0.1".into(),
@@ -68,7 +69,7 @@ impl Sshd {
                     _child: child,
                 };
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            sleep(Duration::from_millis(20)).await;
         }
         panic!("sshd fixture startup deadline")
     }
