@@ -231,7 +231,7 @@ enum Endpoint {
 struct Bound {
     path: PathBuf,
     carrier: Option<Carrier>,
-    /// Since when no copy has been more than withdrawn.
+    /// Since when every copy has been withdrawn or gone.
     ending: Option<Instant>,
     entry: BindingEntry,
     endpoint: Option<Endpoint>,
@@ -260,7 +260,11 @@ impl Binder {
                         self.apply(event);
                     }
                 }
-                _ = tick.tick() => {}
+                _ = tick.tick() => {
+                    if !self.bound.values().any(|bound| bound.ending.is_some()) {
+                        continue;
+                    }
+                }
             }
             self.rebind();
         }

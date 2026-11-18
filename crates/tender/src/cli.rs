@@ -274,13 +274,22 @@ async fn trust(control: &Control, json: bool, trust: Trust) -> Result<(), String
                 quote(&own.peer_socket.to_string_lossy()),
                 quote(&return_destination.unwrap_or_else(hostname)),
             );
-            remotely(&session, &destination, &accept).await?;
+            // This side first, so a failure on either leaves neither changed:
+            // a far refusal undoes this side's new trust.
+            let members: Vec<TrustedMember> = control.get(api::TRUSTED).await?;
+            let known = members.iter().any(|member| member.fingerprint == fingerprint);
             let instance = TrustedInstance {
                 key: remote.key,
                 name: name.unwrap_or_else(|| destination.clone()),
-                route: Some(PeerRoute { ssh: Some(destination), socket: remote.peer_socket }),
+                route: Some(PeerRoute { ssh: Some(destination.clone()), socket: remote.peer_socket }),
             };
             let member: TrustedMember = control.post(api::TRUSTED, &instance).await?;
+            if let Err(error) = remotely(&session, &destination, &accept).await {
+                if !known {
+                    let _: Result<(), _> = control.post(api::UNTRUST, &Untrust { fingerprint }).await;
+                }
+                return Err(error);
+            }
             show(json, &member, || format!("paired with {} ({})", member.instance.name, member.fingerprint.0))
         }
     }
@@ -299,7 +308,11 @@ async fn remotely(session: &OpenSsh, destination: &str, command: &str) -> Result
 fn confirm(destination: &str, fingerprint: &Fingerprint, expected: Option<&str>) -> Result<(), String> {
     eprintln!("{destination} is instance {}", fingerprint.0);
     if let Some(expected) = expected {
-        return if expected == fingerprint.0 { Ok(()) } else { Err(format!("{destination} is not instance {expected}")) };
+        return if expected.eq_ignore_ascii_case(&fingerprint.0) {
+            Ok(())
+        } else {
+            Err(format!("{destination} is not instance {expected}"))
+        };
     }
     if !stdin().is_terminal() {
         return Err("nobody to confirm the fingerprint: pass --expect-fingerprint".into());

@@ -15,6 +15,8 @@ use std::{
     path::Path,
     time::Duration,
 };
+#[cfg(target_os = "linux")]
+use std::{fs::Permissions, os::unix::fs::PermissionsExt};
 
 use node::{Node, eventually};
 #[cfg(target_os = "linux")]
@@ -217,9 +219,18 @@ async fn pairing_over_ssh_binds_through_a_forward() {
     assert!(String::from_utf8_lossy(&unconfirmed.stderr).contains(&far.instance.fingerprint.0), "the fingerprint is shown");
     let wrong = near.run(&[&pair[..], &["--expect-fingerprint", &near.instance.fingerprint.0]].concat()).await;
     assert!(!wrong.status.success(), "a different instance answered");
+    // A far side that refuses to trust this one leaves this one trusting
+    // nothing either.
+    let refusing = near.root.path().join("refusing-tender");
+    fs::write(&refusing, format!("#!/bin/sh\ncase \"$*\" in *accept*) echo refused >&2; exit 1;; esac\nexec {remote} \"$@\"\n"))
+        .expect("refusing tender");
+    fs::set_permissions(&refusing, Permissions::from_mode(0o700)).expect("executable");
+    let expect = ["--expect-fingerprint", &far.instance.fingerprint.0];
+    let refused = near.run(&[&pair[..pair.len() - 1], &[refusing.to_str().expect("path")], &expect[..]].concat()).await;
+    assert!(!refused.status.success(), "the far side refused");
     for node in [&far, &near] {
         let members: Vec<api::TrustedMember> = node.control.get(api::TRUSTED).await.expect("group");
-        assert!(members.is_empty(), "nothing trusted unconfirmed");
+        assert!(members.is_empty(), "nothing trusted unconfirmed or refused");
     }
     near.cli(&[&pair[..], &["--expect-fingerprint", &far.instance.fingerprint.0]].concat()).await;
     let far_members = far.cli(&["--json", "trust", "list"]).await;

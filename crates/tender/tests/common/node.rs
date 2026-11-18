@@ -64,14 +64,14 @@ impl Node {
         self.root.path().join("runtime")
     }
 
-    /// Run the `tender` CLI against this node.
-    /// The CLI against this node, which must succeed.
+    /// Run the `tender` CLI against this node; it must succeed.
     pub async fn cli(&self, args: &[&str]) -> Output {
         let output = self.run(args).await;
         assert!(output.status.success(), "tender {args:?}: {}", String::from_utf8_lossy(&output.stderr));
         output
     }
 
+    /// Run the `tender` CLI against this node, whatever its outcome.
     pub async fn run(&self, args: &[&str]) -> Output {
         Command::new(env!("CARGO_BIN_EXE_tender"))
             .args(args)
