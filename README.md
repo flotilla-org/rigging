@@ -11,10 +11,17 @@ jackstay, wheelhouse, binnacle and the rest. The rules and their reasons are in
   enforces this in CI.
 - **A crate moves here when a second project needs it.** Until then it stays in
   the project that owns it.
-- **Each consumer pins rigging once,** in its workspace `Cargo.toml`
-  `[workspace.dependencies]`, with a single `rev`. Its crates use
-  `workspace = true`. That pin is the only record of it: rigging keeps no list
-  of its consumers.
+- **Each consumer declares rigging once,** in its workspace `Cargo.toml`
+  `[workspace.dependencies]`, as `git = "https://github.com/flotilla-org/rigging",
+  branch = "main"`, written exactly so. Its crates use `workspace = true`, and
+  its `Cargo.lock` holds the commit. Never declare a `rev`: Cargo treats each rev
+  as a separate source, so a library and an application that both use rigging
+  would build two copies with incompatible types, and every rigging change would
+  need a pin-only PR in each library before the application could move. With one
+  shared declaration, the application's lockfile chooses the commit for the whole
+  build, and moving it is `cargo update -p <crate>` (or `--precise <commit>`) in
+  that one repository. The same applies to depending on drydock, binnacle and
+  the other project libraries. Rigging keeps no list of its consumers.
 - **HTTP serving uses axum** (hyper 1, tower 0.5) in every tokio project, and
   HTTP clients use reqwest.
 - **Crates take the `rigging-` prefix,** except named components with their own
