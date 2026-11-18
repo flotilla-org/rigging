@@ -243,6 +243,19 @@ async fn pairing_over_ssh_binds_through_a_forward() {
     assert!(round_trip(&path, b"after the outage").await);
 }
 
+// Accepting a key already trusted with a route keeps the route, so pairing
+// in the other direction does not stop this side following the peer.
+#[tokio::test]
+async fn accepting_a_member_keeps_its_route() {
+    let near = Node::start("").await;
+    let far = Node::start("").await;
+    near.trust(&far).await;
+    near.cli(&["trust", "accept", &far.instance.key.0, "--name", "far"]).await;
+    let members: Vec<api::TrustedMember> = near.control.get(api::TRUSTED).await.expect("group");
+    let route = members[0].instance.route.as_ref().map(|route| route.socket.as_path());
+    assert_eq!((members.len(), members[0].instance.name.as_str(), route), (1, "far", Some(far.instance.peer_socket.as_path())));
+}
+
 // Changing a member's route restarts its follower: a member trusted at a
 // wrong socket is unreachable until its route is corrected.
 #[tokio::test]

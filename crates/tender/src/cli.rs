@@ -214,7 +214,12 @@ async fn trust(control: &Control, json: bool, trust: Trust) -> Result<(), String
             Ok(())
         }
         Trust::Accept { key, name } => {
-            let _: TrustedMember = control.post(api::TRUSTED, &TrustedInstance { key: PublicKey(key), name, route: None }).await?;
+            let key = PublicKey(key);
+            // A member this side already reaches keeps its route; only a new
+            // member is trusted without one.
+            let members: Vec<TrustedMember> = control.get(api::TRUSTED).await?;
+            let route = members.into_iter().find(|member| member.instance.key == key).and_then(|member| member.instance.route);
+            let _: TrustedMember = control.post(api::TRUSTED, &TrustedInstance { key, name, route }).await?;
             let instance: Instance = control.get(api::IDENTITY).await?;
             println!("{}", serde_json::to_string(&instance).map_err(|error| error.to_string())?);
             Ok(())

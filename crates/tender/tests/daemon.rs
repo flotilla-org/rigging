@@ -11,6 +11,7 @@ use tender::{
     Availability, Error, Fingerprint, Label, PublicationId, PublishRequest, Session, Tender,
     api::{self, Instance, PublicationEntry, PublishEndpoint, TrustedInstance, TrustedMember, Untrust},
     daemon::{Daemon, Paths},
+    paths::binding_path,
     ssh::{Identity, SshTender},
 };
 use tokio::{
@@ -134,8 +135,15 @@ async fn published_endpoint_follows_its_service() {
     let published: tender::Publication = control.post(api::PUBLISH, &publish_request(&id, &service)).await.expect("publish");
     let group = BTreeSet::from([peer.fingerprint(), host.clone()]);
     assert_eq!((published.availability, published.audience.clone()), (Availability::Available, group));
-    let refused: Result<tender::Publication, _> = control.post(api::PUBLISH, &publish_request(&id, &service)).await;
+    let refused: Result<tender::Publication, _> = control.post(api::PUBLISH, &publish_request(&id, &root.path().join("other"))).await;
     assert_eq!(refused.expect_err("live incumbent").1.code, "live_publisher");
+    // A later publication makes the Binder reconcile; the refused socket
+    // must not have reached it.
+    let unrelated = PublicationId::new("tender/test", "unrelated");
+    let _: tender::Publication = control.post(api::PUBLISH, &publish_request(&unrelated, &service)).await.expect("publish");
+    let binding = |id| std::fs::read_link(binding_path(&paths.runtime, id)).ok();
+    eventually("the later publication is bound", || async { binding(&unrelated) == Some(service.clone()) }).await;
+    assert_eq!(binding(&id), Some(service.clone()), "the incumbent's Binding still reaches its socket");
     let entries: Vec<PublicationEntry> = control.get(api::PUBLICATIONS).await.expect("publications");
     assert_eq!(entries[0].endpoint.as_deref(), Some(service.as_path()));
 

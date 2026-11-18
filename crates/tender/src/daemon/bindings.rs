@@ -35,6 +35,8 @@ pub(super) enum Event {
     Local(Vec<Publication>),
     Trust(Vec<TrustedInstance>),
     Peer(Fingerprint, PeerUpdate),
+    /// An own endpoint was recorded after its publication was announced.
+    Endpoints,
 }
 
 pub(super) enum PeerUpdate {
@@ -67,8 +69,9 @@ impl Drop for Bindings {
     }
 }
 
-/// Own local sockets by identity, which a Binding links to directly.
-pub(super) type Endpoints = Arc<Mutex<BTreeMap<PublicationId, PathBuf>>>;
+/// Own local sockets by identity, with the generation each was published at.
+/// A Binding links directly to the socket of the generation it carries.
+pub(super) type Endpoints = Arc<Mutex<BTreeMap<PublicationId, (u64, PathBuf)>>>;
 
 impl Bindings {
     pub(super) fn start(
@@ -121,6 +124,10 @@ impl Bindings {
 
     pub(super) fn trust(&self, members: Vec<TrustedInstance>) {
         let _ = self.events.send(Event::Trust(members));
+    }
+
+    pub(super) fn endpoints_changed(&self) {
+        let _ = self.events.send(Event::Endpoints);
     }
 
     pub(super) fn bindings(&self) -> Vec<BindingEntry> {
@@ -240,6 +247,7 @@ impl Binder {
         match event {
             Event::Local(snapshot) => self.local = snapshot,
             Event::Trust(members) => self.trust(members),
+            Event::Endpoints => {}
             Event::Peer(fingerprint, update) => {
                 let Some(peer) = self.peers.get_mut(&fingerprint) else { return };
                 match update {
@@ -347,7 +355,9 @@ impl Binder {
                 let own = candidate.carrier == Carrier::Local
                     && candidate.publication.publisher == self.own
                     && candidate.publication.availability != Availability::Withdrawn;
-                let link = own.then(|| self.endpoints.lock().expect("endpoints lock").get(id).cloned()).flatten();
+                let generation = candidate.publication.generation;
+                let endpoints = self.endpoints.lock().expect("endpoints lock");
+                let link = endpoints.get(id).filter(|(published, _)| own && *published == generation).map(|(_, path)| path.clone());
                 (state, target, link, Some(candidate.carrier.clone()))
             }
         };

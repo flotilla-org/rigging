@@ -60,8 +60,9 @@ pub fn bindings_dir(runtime: &Path) -> PathBuf {
 }
 
 /// A Binding's Local Endpoint: one file in [`bindings_dir`], named
-/// `<scope>,<name>` with every byte outside `[A-Za-z0-9._-]` written as `%XX`,
-/// so distinct identities never share a name. When that path would exceed
+/// `<scope>,<name>` with every byte outside `[a-z0-9._-]` written as `%XX`, so
+/// distinct identities never share a name, even on a filesystem that folds
+/// case. When that path would exceed
 /// [`MAX_SOCKET_PATH`], the name is `~` and the first 32 hex digits of the
 /// SHA-256 of the scope's length (8 bytes, big-endian), the scope and the name.
 /// A runtime directory longer than 66 bytes cannot hold every Binding.
@@ -89,7 +90,9 @@ pub fn binding_path(runtime: &Path, id: &PublicationId) -> PathBuf {
 
 fn encode(text: &str, out: &mut String) {
     for byte in text.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-') {
+        // Uppercase is escaped: scopes and names are case-sensitive, and some
+        // filesystems are not.
+        if byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'_' | b'-') {
             out.push(byte as char);
         } else {
             let _ = write!(out, "%{byte:02X}");
@@ -145,6 +148,24 @@ mod tests {
         }
     }
 
+    // Identities that differ only in case keep distinct Binding paths where
+    // the filesystem folds case.
+    #[hegel::test]
+    fn binding_paths_differ_under_case_folding(tc: hegel::TestCase) {
+        let runtime = Path::new("/run/user/1000/tender");
+        let scope = tc.draw(gs::text().max_size(40));
+        let name = tc.draw(gs::text().max_size(40));
+        let toggle = |text: &str| -> String {
+            text.chars().map(|c| if c.is_ascii_alphabetic() && tc.draw(gs::booleans()) { (c as u8 ^ 0x20) as char } else { c }).collect()
+        };
+        let first = PublicationId::new(scope.clone(), name.clone());
+        let second = PublicationId::new(toggle(&scope), toggle(&name));
+        let folded = |id| binding_path(runtime, id).to_string_lossy().to_lowercase();
+        if first != second {
+            assert_ne!(folded(&first), folded(&second));
+        }
+    }
+
     // A short identity reads as itself; one past the limit is hashed.
     #[test]
     fn readable_until_the_limit() {
@@ -157,6 +178,8 @@ mod tests {
         // `~` is escaped, so a readable name never looks like a hashed one.
         let tilde = binding_path(runtime, &PublicationId::new("~", "~"));
         assert_eq!(tilde.file_name().unwrap(), "%7E,%7E");
+        let upper = binding_path(runtime, &PublicationId::new("scope", "Build"));
+        assert_eq!(upper.file_name().unwrap(), "scope,%42uild");
     }
 
     #[test]

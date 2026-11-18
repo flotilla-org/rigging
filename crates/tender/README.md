@@ -108,7 +108,7 @@ asks for a Binding, and binding never starts anything on either side.
 
 - **Where.** A Binding's Local Endpoint is
   `tender_types::paths::binding_path(runtime, id)`: `runtime/b/<scope>,<name>`
-  with every byte outside `[A-Za-z0-9._-]` written `%XX`, or `~` and a hash
+  with every byte outside `[a-z0-9._-]` written `%XX`, or `~` and a hash
   when that would pass the 103-byte socket-path limit. Clients compute it;
   `tender path` prints it and `GET /v1/bindings` lists it.
 - **Own publications.** When this instance publishes the identity from a

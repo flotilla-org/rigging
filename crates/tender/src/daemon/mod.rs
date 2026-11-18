@@ -281,9 +281,6 @@ impl Inner {
     }
 
     async fn publish_locked(&self, state: &mut State, request: PublishEndpoint) -> Result<Lease, Error> {
-        // Known before the authority announces the publication, so its own
-        // Binding links straight to the socket.
-        self.endpoints.lock().expect("endpoints lock").insert(request.id.clone(), request.endpoint.clone());
         let published = self
             .policy()
             .publish(
@@ -297,6 +294,10 @@ impl Inner {
             )
             .await?;
         let lease = published.lease;
+        // Only an accepted publication's socket reaches the Binder, so a
+        // refused one never redirects the incumbent's Binding.
+        self.endpoints.lock().expect("endpoints lock").insert(request.id.clone(), (lease.generation, request.endpoint.clone()));
+        self.bindings.endpoints_changed();
         let pump =
             tokio::spawn(pump(published.incoming, request.endpoint.clone(), self.policy().clone(), self.session.clone(), lease.clone()));
         // Replacing an earlier Local drops it, which stops its pump; its

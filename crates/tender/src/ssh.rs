@@ -37,6 +37,7 @@ use crate::{
     Binding, BindingState, ByteStream, Dial, Error, Fingerprint, Lease, PublicKey, Publication, PublicationId, PublishRequest, Published,
     Router, Session, Tender, UnavailableReason, Watch,
     memory::MemoryTender,
+    paths::MAX_SOCKET_PATH,
     runtime::{Clock, FileStore},
 };
 
@@ -45,9 +46,6 @@ const MAX_CONTROL: usize = 64 * 1024;
 const MAX_CHANNELS: usize = 256;
 /// Bounds a relay chain, so a routing loop between relays fails promptly.
 const MAX_RELAY_HOPS: u8 = 8;
-/// The longest Unix socket path every platform accepts: `sun_path` holds 104
-/// bytes with its terminating NUL on macOS.
-const MAX_SOCKET_PATH: usize = 103;
 /// A Binding listener's name, its number in hex.
 const MAX_BINDING_NAME: usize = 16;
 
