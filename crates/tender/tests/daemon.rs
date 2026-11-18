@@ -3,25 +3,37 @@
 #[path = "common/control.rs"]
 mod control;
 
-use std::{collections::BTreeSet, fs, os::unix::fs::PermissionsExt, path::Path, time::Duration};
+use std::{
+    collections::BTreeSet,
+    fs::{self, Permissions},
+    os::unix::fs::PermissionsExt,
+    path::Path,
+    time::Duration,
+};
 
 use control::{Control, Format};
+use http::StatusCode;
+use libc::{SIGTERM, kill};
 use reqwest::Method;
+use rigging_process::EnvVars;
+use tempfile::{Builder, TempDir};
 use tender::{
-    Availability, Error, Fingerprint, Label, PublicationId, PublishRequest, Scope, Session, Tender,
+    Availability, Error, Fingerprint, Label, PublicKey, Publication, PublicationId, PublishRequest, Scope, Session, Tender,
     api::{self, Instance, PublicationList, PublishEndpoint, TrustedInstance, TrustedMember, Untrust},
     daemon::{Daemon, Paths},
     ssh::{Identity, SshTender},
 };
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, copy, split},
     net::{UnixListener, UnixStream},
+    process::Command,
+    spawn,
     task::JoinHandle,
     time::{sleep, timeout},
 };
 
-fn root() -> tempfile::TempDir {
-    tempfile::Builder::new().prefix("td-").permissions(std::fs::Permissions::from_mode(0o700)).tempdir().expect("root")
+fn root() -> TempDir {
+    Builder::new().prefix("td-").permissions(Permissions::from_mode(0o700)).tempdir().expect("root")
 }
 
 fn paths(root: &Path) -> Paths {
@@ -31,18 +43,18 @@ fn paths(root: &Path) -> Paths {
 /// An ordinary Unix-socket service that echoes each connection's bytes.
 fn echo(path: &Path) -> JoinHandle<()> {
     let listener = UnixListener::bind(path).expect("echo listener");
-    tokio::spawn(async move {
+    spawn(async move {
         loop {
             let Ok((mut stream, _)) = listener.accept().await else { break };
-            tokio::spawn(async move {
+            spawn(async move {
                 let (mut reader, mut writer) = stream.split();
-                let _ = tokio::io::copy(&mut reader, &mut writer).await;
+                let _ = copy(&mut reader, &mut writer).await;
             });
         }
     })
 }
 
-async fn echoes(mut stream: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin) {
+async fn echoes(mut stream: impl AsyncRead + AsyncWrite + Unpin) {
     stream.write_all(b"ping").await.expect("write");
     let mut reply = [0; 4];
     timeout(Duration::from_secs(5), stream.read_exact(&mut reply)).await.expect("echo deadline").expect("echo");
@@ -60,7 +72,7 @@ fn trusted(identity: &Identity) -> TrustedInstance {
 async fn eventually<F: Future<Output = bool>>(what: &str, mut check: impl FnMut() -> F) {
     timeout(Duration::from_secs(10), async {
         while !check().await {
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            sleep(Duration::from_millis(50)).await;
         }
     })
     .await
@@ -83,7 +95,7 @@ async fn restart(root: &Path) -> Daemon {
             match Daemon::start(paths(root)).await {
                 Ok(daemon) => return daemon,
                 Err(error) if error.to_string().contains("would block") || error.to_string().contains("WouldBlock") => {
-                    tokio::time::sleep(Duration::from_millis(20)).await
+                    sleep(Duration::from_millis(20)).await
                 }
                 Err(error) => panic!("restart: {error}"),
             }
@@ -131,9 +143,9 @@ async fn published_endpoint_follows_its_service() {
     let service = root.path().join("echo");
     let echo_task = echo(&service);
     let id = PublicationId::new("vessel/test", "echo");
-    let published: tender::Publication = control.post(api::PUBLISH, &publish_request(&id, &service)).await.expect("publish");
+    let published: Publication = control.post(api::PUBLISH, &publish_request(&id, &service)).await.expect("publish");
     assert_eq!((published.availability, published.audience.clone()), (Availability::Available, BTreeSet::from([peer.fingerprint()])));
-    let refused: Result<tender::Publication, _> = control.post(api::PUBLISH, &publish_request(&id, &service)).await;
+    let refused: Result<Publication, _> = control.post(api::PUBLISH, &publish_request(&id, &service)).await;
     assert_eq!(refused.expect_err("live incumbent").1.code, "live_publisher");
     let list: PublicationList = control.get(api::PUBLICATIONS).await.expect("publications");
     assert_eq!(list.publications[0].endpoint.as_deref(), Some(service.as_path()));
@@ -144,7 +156,7 @@ async fn published_endpoint_follows_its_service() {
 
     echo_task.abort();
     let _ = echo_task.await;
-    std::fs::remove_file(&service).expect("service gone");
+    fs::remove_file(&service).expect("service gone");
     eventually("dead endpoint becomes unavailable", || async {
         let _ = client.connect(&session, &id).await;
         state_of(&control, &id).await.map(|state| state.0) == Some(Availability::Unavailable)
@@ -160,7 +172,7 @@ async fn published_endpoint_follows_its_service() {
     assert_eq!(client.connect(&session, &id).await.err(), Some(Error::Withdrawn));
     let _: () = control.post(api::WITHDRAW, &id).await.expect("withdrawing again changes nothing");
     let unknown: Result<(), _> = control.post(api::WITHDRAW, &PublicationId::new("vessel/test", "never")).await;
-    assert_eq!(unknown.expect_err("never published").0, http::StatusCode::NOT_FOUND);
+    assert_eq!(unknown.expect_err("never published").0, StatusCode::NOT_FOUND);
 }
 
 // Only Trusted Group members reach the peer socket's publications; removing a
@@ -183,14 +195,14 @@ async fn trusted_group_admits_members_only() {
     assert_eq!(client.browse(&as_outsider).await, Err(Error::Denied));
     let _: () = control.post(api::UNTRUST, &Untrust { fingerprint: member.fingerprint() }).await.expect("untrust");
     assert_eq!(client.browse(&as_member).await, Err(Error::Denied));
-    let invalid = TrustedInstance { key: tender::PublicKey("not a key".into()), name: String::new(), route: None };
+    let invalid = TrustedInstance { key: PublicKey("not a key".into()), name: String::new(), route: None };
     let refused: Result<TrustedMember, _> = control.post(api::TRUSTED, &invalid).await;
     assert_eq!(refused.expect_err("invalid key").1.code, "invalid_key");
     let own = TrustedInstance { key: daemon.instance().key, name: String::new(), route: None };
     let refused: Result<TrustedMember, _> = control.post(api::TRUSTED, &own).await;
     assert_eq!(refused.expect_err("own key").1.code, "own_key");
     let missing: Result<(), _> = control.post(api::UNTRUST, &Untrust { fingerprint: Fingerprint("absent".into()) }).await;
-    assert_eq!(missing.expect_err("not a member").0, http::StatusCode::NOT_FOUND);
+    assert_eq!(missing.expect_err("not a member").0, StatusCode::NOT_FOUND);
 }
 
 // Configured publications are published at start, under the instance's host
@@ -204,8 +216,8 @@ async fn configuration_publishes_endpoints_and_grants_scopes() {
     let _echo = echo(&service);
     let helper = Identity::generate();
     let member = Identity::generate();
-    std::fs::create_dir_all(&paths.config).expect("config directory");
-    std::fs::write(
+    fs::create_dir_all(&paths.config).expect("config directory");
+    fs::write(
         paths.config_file(),
         format!(
             "[[publication]]\nname = \"echo\"\nlabel = \"echo\"\ndisplay = \"Hand-run echo\"\nendpoint = \"{}\"\n\n[[grant]]\ngrantee = \"{}\"\nscope = \"vessel/7\"\n",
@@ -214,8 +226,7 @@ async fn configuration_publishes_endpoints_and_grants_scopes() {
         ),
     )
     .expect("config");
-    std::fs::write(paths.trusted_file(), format!("[[instance]]\nkey = \"{}\"\nname = \"laptop\"\n", member.public_key().0))
-        .expect("trusted");
+    fs::write(paths.trusted_file(), format!("[[instance]]\nkey = \"{}\"\nname = \"laptop\"\n", member.public_key().0)).expect("trusted");
     let daemon = Daemon::start(paths.clone()).await.expect("daemon");
     let host = daemon.instance().fingerprint;
     let control = Control::new(&paths.control_socket());
@@ -238,9 +249,9 @@ async fn configuration_publishes_endpoints_and_grants_scopes() {
     let as_member = Session { caller: member.fingerprint(), pinned_host: host, via: None };
     let stream = client.connect(&as_member, &published.lease.id).await.expect("member connects");
     let mut service = timeout(Duration::from_secs(5), published.incoming.recv()).await.expect("accept deadline").expect("accepted");
-    let pump = tokio::spawn(async move {
-        let (mut reader, mut writer) = tokio::io::split(&mut service);
-        let _ = tokio::io::copy(&mut reader, &mut writer).await;
+    let pump = spawn(async move {
+        let (mut reader, mut writer) = split(&mut service);
+        let _ = copy(&mut reader, &mut writer).await;
     });
     echoes(stream).await;
     pump.abort();
@@ -249,7 +260,7 @@ async fn configuration_publishes_endpoints_and_grants_scopes() {
     // on the helper's behalf, however often it is asked.
     let taken = PublicationId::new("vessel/7", "taken");
     let dead = publish_request(&taken, &root.path().join("absent"));
-    let own: tender::Publication = control.post(api::PUBLISH, &dead).await.expect("publish a dead endpoint");
+    let own: Publication = control.post(api::PUBLISH, &dead).await.expect("publish a dead endpoint");
     assert_eq!(own.availability, Availability::Unavailable);
     let request = PublishRequest { id: taken.clone(), ..request("vessel/7") };
     let _helper_lease = client.publish(&as_helper, request).await.expect("helper takes over");
@@ -271,11 +282,11 @@ async fn unsaved_trust_change_is_rolled_back() {
     let daemon = Daemon::start(paths.clone()).await.expect("daemon");
     let control = Control::new(&paths.control_socket());
     let member = Identity::generate();
-    std::fs::set_permissions(&paths.config, std::fs::Permissions::from_mode(0o500)).expect("read-only configuration");
+    fs::set_permissions(&paths.config, Permissions::from_mode(0o500)).expect("read-only configuration");
     let refused: Result<TrustedMember, _> = control.post(api::TRUSTED, &trusted(&member)).await;
-    std::fs::set_permissions(&paths.config, std::fs::Permissions::from_mode(0o700)).expect("writable again");
+    fs::set_permissions(&paths.config, Permissions::from_mode(0o700)).expect("writable again");
     let (status, body) = refused.expect_err("save fails");
-    assert_eq!((status, body.code.as_str()), (http::StatusCode::SERVICE_UNAVAILABLE, "storage"));
+    assert_eq!((status, body.code.as_str()), (StatusCode::SERVICE_UNAVAILABLE, "storage"));
     let members: Vec<TrustedMember> = control.get(api::TRUSTED).await.expect("trusted group");
     assert!(members.is_empty());
     assert!(!paths.trusted_file().exists());
@@ -288,7 +299,7 @@ async fn unsaved_trust_change_is_rolled_back() {
 #[test]
 fn relative_root_is_refused() {
     struct Env(&'static str);
-    impl rigging_process::EnvVars for Env {
+    impl EnvVars for Env {
         fn get(&self, key: &str) -> Option<String> {
             match key {
                 "TENDER_ROOT" => Some(self.0.into()),
@@ -306,7 +317,7 @@ fn relative_root_is_refused() {
 #[tokio::test]
 async fn binary_serves_until_terminated() {
     let root = root();
-    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_tender"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_tender"))
         .arg("serve")
         .env("TENDER_ROOT", root.path())
         .env_remove("XDG_RUNTIME_DIR")
@@ -318,7 +329,7 @@ async fn binary_serves_until_terminated() {
     let instance: Instance = Control::new(&socket).get(api::IDENTITY).await.expect("identity");
     assert_eq!(instance.peer_socket, root.path().join("runtime/peer"));
     // SAFETY: the child is still running, so its pid has not been reused.
-    unsafe { libc::kill(child.id().expect("pid") as i32, libc::SIGTERM) };
+    unsafe { kill(child.id().expect("pid") as i32, SIGTERM) };
     let status = timeout(Duration::from_secs(10), child.wait()).await.expect("exit deadline").expect("exit");
     assert!(status.success(), "{status}");
     assert!(!socket.exists(), "the control socket is removed on exit");
@@ -341,7 +352,7 @@ async fn restart_resumes_configuration_and_withdraws_the_rest() {
     let (kept, dropped) = (PublicationId::new(scope.clone(), "kept"), PublicationId::new(scope, "dropped"));
     let control = Control::new(&paths.control_socket());
     let api = PublicationId::new("vessel/1", "api");
-    let _: tender::Publication = control.post(api::PUBLISH, &publish_request(&api, &service)).await.expect("publish");
+    let _: Publication = control.post(api::PUBLISH, &publish_request(&api, &service)).await.expect("publish");
     let before: PublicationList = control.get(api::PUBLICATIONS).await.expect("publications");
     daemon.shutdown().await;
 
@@ -363,9 +374,9 @@ async fn relative_endpoint_is_refused() {
     let _daemon = Daemon::start(paths.clone()).await.expect("daemon");
     let control = Control::new(&paths.control_socket());
     let request = publish_request(&PublicationId::new("vessel/1", "echo"), Path::new("echo.sock"));
-    let refused: Result<tender::Publication, _> = control.post(api::PUBLISH, &request).await;
+    let refused: Result<Publication, _> = control.post(api::PUBLISH, &request).await;
     let (status, error) = refused.expect_err("relative endpoint");
-    assert_eq!((status, error.code.as_str()), (http::StatusCode::BAD_REQUEST, "relative_endpoint"));
+    assert_eq!((status, error.code.as_str()), (StatusCode::BAD_REQUEST, "relative_endpoint"));
 }
 
 // A publication whose endpoint does not answer is never announced as
@@ -383,9 +394,9 @@ async fn dead_endpoint_is_never_announced_available() {
     let mut watch = client.watch(&Session { caller: peer.fingerprint(), pinned_host: host, via: None }).await.expect("watch");
     let service = root.path().join("late");
     let id = PublicationId::new("vessel/1", "late");
-    let published: tender::Publication = control.post(api::PUBLISH, &publish_request(&id, &service)).await.expect("publish");
+    let published: Publication = control.post(api::PUBLISH, &publish_request(&id, &service)).await.expect("publish");
     assert_eq!(published.availability, Availability::Unavailable);
-    let announced = |snapshot: &[tender::Publication]| {
+    let announced = |snapshot: &[Publication]| {
         snapshot.iter().any(|publication| publication.id == id && publication.availability == Availability::Available)
     };
     while let Ok(Some(snapshot)) = timeout(Duration::from_millis(300), watch.recv()).await {
@@ -411,11 +422,11 @@ async fn brief_endpoint_outage_keeps_the_publication() {
     let service = root.path().join("echo");
     let first = echo(&service);
     let id = PublicationId::new("vessel/1", "echo");
-    let published: tender::Publication = control.post(api::PUBLISH, &publish_request(&id, &service)).await.expect("publish");
+    let published: Publication = control.post(api::PUBLISH, &publish_request(&id, &service)).await.expect("publish");
     first.abort();
     let _ = first.await;
     fs::remove_file(&service).expect("service away");
-    let returning = tokio::spawn({
+    let returning = spawn({
         let service = service.clone();
         async move {
             sleep(Duration::from_millis(100)).await;

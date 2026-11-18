@@ -3,13 +3,15 @@ mod control;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    io,
+    fs::{self, DirBuilder, Permissions},
+    io, mem,
     os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
 
+use libc::geteuid;
 use rand_core::{OsRng, RngCore};
 use rigging_http_serve::{Caller, UnixServer};
 use rigging_paths::{PathPolicy, runtime_dir};
@@ -17,13 +19,21 @@ use rigging_process::EnvVars;
 use tokio::{
     io::copy_bidirectional,
     net::UnixStream,
-    signal::unix::{SignalKind, signal},
+    signal::{
+        ctrl_c,
+        unix::{SignalKind, signal},
+    },
+    spawn,
     sync::{Mutex, mpsc, oneshot},
     task::JoinHandle,
-    time::{sleep, timeout},
+    time::{interval, sleep, timeout},
 };
 
 pub use self::config::{Config, ConfiguredGrant, ConfiguredPublication, TrustedFile};
+#[cfg(target_os = "linux")]
+use crate::runtime::BootClock;
+#[cfg(not(target_os = "linux"))]
+use crate::runtime::ProcessClock;
 use crate::{
     Availability, ByteStream, Error, Fingerprint, Grant, Label, Lease, Publication, PublicationId, PublishRequest, Scope, Session, Tender,
     api::{Instance, PublicationEntry, PublicationList, PublishEndpoint, TrustedInstance, TrustedMember},
@@ -54,7 +64,7 @@ impl Paths {
     pub fn from_env(env: &dyn EnvVars) -> Result<Self, String> {
         let policy = PathPolicy::from_env("tender", env)?;
         // SAFETY: geteuid has no preconditions.
-        let runtime = runtime_dir("tender", unsafe { libc::geteuid() }, env)?;
+        let runtime = runtime_dir("tender", unsafe { geteuid() }, env)?;
         Ok(Self { config: policy.config_dir, state: policy.state_dir, runtime })
     }
 
@@ -80,14 +90,14 @@ impl Paths {
 
 /// Create a directory owned by this user with mode 0700, or check an existing one.
 fn private_directory(path: &Path) -> io::Result<()> {
-    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(path)?;
-    let metadata = std::fs::symlink_metadata(path)?;
+    DirBuilder::new().recursive(true).mode(0o700).create(path)?;
+    let metadata = fs::symlink_metadata(path)?;
     // SAFETY: geteuid has no preconditions.
-    if !metadata.is_dir() || metadata.uid() != unsafe { libc::geteuid() } {
+    if !metadata.is_dir() || metadata.uid() != unsafe { geteuid() } {
         return Err(io::Error::other(format!("{} must be a directory owned by this user", path.display())));
     }
     if metadata.mode() & 0o077 != 0 {
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+        fs::set_permissions(path, Permissions::from_mode(0o700))?;
     }
     Ok(())
 }
@@ -174,12 +184,12 @@ impl Daemon {
         }
         let (stop_control, stopped) = oneshot::channel();
         let router = control::router(inner.clone());
-        let control = tokio::spawn(control.serve(router, Caller::<()>::Unix, async {
+        let control = spawn(control.serve(router, Caller::<()>::Unix, async {
             let _ = stopped.await;
         }));
         let maintained = Arc::downgrade(&inner);
-        let maintenance = tokio::spawn(async move {
-            let mut tick = tokio::time::interval(MAINTENANCE);
+        let maintenance = spawn(async move {
+            let mut tick = interval(MAINTENANCE);
             loop {
                 tick.tick().await;
                 let Some(inner) = maintained.upgrade() else { break };
@@ -214,12 +224,12 @@ impl Drop for Daemon {
 
 #[cfg(target_os = "linux")]
 fn clock() -> io::Result<Arc<dyn Clock>> {
-    Ok(Arc::new(crate::runtime::BootClock::new()?))
+    Ok(Arc::new(BootClock::new()?))
 }
 
 #[cfg(not(target_os = "linux"))]
 fn clock() -> io::Result<Arc<dyn Clock>> {
-    Ok(Arc::new(crate::runtime::ProcessClock::default()))
+    Ok(Arc::new(ProcessClock::default()))
 }
 
 impl Inner {
@@ -290,7 +300,7 @@ impl Inner {
             let published = self.policy().publish(&self.session, claim).await?;
             let lease = published.lease;
             let endpoint = request.endpoint.clone();
-            (lease.clone(), Some(tokio::spawn(pump(published.incoming, endpoint, self.policy().clone(), self.session.clone(), lease))))
+            (lease.clone(), Some(spawn(pump(published.incoming, endpoint, self.policy().clone(), self.session.clone(), lease))))
         } else {
             (self.policy().reserve(&self.session, claim)?, None)
         };
@@ -392,7 +402,7 @@ impl Inner {
     /// Apply, then persist; a failure at either step restores the previous
     /// group in the authority, and the file is only ever written whole.
     fn change_trust(&self, state: &mut State, trusted: Vec<TrustedInstance>) -> Result<(), TrustError> {
-        let previous = std::mem::replace(&mut state.trusted, trusted);
+        let previous = mem::replace(&mut state.trusted, trusted);
         let applied = self
             .apply_trust(state)
             .map_err(TrustError::Tender)
@@ -471,7 +481,7 @@ async fn pump(mut incoming: mpsc::UnboundedReceiver<ByteStream>, endpoint: PathB
         let policy = policy.clone();
         let session = session.clone();
         let lease = lease.clone();
-        tokio::spawn(async move {
+        spawn(async move {
             match open(&endpoint).await {
                 Some(mut service) => {
                     let _ = copy_bidirectional(&mut stream, &mut service).await;
@@ -502,7 +512,7 @@ pub async fn serve(paths: Paths) -> io::Result<()> {
     tracing::info!(fingerprint = %instance.fingerprint.0, peer = %instance.peer_socket.display(), "tender serving");
     let mut terminate = signal(SignalKind::terminate())?;
     tokio::select! {
-        _ = tokio::signal::ctrl_c() => {}
+        _ = ctrl_c() => {}
         _ = terminate.recv() => {}
     }
     daemon.shutdown().await;
@@ -511,6 +521,7 @@ pub async fn serve(paths: Paths) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use tempfile::Builder;
     use tokio::net::UnixListener;
 
     use super::*;
@@ -520,7 +531,7 @@ mod tests {
     // it: maintenance compares against the authority as of holding the lock.
     #[tokio::test]
     async fn maintenance_keeps_a_concurrent_publish() {
-        let root = tempfile::Builder::new().prefix("td-").permissions(std::fs::Permissions::from_mode(0o700)).tempdir().expect("root");
+        let root = Builder::new().prefix("td-").permissions(Permissions::from_mode(0o700)).tempdir().expect("root");
         let paths = Paths { config: root.path().join("config"), state: root.path().join("state"), runtime: root.path().join("runtime") };
         let daemon = Daemon::start(paths).await.expect("start");
         let endpoint = root.path().join("service");
@@ -529,11 +540,11 @@ mod tests {
         let request = PublishEndpoint { id: id.clone(), label: Label("echo".into()), display: String::new(), endpoint, audience: None };
         let inner = daemon.inner.clone();
         let mut state = inner.state.lock().await;
-        let maintaining = tokio::spawn({
+        let maintaining = spawn({
             let inner = inner.clone();
             async move { inner.maintain().await }
         });
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        sleep(Duration::from_millis(50)).await;
         inner.publish_locked(&mut state, request, true).await.expect("publish");
         drop(state);
         maintaining.await.expect("maintain");

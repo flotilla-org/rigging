@@ -1,4 +1,11 @@
+use std::{io, process::ExitCode};
+
 use clap::{Parser, Subcommand};
+#[cfg(unix)]
+use rigging_process::ProcessEnvVars;
+#[cfg(unix)]
+use tender::daemon::{self, Paths};
+use tracing_subscriber::fmt;
 
 #[derive(Parser)]
 #[command(name = "tender", about = "Publish this account's local endpoints and keep Bindings to others' publications")]
@@ -14,24 +21,24 @@ enum Command {
 }
 
 #[tokio::main]
-async fn main() -> std::process::ExitCode {
-    tracing_subscriber::fmt().with_writer(std::io::stderr).init();
+async fn main() -> ExitCode {
+    fmt().with_writer(io::stderr).init();
     let result = match Cli::parse().command {
         Command::Serve => serve().await,
     };
     match result {
-        Ok(()) => std::process::ExitCode::SUCCESS,
+        Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("tender: {error}");
-            std::process::ExitCode::FAILURE
+            ExitCode::FAILURE
         }
     }
 }
 
 #[cfg(unix)]
 async fn serve() -> Result<(), String> {
-    let paths = tender::daemon::Paths::from_env(&rigging_process::ProcessEnvVars)?;
-    tender::daemon::serve(paths).await.map_err(|error| error.to_string())
+    let paths = Paths::from_env(&ProcessEnvVars)?;
+    daemon::serve(paths).await.map_err(|error| error.to_string())
 }
 
 #[cfg(not(unix))]
