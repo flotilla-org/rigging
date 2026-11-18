@@ -39,8 +39,11 @@ impl Scope {
     }
 
     /// The instance whose scope this is, for a `tender/<fingerprint>` scope.
+    /// Any other `tender/…` scope names no instance, and nobody publishes
+    /// under it without a grant.
     pub fn owner(&self) -> Option<Fingerprint> {
-        self.0.strip_prefix("tender/").map(|fingerprint| Fingerprint(fingerprint.to_owned()))
+        let fingerprint = self.0.strip_prefix("tender/")?;
+        (!fingerprint.is_empty() && !fingerprint.contains('/')).then(|| Fingerprint(fingerprint.to_owned()))
     }
 
     /// A `vessel/…` scope, which whichever host holds the vessel publishes under.
@@ -248,4 +251,20 @@ pub trait Tender: Send + Sync {
     }
     async fn disconnect(&self, session: &Session, lease: &Lease) -> Result<(), Error>;
     async fn withdraw(&self, session: &Session, lease: &Lease) -> Result<(), Error>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Only `tender/<fingerprint>` names an instance.
+    #[test]
+    fn instance_scopes_name_one_instance() {
+        let fingerprint = Fingerprint("ab12".into());
+        assert_eq!(Scope::instance(&fingerprint).owner(), Some(fingerprint));
+        for other in ["tender/", "tender/a/b", "vessel/7", "tenderab12"] {
+            assert_eq!(Scope(other.into()).owner(), None, "{other}");
+        }
+        assert!(Scope("vessel/7".into()).is_vessel() && !Scope("vessels/7".into()).is_vessel());
+    }
 }
