@@ -3,10 +3,10 @@
 #[path = "common/ssh.rs"]
 mod ssh_fixture;
 
-use std::{collections::BTreeSet, os::unix::fs::PermissionsExt, path::Path, time::Duration};
+use std::{collections::BTreeSet, os::unix::fs::PermissionsExt, time::Duration};
 
 use tender::{
-    Availability, Error, Grant, Namespace, PublishRequest, Session, Tender,
+    Availability, BindingState, Error, Grant, Label, PublicationId, PublishRequest, Scope, Session, Tender, UnavailableReason,
     memory::MemoryTender,
     ssh::{Forward, Identity, Server, SshTender},
 };
@@ -18,7 +18,12 @@ use tokio::{
 };
 
 fn request(audience: tender::Fingerprint) -> PublishRequest {
-    PublishRequest { namespace: Namespace("services".into()), name: "ordinary".into(), audience: BTreeSet::from([audience]), reclaim: None }
+    PublishRequest {
+        id: PublicationId::new("services", "ordinary"),
+        label: Label("echo".into()),
+        display: "Ordinary service".into(),
+        audience: Some(BTreeSet::from([audience])),
+    }
 }
 
 // Tender owns the route, while an ordinary Rust service independently owns its
@@ -59,7 +64,7 @@ async fn ordinary_service_survives_route_loss_and_fresh_client_recovers() {
     policy
         .grant(Grant {
             grantee: caller.fingerprint(),
-            namespace: Namespace("services".into()),
+            scope: Scope("services".into()),
             audience_ceiling: BTreeSet::from([caller.fingerprint()]),
             expires_at: 100,
         })
@@ -69,10 +74,10 @@ async fn ordinary_service_survives_route_loss_and_fresh_client_recovers() {
     let server = Server::bind(endpoint.clone(), host.clone(), policy.clone()).expect("server");
     let lease = server.publish_endpoint(&session, request(caller.fingerprint()), service_path.clone()).await.expect("ordinary endpoint");
     let adapter = SshTender::new(endpoint.clone(), host.fingerprint(), vec![caller]).expect("adapter");
-    let exposure = adapter.expose_local(&session, lease.id).await.expect("exposure");
+    let binding = adapter.bind(&session, &lease.id).await.expect("binding");
     let mut watch = adapter.watch(&session).await.expect("watch");
     assert_eq!(watch.recv().await.expect("initial")[0].availability, Availability::Available);
-    let mut first = UnixStream::connect(&exposure.local_name).await.expect("ordinary client");
+    let mut first = UnixStream::connect(&binding.local_endpoint).await.expect("ordinary client");
     first.write_all(b"before").await.expect("request");
     first.shutdown().await.expect("half close");
     let mut response = Vec::new();
@@ -93,7 +98,7 @@ async fn ordinary_service_survives_route_loss_and_fresh_client_recovers() {
         .expect("service input deadline");
     }
     input_received(&mut received, b"before").await;
-    let mut held = adapter.connect(&session, lease.id).await.expect("held client");
+    let mut held = adapter.connect(&session, &lease.id).await.expect("held client");
     held.write_all(b"interrupted").await.expect("held request");
     input_received(&mut received, b"interrupted").await;
     // Dropping the transport server terminates its channels, not the service.
@@ -119,9 +124,7 @@ async fn ordinary_service_survives_route_loss_and_fresh_client_recovers() {
     assert_eq!(direct_response, b"direct");
     let restored = Server::bind(endpoint, host, policy).expect("restored server");
     assert_eq!(adapter.browse(&session).await.expect("restored browse")[0].availability, Availability::Unavailable);
-    let mut publish = request(session.caller.clone());
-    publish.reclaim = Some(lease.id);
-    let renewed = restored.publish_endpoint(&session, publish, service_path).await.expect("reclaim endpoint");
+    let renewed = restored.publish_endpoint(&session, request(session.caller.clone()), service_path).await.expect("publish again");
     assert_eq!(renewed.generation, lease.generation + 1);
     assert_eq!(adapter.browse(&session).await.expect("available")[0].availability, Availability::Available);
     // Drain only requests from the interrupted/direct clients before reopening.
@@ -132,7 +135,7 @@ async fn ordinary_service_survives_route_loss_and_fresh_client_recovers() {
     })
     .await
     .expect("prior requests");
-    let mut fresh = UnixStream::connect(&exposure.local_name).await.expect("fresh exposed client");
+    let mut fresh = UnixStream::connect(&binding.local_endpoint).await.expect("fresh exposed client");
     fresh.write_all(b"after").await.expect("fresh request");
     fresh.shutdown().await.expect("fresh EOF");
     let mut response = Vec::new();
@@ -173,7 +176,7 @@ async fn exposure_failure_is_eof_without_protocol_bytes() {
     policy
         .grant(Grant {
             grantee: caller.fingerprint(),
-            namespace: Namespace("services".into()),
+            scope: Scope("services".into()),
             audience_ceiling: BTreeSet::from([caller.fingerprint()]),
             expires_at: 100,
         })
@@ -182,22 +185,21 @@ async fn exposure_failure_is_eof_without_protocol_bytes() {
     let _server = Server::bind(endpoint.clone(), host.clone(), policy.clone()).expect("server");
     let adapter = SshTender::new(endpoint, host.fingerprint(), vec![caller.clone()]).expect("adapter");
     let published = policy.publish(&session, request(caller.fingerprint())).await.expect("publish");
-    let exposure = adapter.expose_local(&session, published.lease.id).await.expect("connect-only authority can expose without browse");
+    let binding = adapter.bind(&session, &published.lease.id).await.expect("connect-only authority can bind without browse");
     policy.disconnect(&session, &published.lease).await.expect("outage");
-    let mut local = UnixStream::connect(&exposure.local_name).await.expect("stable socket");
-    let mut bytes = Vec::new();
-    timeout(Duration::from_secs(1), local.read_to_end(&mut bytes)).await.expect("prompt close").expect("EOF");
-    assert!(bytes.is_empty());
-    // Withdrawal is terminal and removes the Tender-owned listener.
+    async fn closes_without_bytes(path: &str) {
+        let mut local = UnixStream::connect(path).await.expect("stable socket");
+        let mut bytes = Vec::new();
+        timeout(Duration::from_secs(1), local.read_to_end(&mut bytes)).await.expect("prompt close").expect("EOF");
+        assert!(bytes.is_empty());
+    }
+    closes_without_bytes(&binding.local_endpoint).await;
+    // Withdrawal keeps the Binding, which still closes fresh connections.
     policy.withdraw(&session, &published.lease).await.expect("withdraw unavailable publication");
-    timeout(Duration::from_secs(3), async {
-        while Path::new(&exposure.local_name).exists() {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("withdrawal removes exposure");
-    assert!(matches!(adapter.expose_local(&session, published.lease.id).await, Err(Error::Withdrawn)));
+    closes_without_bytes(&binding.local_endpoint).await;
+    let withdrawn = adapter.bind(&session, &published.lease.id).await.expect("withdrawn binding");
+    assert!(matches!(withdrawn.state, BindingState::Unavailable { reason: UnavailableReason::Withdrawn, .. }));
+    assert_eq!(withdrawn.local_endpoint, binding.local_endpoint);
 }
 
 // Ordinary services retain directional EOF: request half-close still permits
@@ -221,7 +223,7 @@ async fn endpoint_half_close_preserves_response() {
     policy
         .grant(Grant {
             grantee: caller.fingerprint(),
-            namespace: Namespace("services".into()),
+            scope: Scope("services".into()),
             audience_ceiling: BTreeSet::from([caller.fingerprint()]),
             expires_at: 100,
         })
@@ -231,7 +233,7 @@ async fn endpoint_half_close_preserves_response() {
     let server = Server::bind(endpoint.clone(), host.clone(), policy).expect("server");
     let lease = server.publish_endpoint(&session, request(caller.fingerprint()), service_path).await.expect("ordinary endpoint");
     let adapter = SshTender::new(endpoint, host.fingerprint(), vec![caller]).expect("adapter");
-    let mut stream = adapter.connect(&session, lease.id).await.expect("open");
+    let mut stream = adapter.connect(&session, &lease.id).await.expect("open");
     stream.write_all(b"request").await.expect("write");
     stream.shutdown().await.expect("half-close");
     let mut response = Vec::new();
@@ -268,7 +270,7 @@ async fn missing_service_marks_publication_unavailable() {
     policy
         .grant(Grant {
             grantee: caller.fingerprint(),
-            namespace: Namespace("services".into()),
+            scope: Scope("services".into()),
             audience_ceiling: BTreeSet::from([caller.fingerprint()]),
             expires_at: 100,
         })
@@ -281,7 +283,7 @@ async fn missing_service_marks_publication_unavailable() {
     let adapter = SshTender::new(endpoint, host.fingerprint(), vec![caller]).expect("adapter");
     // Admission may precede a failed ordinary endpoint open, so explicit open
     // can either refuse or produce a channel that promptly closes.
-    match adapter.connect(&session, lease.id).await {
+    match adapter.connect(&session, &lease.id).await {
         Ok(mut stream) => {
             let mut bytes = Vec::new();
             timeout(Duration::from_secs(1), stream.read_to_end(&mut bytes)).await.expect("close deadline").expect("EOF");
@@ -291,13 +293,13 @@ async fn missing_service_marks_publication_unavailable() {
         Err(error) => panic!("unexpected endpoint failure: {error}"),
     }
     assert_eq!(adapter.browse(&session).await.expect("diagnostics")[0].availability, Availability::Unavailable);
-    assert!(matches!(adapter.connect(&session, lease.id).await, Err(Error::Unavailable)));
+    assert!(matches!(adapter.connect(&session, &lease.id).await, Err(Error::Unavailable)));
 }
 
-// The same stable address can be explicitly exposed again after audience
-// permission returns; a dead task must not leave an unusable map entry.
+// A Binding whose audience drops this caller stays in place as revoked,
+// closing fresh connections, and serves again once the audience returns.
 #[tokio::test]
-async fn reexpose_after_audience_permission_returns() {
+async fn binding_is_revoked_and_restored_in_place() {
     let root = tempfile::Builder::new().permissions(std::fs::Permissions::from_mode(0o700)).tempdir().expect("directory");
     let host = Identity::generate();
     let caller = Identity::generate();
@@ -305,7 +307,7 @@ async fn reexpose_after_audience_permission_returns() {
     policy.allow_connect(caller.fingerprint()).expect("host policy");
     let grant = Grant {
         grantee: caller.fingerprint(),
-        namespace: Namespace("services".into()),
+        scope: Scope("services".into()),
         audience_ceiling: BTreeSet::from([caller.fingerprint()]),
         expires_at: 100,
     };
@@ -313,21 +315,25 @@ async fn reexpose_after_audience_permission_returns() {
     let session = Session { caller: caller.fingerprint(), pinned_host: host.fingerprint(), via: None };
     let endpoint = root.path().join("server");
     let _server = Server::bind(endpoint.clone(), host.clone(), policy.clone()).expect("server");
-    let published = policy.publish(&session, request(caller.fingerprint())).await.expect("publish");
+    let mut published = policy.publish(&session, request(caller.fingerprint())).await.expect("publish");
     let adapter = SshTender::new(endpoint, host.fingerprint(), vec![caller]).expect("adapter");
-    let first = adapter.expose_local(&session, published.lease.id).await.expect("exposure");
+    let first = adapter.bind(&session, &published.lease.id).await.expect("binding");
     policy.grant(Grant { audience_ceiling: BTreeSet::new(), ..grant.clone() }).expect("host policy");
-    timeout(Duration::from_secs(3), async {
-        while Path::new(&first.local_name).exists() {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("denial removes listener");
+    let revoked = adapter.bind(&session, &published.lease.id).await.expect("revoked binding");
+    assert_eq!((revoked.local_endpoint.as_str(), revoked.state), (first.local_endpoint.as_str(), BindingState::Revoked));
+    let mut refused = UnixStream::connect(&first.local_endpoint).await.expect("revoked binding keeps its socket");
+    let mut bytes = Vec::new();
+    timeout(Duration::from_secs(1), refused.read_to_end(&mut bytes)).await.expect("prompt close").expect("EOF");
+    assert!(bytes.is_empty());
     policy.grant(grant).expect("host policy");
-    let restored = adapter.expose_local(&session, published.lease.id).await.expect("explicit re-exposure");
+    let restored = adapter.bind(&session, &published.lease.id).await.expect("restored binding");
     assert_eq!(restored, first);
-    assert!(UnixStream::connect(&restored.local_name).await.is_ok(), "re-exposure has a live listener");
+    let mut client = UnixStream::connect(&restored.local_endpoint).await.expect("restored listener");
+    let mut service = timeout(Duration::from_secs(2), published.incoming.recv()).await.expect("service channel").expect("open");
+    client.write_all(b"back").await.expect("write");
+    let mut back = [0; 4];
+    service.read_exact(&mut back).await.expect("read");
+    assert_eq!(&back, b"back");
 }
 
 // Atomic first-run creation makes every concurrent enrolment observe one
@@ -369,8 +375,8 @@ fn server_refuses_a_shared_parent_directory() {
 }
 
 // A publisher outage reserves its identity. The public Lease includes its
-// generation, so recovery is an explicit reclaim that returns a fresh Lease;
-// automatically reclaiming would leave the caller's Lease silently stale.
+// generation, so recovery is an explicit publish that returns a fresh Lease;
+// automatically republishing would leave the caller's Lease silently stale.
 #[tokio::test]
 async fn forward_carries_contract_and_reclaims_after_route_replacement() {
     let sshd = ssh_fixture::Sshd::start().await;
@@ -382,7 +388,7 @@ async fn forward_carries_contract_and_reclaims_after_route_replacement() {
     policy
         .grant(Grant {
             grantee: caller.fingerprint(),
-            namespace: Namespace("services".into()),
+            scope: Scope("services".into()),
             audience_ceiling: BTreeSet::from([caller.fingerprint()]),
             expires_at: 100,
         })
@@ -393,7 +399,7 @@ async fn forward_carries_contract_and_reclaims_after_route_replacement() {
     let mut forward = Forward::start(sshd.target.clone(), &endpoint).await.expect("SSH");
     let adapter = SshTender::new(forward.socket().to_owned(), host.fingerprint(), vec![caller.clone()]).expect("adapter");
     let mut first = adapter.publish(&session, request(caller.fingerprint())).await.expect("publisher");
-    let mut client = adapter.connect(&session, first.lease.id).await.expect("first client");
+    let mut client = adapter.connect(&session, &first.lease.id).await.expect("first client");
     let mut service = first.incoming.recv().await.expect("accepted raw channel");
     client.write_all(b"before").await.expect("input");
     let mut before = [0; 6];
@@ -418,13 +424,11 @@ async fn forward_carries_contract_and_reclaims_after_route_replacement() {
     .expect("reserved identity");
     let restored = Forward::start(sshd.target.clone(), &endpoint).await.expect("restored SSH");
     adapter.replace_route(restored.socket().to_owned());
-    let mut publish = request(caller.fingerprint());
-    publish.reclaim = Some(first.lease.id);
-    let mut next = adapter.publish(&session, publish).await.expect("explicit reclaim");
+    let mut next = adapter.publish(&session, request(caller.fingerprint())).await.expect("publish again");
     assert_eq!(next.lease.id, first.lease.id);
     assert_eq!(next.lease.generation, first.lease.generation + 1);
     assert_eq!(adapter.disconnect(&session, &first.lease).await, Err(Error::StaleGeneration));
-    let mut fresh = adapter.connect(&session, next.lease.id).await.expect("fresh connection");
+    let mut fresh = adapter.connect(&session, &next.lease.id).await.expect("fresh connection");
     let mut service = next.incoming.recv().await.expect("fresh channel");
     let mut byte = [0];
     assert!(timeout(Duration::from_millis(30), service.read(&mut byte)).await.is_err(), "no replay across generations");

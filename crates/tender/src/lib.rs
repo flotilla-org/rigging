@@ -26,12 +26,36 @@ pub mod ssh;
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct Fingerprint(pub String);
 
+/// A vessel, or the publishing instance for a host endpoint. Who may publish
+/// under a scope is a [`Grant`].
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
-pub struct Namespace(pub String);
+pub struct Scope(pub String);
 
-/// Host-assigned identity; names and routes are never used as identity.
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
-pub struct PublicationId(pub u64);
+/// A publication's identity. The name is chosen by whoever asks and is opaque
+/// to Tender; the publisher and its route are not part of the identity, so a
+/// publisher that moves keeps its publications (flotilla#3995).
+#[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct PublicationId {
+    pub scope: Scope,
+    pub name: String,
+}
+
+impl PublicationId {
+    pub fn new(scope: impl Into<String>, name: impl Into<String>) -> Self {
+        Self { scope: Scope(scope.into()), name: name.into() }
+    }
+}
+
+impl fmt::Display for PublicationId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:{}", self.scope.0, self.name)
+    }
+}
+
+/// The protocol a publication claims to speak (`cleat`, `agent-view`, `http`,
+/// …). Tender never checks it; the application's own handshake does.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct Label(pub String);
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Availability {
@@ -43,8 +67,8 @@ pub enum Availability {
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
 pub struct Publication {
     pub id: PublicationId,
-    pub namespace: Namespace,
-    pub name: String,
+    pub label: Label,
+    pub display: String,
     pub publisher: Fingerprint,
     pub audience: BTreeSet<Fingerprint>,
     pub generation: u64,
@@ -55,7 +79,8 @@ pub struct Publication {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Grant {
     pub grantee: Fingerprint,
-    pub namespace: Namespace,
+    #[serde(alias = "namespace")]
+    pub scope: Scope,
     pub audience_ceiling: BTreeSet<Fingerprint>,
     /// Hosting clock milliseconds; the grant is invalid at this tick.
     pub expires_at: u64,
@@ -71,14 +96,15 @@ pub struct Session {
     pub via: Option<Fingerprint>,
 }
 
+/// Publishing an identity whose publisher is unavailable or withdrawn takes it
+/// over, under the caller's own grant; a live incumbent always wins.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct PublishRequest {
-    pub namespace: Namespace,
-    pub name: String,
-    pub audience: BTreeSet<Fingerprint>,
-    /// Reclaiming an identity is explicit; a duplicate display name creates
-    /// another identity, while a live incumbent always wins.
-    pub reclaim: Option<PublicationId>,
+    pub id: PublicationId,
+    pub label: Label,
+    pub display: String,
+    /// `None` is the host's Trusted Group. Either way the grant's ceiling applies.
+    pub audience: Option<BTreeSet<Fingerprint>>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
@@ -109,13 +135,46 @@ pub struct Published {
     pub incoming: mpsc::UnboundedReceiver<ByteStream>,
 }
 
-/// Consumer-owned address. It is bound to both a host fingerprint and a
-/// publication ID, so reconnecting never substitutes a same-named service.
+/// The instance carrying a Binding's streams, and the relay in between if any.
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
-pub struct Exposure {
-    pub host: Fingerprint,
+pub struct Route {
+    pub instance: Fingerprint,
+    pub via: Option<Fingerprint>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum UnavailableReason {
+    /// The publisher went away; another may take the identity over.
+    PublisherUnavailable,
+    Withdrawn,
+    /// No route currently reaches an instance carrying the publication.
+    RouteUnavailable,
+}
+
+/// For display and diagnostics only: clients connect to the Local Endpoint
+/// whatever the state, and an unavailable Binding refuses or closes promptly.
+#[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
+#[serde(rename_all = "snake_case", tag = "state")]
+pub enum BindingState {
+    Available {
+        route: Route,
+    },
+    Unavailable {
+        reason: UnavailableReason,
+        route: Option<Route>,
+    },
+    /// The publication's audience or grant no longer admits this machine.
+    Revoked,
+}
+
+/// A Local Endpoint on this machine for a publication, keyed by its identity
+/// and shared by every client here. A takeover or new route keeps the endpoint.
+#[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
+pub struct Binding {
     pub publication: PublicationId,
-    pub local_name: String,
+    pub local_endpoint: String,
+    pub state: BindingState,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Eq, PartialEq)]
@@ -150,16 +209,19 @@ pub trait Tender: Send + Sync {
     async fn publish(&self, session: &Session, request: PublishRequest) -> Result<Published, Error>;
     async fn browse(&self, session: &Session) -> Result<Vec<Publication>, Error>;
     async fn watch(&self, session: &Session) -> Result<Watch, Error>;
-    async fn connect(&self, session: &Session, id: PublicationId) -> Result<ByteStream, Error>;
+    async fn connect(&self, session: &Session, id: &PublicationId) -> Result<ByteStream, Error>;
     /// Abort a pending open at a caller-chosen bound. An established stream
     /// has no idle timeout; its owner may cancel by dropping it.
-    async fn connect_with_deadline(&self, session: &Session, id: PublicationId, deadline: Duration) -> Result<ByteStream, Error> {
+    async fn connect_with_deadline(&self, session: &Session, id: &PublicationId, deadline: Duration) -> Result<ByteStream, Error> {
         tokio::time::timeout(deadline, self.connect(session, id)).await.map_err(|_| Error::Deadline)?
     }
-    async fn expose_local(&self, session: &Session, id: PublicationId) -> Result<Exposure, Error>;
-    async fn open_exposure(&self, session: &Session, exposure: &Exposure) -> Result<ByteStream, Error>;
-    async fn open_exposure_with_deadline(&self, session: &Session, exposure: &Exposure, deadline: Duration) -> Result<ByteStream, Error> {
-        tokio::time::timeout(deadline, self.open_exposure(session, exposure)).await.map_err(|_| Error::Deadline)?
+    /// Binding an identity again returns the same Local Endpoint with its
+    /// current state; once bound, a publication that stops admitting the caller
+    /// reports `Revoked` rather than disappearing.
+    async fn bind(&self, session: &Session, id: &PublicationId) -> Result<Binding, Error>;
+    async fn open_binding(&self, session: &Session, binding: &Binding) -> Result<ByteStream, Error>;
+    async fn open_binding_with_deadline(&self, session: &Session, binding: &Binding, deadline: Duration) -> Result<ByteStream, Error> {
+        tokio::time::timeout(deadline, self.open_binding(session, binding)).await.map_err(|_| Error::Deadline)?
     }
     async fn disconnect(&self, session: &Session, lease: &Lease) -> Result<(), Error>;
     async fn withdraw(&self, session: &Session, lease: &Lease) -> Result<(), Error>;

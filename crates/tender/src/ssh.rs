@@ -12,7 +12,7 @@ use std::{
     io,
     os::unix::fs::{FileTypeExt, PermissionsExt},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, Weak},
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -27,12 +27,12 @@ use tokio::{
     net::{UnixListener, UnixStream},
     sync::{Mutex as AsyncMutex, Semaphore, mpsc},
     task::JoinHandle,
-    time::{Instant, sleep, timeout},
+    time::{sleep, timeout},
 };
 
 use crate::{
-    ByteStream, Dial, Error, Exposure, Fingerprint, Lease, Publication, PublicationId, PublishRequest, Published, Router, Session, Tender,
-    Watch,
+    Binding, BindingState, ByteStream, Dial, Error, Fingerprint, Lease, Publication, PublicationId, PublishRequest, Published, Router,
+    Session, Tender, UnavailableReason, Watch,
     memory::MemoryTender,
     runtime::{Clock, FileStore},
 };
@@ -165,8 +165,7 @@ enum Request {
     Browse,
     Watch,
     Connect(PublicationId),
-    Expose(PublicationId),
-    Probe(PublicationId),
+    Bind(PublicationId),
     Disconnect(Lease),
     Withdraw(Lease),
     /// Carry the stream to `host`. The requester authenticated as itself; once
@@ -181,13 +180,13 @@ enum Request {
 enum Response {
     Lease(Lease),
     Publications(Vec<Publication>),
-    Exposure(Exposure),
+    Binding(Binding),
     Open,
     Done,
     Error(Error),
 }
 
-type Registrations = Arc<Mutex<BTreeMap<(u64, u64), Arc<Registration>>>>;
+type Registrations = Arc<Mutex<BTreeMap<(PublicationId, u64), Arc<Registration>>>>;
 
 struct Registration {
     lease: Lease,
@@ -362,7 +361,7 @@ async fn serve(
             Ok(published) => {
                 let lease = published.lease;
                 registrations.lock().expect("registrations lock").insert(
-                    (lease.id.0, lease.generation),
+                    (lease.id.clone(), lease.generation),
                     Arc::new(Registration { lease: lease.clone(), incoming: AsyncMutex::new(published.incoming) }),
                 );
                 // Cleanup also runs when the client cancels before receiving
@@ -381,7 +380,7 @@ async fn serve(
                 }
                 .await;
                 let _ = policy.disconnect(&session, &lease).await;
-                registrations.lock().expect("registrations lock").remove(&(lease.id.0, lease.generation));
+                registrations.lock().expect("registrations lock").remove(&(lease.id.clone(), lease.generation));
                 return control;
             }
             Err(error) => Response::Error(error),
@@ -406,15 +405,11 @@ async fn serve(
             }
             Err(error) => Response::Error(error),
         },
-        Request::Probe(id) => match policy.check_connect(&session, id) {
-            Ok(()) => Response::Done,
+        Request::Bind(id) => match policy.bind(&session, &id).await {
+            Ok(binding) => Response::Binding(binding),
             Err(error) => Response::Error(error),
         },
-        Request::Expose(id) => match policy.expose_local(&session, id).await {
-            Ok(exposure) => Response::Exposure(exposure),
-            Err(error) => Response::Error(error),
-        },
-        Request::Connect(id) => match policy.connect(&session, id).await {
+        Request::Connect(id) => match policy.connect(&session, &id).await {
             Ok(mut service) => {
                 write_control(&mut stream, &Response::Open).await?;
                 tokio::io::copy_bidirectional(&mut stream, &mut service).await?;
@@ -423,7 +418,7 @@ async fn serve(
             Err(error) => Response::Error(error),
         },
         Request::Accept(lease) => {
-            let registration = registrations.lock().expect("registrations lock").get(&(lease.id.0, lease.generation)).cloned();
+            let registration = registrations.lock().expect("registrations lock").get(&(lease.id.clone(), lease.generation)).cloned();
             match registration {
                 Some(registration) if registration.lease == lease && lease.publisher == session.caller => {
                     let mut byte = [0];
@@ -448,7 +443,7 @@ async fn serve(
                         }
                         _ = stream.read(&mut byte) => {
                         let _ = policy.disconnect(&session, &lease).await;
-                        registrations.lock().expect("registrations lock").remove(&(lease.id.0, lease.generation));
+                        registrations.lock().expect("registrations lock").remove(&(lease.id.clone(), lease.generation));
                         return Ok(());
                     },
                     }
@@ -458,14 +453,14 @@ async fn serve(
         }
         Request::Disconnect(lease) => match policy.disconnect(&session, &lease).await {
             Ok(()) => {
-                registrations.lock().expect("registrations lock").remove(&(lease.id.0, lease.generation));
+                registrations.lock().expect("registrations lock").remove(&(lease.id.clone(), lease.generation));
                 Response::Done
             }
             Err(error) => Response::Error(error),
         },
         Request::Withdraw(lease) => match policy.withdraw(&session, &lease).await {
             Ok(()) => {
-                registrations.lock().expect("registrations lock").remove(&(lease.id.0, lease.generation));
+                registrations.lock().expect("registrations lock").remove(&(lease.id.clone(), lease.generation));
                 Response::Done
             }
             Err(error) => Response::Error(error),
@@ -556,10 +551,8 @@ impl Forward {
     }
 }
 
-/// Remote Tender operations over an established SSH forward. Credentials are
-/// explicit; accepting an arbitrary Session never lets a caller forge a key.
-type ExposureMap = BTreeMap<(Fingerprint, PublicationId), Arc<LocalExposure>>;
-type Exposures = Arc<Mutex<ExposureMap>>;
+type BindingMap = BTreeMap<PublicationId, Arc<LocalBinding>>;
+type Bindings = Arc<Mutex<BindingMap>>;
 
 /// Dials one Unix socket path whichever instance is named, such as an OpenSSH
 /// stream-local forward or a host's own Tender listener. A single path cannot
@@ -574,39 +567,27 @@ impl Dial for UnixDial {
     }
 }
 
+/// Remote Tender operations over an established SSH forward. Credentials are
+/// explicit; accepting an arbitrary Session never lets a caller forge a key.
 #[derive(Clone)]
 pub struct SshTender {
     route: Arc<Mutex<Arc<dyn Dial>>>,
     credentials: Arc<BTreeMap<Fingerprint, Identity>>,
     pin: Fingerprint,
-    exposures: Exposures,
+    bindings: Bindings,
     directory: Arc<tempfile::TempDir>,
     snapshots: Arc<Mutex<BTreeMap<Fingerprint, Vec<Publication>>>>,
 }
 
-struct LocalExposure {
+/// A Binding's listener lives as long as its adapter: an unavailable,
+/// withdrawn or revoked publication keeps its Local Endpoint, which closes
+/// each fresh connection promptly.
+struct LocalBinding {
     path: PathBuf,
     task: JoinHandle<()>,
 }
 
-struct ExposureCleanup {
-    path: PathBuf,
-    entries: Weak<Mutex<ExposureMap>>,
-    key: (Fingerprint, PublicationId),
-}
-
-impl Drop for ExposureCleanup {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-        if let Some(entries) = self.entries.upgrade() {
-            // Drop the removed handle outside the lock.
-            let removed = entries.lock().expect("exposures lock").remove(&self.key);
-            drop(removed);
-        }
-    }
-}
-
-impl Drop for LocalExposure {
+impl Drop for LocalBinding {
     fn drop(&mut self) {
         self.task.abort();
         let _ = std::fs::remove_file(&self.path);
@@ -628,9 +609,9 @@ impl SshTender {
             route: Arc::new(Mutex::new(dial)),
             credentials: Arc::new(identities.into_iter().map(|identity| (identity.fingerprint(), identity)).collect()),
             pin,
-            exposures: Arc::new(Mutex::new(BTreeMap::new())),
+            bindings: Arc::new(Mutex::new(BTreeMap::new())),
             directory: Arc::new(
-                tempfile::Builder::new().prefix("tender-exposures-").permissions(std::fs::Permissions::from_mode(0o700)).tempdir()?,
+                tempfile::Builder::new().prefix("tender-bindings-").permissions(std::fs::Permissions::from_mode(0o700)).tempdir()?,
             ),
         })
     }
@@ -835,8 +816,8 @@ impl Tender for SshTender {
         Ok(receiver)
     }
 
-    async fn connect(&self, session: &Session, id: PublicationId) -> Result<ByteStream, Error> {
-        let mut stream = self.request(session, Request::Connect(id)).await?;
+    async fn connect(&self, session: &Session, id: &PublicationId) -> Result<ByteStream, Error> {
+        let mut stream = self.request(session, Request::Connect(id.clone())).await?;
         match timeout(OPEN_TIMEOUT, read_control(&mut stream)).await.map_err(|_| Error::Deadline)?.map_err(|_| Error::Unavailable)? {
             Response::Open => Ok(stream),
             Response::Error(error) => Err(error),
@@ -844,72 +825,57 @@ impl Tender for SshTender {
         }
     }
 
-    async fn expose_local(&self, session: &Session, id: PublicationId) -> Result<Exposure, Error> {
-        match self.reply(session, Request::Expose(id)).await? {
-            Response::Exposure(_) => {}
-            _ => return Err(Error::Unavailable),
-        }
-        match self.reply(session, Request::Probe(id)).await {
-            Ok(Response::Done) | Err(Error::Unavailable) => {}
+    async fn bind(&self, session: &Session, id: &PublicationId) -> Result<Binding, Error> {
+        let existing = self.bindings.lock().expect("bindings lock").get(id).map(|binding| binding.path.clone());
+        let state = match self.reply(session, Request::Bind(id.clone())).await {
+            Ok(Response::Binding(binding)) => binding.state,
+            Ok(_) => return Err(Error::Unavailable),
+            Err(Error::Unavailable | Error::Deadline) if existing.is_some() => {
+                BindingState::Unavailable { reason: UnavailableReason::RouteUnavailable, route: None }
+            }
             Err(error) => return Err(error),
-            _ => return Err(Error::Unavailable),
-        }
-        let key = (session.caller.clone(), id);
-        let caller_hash: String = Sha256::digest(session.caller.0.as_bytes()).iter().take(8).map(|byte| format!("{byte:02x}")).collect();
-        let path = self.directory.path().join(format!("{caller_hash}-{}", id.0));
-        if !self.exposures.lock().expect("exposures lock").contains_key(&key) {
-            let listener = UnixListener::bind(&path).map_err(|_| Error::Unavailable)?;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).map_err(|_| Error::Unavailable)?;
-            // Avoid a reference cycle between the adapter and its owned task.
-            let adapter = Self { exposures: Arc::new(Mutex::new(BTreeMap::new())), ..self.clone() };
-            let session = session.clone();
-            let owned_path = path.clone();
-            let cleanup = ExposureCleanup { path: path.clone(), entries: Arc::downgrade(&self.exposures), key: key.clone() };
-            let task = tokio::spawn(async move {
-                let _cleanup = cleanup;
-                let mut health_delay = Duration::from_secs(1);
-                let mut next_health = Instant::now() + health_delay;
-                let mut streams = tokio::task::JoinSet::new();
-                loop {
-                    tokio::select! {
-                        accepted = listener.accept() => {
-                            let Ok((mut local, _)) = accepted else { break };
-                            let adapter = adapter.clone();
-                            let session = session.clone();
-                            streams.spawn(async move {
-                                if let Ok(mut remote) = adapter.connect(&session, id).await {
-                                    let _ = tokio::io::copy_bidirectional(&mut local, &mut remote).await;
-                                }
-                            });
-                        }
-                        _ = streams.join_next(), if !streams.is_empty() => {}
-                        _ = sleep(next_health.saturating_duration_since(Instant::now())) => {
-                            let result = adapter.reply(&session, Request::Probe(id)).await;
-                            if matches!(result, Err(Error::Withdrawn | Error::Denied)) {
-                                drop(listener);
-                                let _ = std::fs::remove_file(&owned_path);
-                                // Expiry forbids new opens, but established streams run to close.
-                                while streams.join_next().await.is_some() {}
-                                break;
+        };
+        let path = match existing {
+            Some(path) => path,
+            None => {
+                let digest = Sha256::digest(serde_json::to_vec(id).map_err(|_| Error::Unavailable)?);
+                let path = self.directory.path().join(digest.iter().take(16).map(|byte| format!("{byte:02x}")).collect::<String>());
+                let listener = UnixListener::bind(&path).map_err(|_| Error::Unavailable)?;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).map_err(|_| Error::Unavailable)?;
+                // Avoid a reference cycle between the adapter and its owned task.
+                let adapter = Self { bindings: Arc::new(Mutex::new(BTreeMap::new())), ..self.clone() };
+                let session = session.clone();
+                let bound = id.clone();
+                let task = tokio::spawn(async move {
+                    let mut streams = tokio::task::JoinSet::new();
+                    loop {
+                        tokio::select! {
+                            accepted = listener.accept() => {
+                                let Ok((mut local, _)) = accepted else { break };
+                                let adapter = adapter.clone();
+                                let session = session.clone();
+                                let id = bound.clone();
+                                streams.spawn(async move {
+                                    if let Ok(mut remote) = adapter.connect(&session, &id).await {
+                                        let _ = tokio::io::copy_bidirectional(&mut local, &mut remote).await;
+                                    }
+                                });
                             }
-                            health_delay = if result.is_err() { (health_delay * 2).min(Duration::from_secs(8)) } else { Duration::from_secs(1) };
-                            next_health = Instant::now() + health_delay;
+                            _ = streams.join_next(), if !streams.is_empty() => {}
                         }
                     }
-                }
-            });
-            self.exposures.lock().expect("exposures lock").insert(key, Arc::new(LocalExposure { path: path.clone(), task }));
-        }
-        Ok(Exposure { host: self.pin.clone(), publication: id, local_name: path.to_string_lossy().into_owned() })
+                });
+                self.bindings.lock().expect("bindings lock").insert(id.clone(), Arc::new(LocalBinding { path: path.clone(), task }));
+                path
+            }
+        };
+        Ok(Binding { publication: id.clone(), local_endpoint: path.to_string_lossy().into_owned(), state })
     }
 
-    async fn open_exposure(&self, session: &Session, exposure: &Exposure) -> Result<ByteStream, Error> {
-        if exposure.host != self.pin {
-            return Err(Error::IdentityMismatch);
-        }
+    async fn open_binding(&self, session: &Session, binding: &Binding) -> Result<ByteStream, Error> {
         // The explicit interface preserves classified errors; ordinary socket
         // clients instead observe close, without injected diagnostic bytes.
-        self.connect(session, exposure.publication).await
+        self.connect(session, &binding.publication).await
     }
 
     async fn disconnect(&self, session: &Session, lease: &Lease) -> Result<(), Error> {
@@ -957,7 +923,7 @@ mod tests {
         policy
             .grant(crate::Grant {
                 grantee: caller.clone(),
-                namespace: crate::Namespace("n".into()),
+                scope: crate::Scope("n".into()),
                 audience_ceiling: std::collections::BTreeSet::from([caller.clone()]),
                 expires_at: 100,
             })
@@ -967,10 +933,10 @@ mod tests {
             .publish(
                 &session,
                 PublishRequest {
-                    namespace: crate::Namespace("n".into()),
-                    name: "service".into(),
-                    audience: std::collections::BTreeSet::from([caller]),
-                    reclaim: None,
+                    id: PublicationId::new("n", "service"),
+                    label: crate::Label("echo".into()),
+                    display: "Service".into(),
+                    audience: Some(std::collections::BTreeSet::from([caller])),
                 },
             )
             .await
@@ -978,7 +944,7 @@ mod tests {
         let lease = published.lease;
         let registration = Arc::new(Registration { lease: lease.clone(), incoming: AsyncMutex::new(published.incoming) });
         let incumbent = registration.incoming.lock().await;
-        let registrations = Arc::new(Mutex::new(BTreeMap::from([((lease.id.0, lease.generation), registration.clone())])));
+        let registrations = Arc::new(Mutex::new(BTreeMap::from([((lease.id.clone(), lease.generation), registration.clone())])));
         let (mut client, server) = UnixStream::pair().expect("transport pair");
         let authority = policy.clone();
         let server_identity = host.clone();

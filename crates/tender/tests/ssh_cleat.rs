@@ -6,7 +6,7 @@ mod ssh_fixture;
 use std::{collections::BTreeSet, os::unix::fs::PermissionsExt, path::PathBuf, time::Duration};
 
 use tender::{
-    Availability, Grant, Namespace, PublishRequest, Session, Tender,
+    Availability, Grant, Label, PublicationId, PublishRequest, Scope, Session, Tender,
     memory::MemoryTender,
     ssh::{Forward, Identity, Server, SshTender},
 };
@@ -150,7 +150,7 @@ async fn cleat_survives_ssh_loss_and_fresh_client_recovers() {
     policy
         .grant(Grant {
             grantee: caller.fingerprint(),
-            namespace: Namespace("services".into()),
+            scope: Scope("services".into()),
             audience_ceiling: BTreeSet::from([caller.fingerprint()]),
             expires_at: 100,
         })
@@ -162,10 +162,10 @@ async fn cleat_survives_ssh_loss_and_fresh_client_recovers() {
         .publish_endpoint(
             &session,
             PublishRequest {
-                namespace: Namespace("services".into()),
-                name: "cleat".into(),
-                audience: BTreeSet::from([caller.fingerprint()]),
-                reclaim: None,
+                id: PublicationId::new("services", "cleat"),
+                label: Label("cleat".into()),
+                display: "Proof cleat daemon".into(),
+                audience: Some(BTreeSet::from([caller.fingerprint()])),
             },
             service_socket,
         )
@@ -173,16 +173,16 @@ async fn cleat_survives_ssh_loss_and_fresh_client_recovers() {
         .expect("existing cleat publication");
     let mut forward = Forward::start(sshd.target.clone(), &endpoint).await.expect("real SSH route");
     let adapter = SshTender::new(forward.socket().to_owned(), host.fingerprint(), vec![caller]).expect("adapter");
-    let exposure = adapter.expose_local(&session, lease.id).await.expect("Tender-owned exposure");
+    let binding = adapter.bind(&session, &lease.id).await.expect("Tender-owned binding");
     let mut watch = adapter.watch(&session).await.expect("availability watch");
     assert_eq!(watch.recv().await.expect("initial availability")[0].availability, Availability::Available);
-    let packet = cleat.packets(&exposure.local_name, SESSION).await;
+    let packet = cleat.packets(&binding.local_endpoint, SESSION).await;
     assert!(packet.status.success(), "directory/session/render: {}", String::from_utf8_lossy(&packet.stderr));
     assert!(String::from_utf8_lossy(&packet.stdout).contains("mode_changes=initial"));
-    let missing = cleat.packets(&exposure.local_name, "absent-session").await;
+    let missing = cleat.packets(&binding.local_endpoint, "absent-session").await;
     assert!(!missing.status.success());
     assert!(String::from_utf8_lossy(&missing.stderr).contains("not present in packet directory"));
-    terminal.attach(&exposure.local_name, "client-before").await;
+    terminal.attach(&binding.local_endpoint, "client-before").await;
     terminal.rendered("client-before", "READY").await;
     terminal.output(&["send", "client-before", "before"]).await;
     terminal.rendered("client-before", "REPLY:before").await;
@@ -216,15 +216,15 @@ async fn cleat_survives_ssh_loss_and_fresh_client_recovers() {
     );
     assert_eq!(adapter.browse(&session).await.expect("cached unavailable")[0].availability, Availability::Unavailable);
     assert_eq!(cleat.output(&["capture", SESSION]).await, before, "cleat screen survives SSH loss");
-    let unavailable = cleat.packets(&exposure.local_name, SESSION).await;
+    let unavailable = cleat.packets(&binding.local_endpoint, SESSION).await;
     assert!(!unavailable.status.success(), "socket-only client must refuse an unavailable route");
-    assert!(std::path::Path::new(&exposure.local_name).exists(), "stable Tender exposure survives route loss");
+    assert!(std::path::Path::new(&binding.local_endpoint).exists(), "stable Tender binding survives route loss");
 
     let restored = Forward::start(sshd.target.clone(), &endpoint).await.expect("fresh SSH route");
     adapter.replace_route(restored.socket().to_owned());
     assert_eq!(adapter.browse(&session).await.expect("recovered browse")[0].availability, Availability::Available);
-    assert!(cleat.packets(&exposure.local_name, SESSION).await.status.success(), "fresh packet client discovers living session");
-    terminal.attach(&exposure.local_name, "client-after").await;
+    assert!(cleat.packets(&binding.local_endpoint, SESSION).await.status.success(), "fresh packet client discovers living session");
+    terminal.attach(&binding.local_endpoint, "client-after").await;
     terminal.rendered("client-after", "REPLY:before").await;
     assert_eq!(std::fs::read_to_string(&log).expect("no replay log"), "before\n", "fresh initial render does not replay old input");
     terminal.output(&["send", "client-after", "after"]).await;

@@ -10,7 +10,7 @@ use std::{
 
 use sha2::{Digest, Sha256};
 use tender::{
-    Error, Fingerprint, Grant, Namespace, PublishRequest, Session, Tender,
+    Error, Fingerprint, Grant, Label, PublicationId, PublishRequest, Scope, Session, Tender,
     memory::MemoryTender,
     ssh::{Identity, Server, SshTender},
 };
@@ -100,12 +100,12 @@ fn relay_chain_opens_only_through_admitted_and_trusted_hops(tc: hegel::TestCase)
             routes.push(Some(host));
         }
         let mesh = mesh(&relays, &routes, upstream);
-        let namespace = Namespace("services".into());
+        let scope = Scope("services".into());
         mesh.host.allow_connect(caller.fingerprint()).expect("host policy");
         mesh.host
             .grant(Grant {
                 grantee: publisher.fingerprint(),
-                namespace: namespace.clone(),
+                scope: scope.clone(),
                 audience_ceiling: BTreeSet::from([caller.fingerprint()]),
                 expires_at: 100,
             })
@@ -115,7 +115,12 @@ fn relay_chain_opens_only_through_admitted_and_trusted_hops(tc: hegel::TestCase)
             .host
             .publish(
                 &publishing,
-                PublishRequest { namespace, name: "service".into(), audience: BTreeSet::from([caller.fingerprint()]), reclaim: None },
+                PublishRequest {
+                    id: PublicationId { scope, name: "service".into() },
+                    label: Label("echo".into()),
+                    display: "Service".into(),
+                    audience: Some(BTreeSet::from([caller.fingerprint()])),
+                },
             )
             .await
             .expect("publish");
@@ -131,7 +136,7 @@ fn relay_chain_opens_only_through_admitted_and_trusted_hops(tc: hegel::TestCase)
             None if relays.last().is_some_and(|relay| !relay.trusted_by_host) => Err(Error::UntrustedIntermediary),
             None => Ok(()),
         };
-        let opened = timeout(Duration::from_secs(5), client.connect(&session, published.lease.id)).await.expect("open deadline");
+        let opened = timeout(Duration::from_secs(5), client.connect(&session, &published.lease.id)).await.expect("open deadline");
         match (opened, expected) {
             (Ok(mut stream), Ok(())) => {
                 let mut service = published.incoming.recv().await.expect("accepted stream");

@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 use tokio::{io, sync::mpsc, task::JoinHandle};
 
 use crate::{
-    Availability, ByteStream, Error, Exposure, Fingerprint, Grant, Lease, Namespace, Publication, PublicationId, PublishRequest, Published,
-    Session, Tender, Watch,
+    Availability, Binding, BindingState, ByteStream, Error, Fingerprint, Grant, Label, Lease, Publication, PublicationId, PublishRequest,
+    Published, Route, Scope, Session, Tender, UnavailableReason, Watch,
     runtime::{Clock, ClockReading, Store},
 };
 
@@ -24,7 +24,7 @@ pub struct MemoryTender {
 
 struct Record {
     publication: Publication,
-    requested_audience: BTreeSet<Fingerprint>,
+    requested_audience: Option<BTreeSet<Fingerprint>>,
     expires_at: u64,
     sender: Option<mpsc::UnboundedSender<ByteStream>>,
     streams: Vec<OpenStream>,
@@ -38,13 +38,15 @@ struct OpenStream {
 struct State {
     host: Fingerprint,
     now: u64,
-    next_id: u64,
-    grants: BTreeMap<(Fingerprint, Namespace), Grant>,
+    grants: BTreeMap<(Fingerprint, Scope), Grant>,
     browse: BTreeSet<Fingerprint>,
     connect: BTreeSet<Fingerprint>,
     intermediaries: BTreeSet<Fingerprint>,
-    assignments: BTreeMap<PublicationId, Fingerprint>,
+    trusted_group: BTreeSet<Fingerprint>,
     records: BTreeMap<PublicationId, Record>,
+    /// Callers that have bound each identity, so losing admission reads as
+    /// Revoked rather than as an identity that never existed.
+    bound: BTreeSet<(Fingerprint, PublicationId)>,
     runtime: Option<Hosting>,
     failed: bool,
     watchers: Vec<(Fingerprint, mpsc::UnboundedSender<Vec<Publication>>)>,
@@ -58,13 +60,13 @@ impl MemoryTender {
             inner: Arc::new(Mutex::new(State {
                 host,
                 now: 0,
-                next_id: 1,
                 grants: BTreeMap::new(),
                 browse: BTreeSet::new(),
                 connect: BTreeSet::new(),
                 intermediaries: BTreeSet::new(),
-                assignments: BTreeMap::new(),
+                trusted_group: BTreeSet::new(),
                 records: BTreeMap::new(),
+                bound: BTreeSet::new(),
                 runtime: None,
                 failed: false,
                 watchers: Vec::new(),
@@ -80,21 +82,11 @@ impl MemoryTender {
         {
             let mut state = authority.inner.lock().expect("state lock");
             if let Some(bytes) = store.load()? {
-                let stored: Stored = serde_json::from_slice(&bytes).map_err(std_io::Error::other)?;
-                if stored.version != 1 || stored.host != host {
-                    return Err(std_io::Error::other("unsupported Tender store version or host identity mismatch"));
-                }
-                if stored.next_id == 0
-                    || stored.records.iter().any(|record| {
-                        record.publication.id.0 == 0 || record.publication.id.0 >= stored.next_id || record.publication.generation == 0
-                    })
-                    || stored.records.iter().map(|record| record.publication.id).collect::<BTreeSet<_>>().len() != stored.records.len()
-                {
-                    return Err(std_io::Error::other("invalid Tender identity counters"));
+                let stored = Stored::decode(&bytes)?;
+                if stored.host != host {
+                    return Err(std_io::Error::other("Tender store belongs to a different host identity"));
                 }
                 let invalid_clock = stored.clock.epoch != reading.epoch || reading.tick < stored.clock.tick;
-                state.now = reading.tick;
-                state.next_id = stored.next_id;
                 state.grants = stored
                     .grants
                     .into_iter()
@@ -102,13 +94,13 @@ impl MemoryTender {
                         if invalid_clock {
                             grant.expires_at = 0;
                         }
-                        ((grant.grantee.clone(), grant.namespace.clone()), grant)
+                        ((grant.grantee.clone(), grant.scope.clone()), grant)
                     })
                     .collect();
                 state.browse = stored.browse;
                 state.connect = stored.connect;
                 state.intermediaries = stored.intermediaries;
-                state.assignments = stored.assignments.into_iter().collect();
+                state.trusted_group = stored.trusted_group;
                 state.records = stored
                     .records
                     .into_iter()
@@ -120,7 +112,7 @@ impl MemoryTender {
                             record.publication.availability = Availability::Unavailable;
                         }
                         (
-                            record.publication.id,
+                            record.publication.id.clone(),
                             Record {
                                 publication: record.publication,
                                 requested_audience: record.requested_audience,
@@ -175,12 +167,6 @@ impl MemoryTender {
         Ok(state)
     }
 
-    /// Authorization and current reachability without opening application data.
-    #[cfg(unix)]
-    pub(crate) fn check_connect(&self, session: &Session, id: PublicationId) -> Result<(), Error> {
-        self.state()?.record_for_connect(session, id).map(|_| ())
-    }
-
     /// Admission to be forwarded through this instance: the authenticated
     /// caller needs connect authority, as for any stream it opens here.
     #[cfg(unix)]
@@ -222,28 +208,23 @@ impl MemoryTender {
 
     pub fn grant(&self, grant: Grant) -> Result<(), Error> {
         let mut state = self.state()?;
-        state.grants.insert((grant.grantee.clone(), grant.namespace.clone()), grant.clone());
-        let current = grant;
-        let now = state.now;
-        for record in state.records.values_mut() {
-            if record.publication.publisher == current.grantee
-                && record.publication.namespace == current.namespace
-                && record.publication.availability != Availability::Withdrawn
-            {
-                record.expires_at = current.expires_at;
-                record.publication.audience = record.requested_audience.intersection(&current.audience_ceiling).cloned().collect();
-                for stream in &record.streams {
-                    if !record.publication.audience.contains(&stream.caller) {
-                        stream.task.abort();
-                    }
-                }
-                record.streams.retain(|stream| !stream.task.is_finished());
-                if current.expires_at <= now {
-                    retire(record, false);
-                }
-            }
-        }
+        state.grants.insert((grant.grantee.clone(), grant.scope.clone()), grant);
+        state.reaudience();
         state.notify()
+    }
+
+    /// The instances acting for this host's person. A publication that names
+    /// no audience gets this group, and the host's own publications cannot
+    /// reach beyond it.
+    pub fn set_trusted_group(&self, group: BTreeSet<Fingerprint>) -> Result<(), Error> {
+        let mut state = self.state()?;
+        state.trusted_group = group;
+        state.reaudience();
+        state.notify()
+    }
+
+    pub fn trusted_group(&self) -> BTreeSet<Fingerprint> {
+        self.inner.lock().expect("state lock").trusted_group.clone()
     }
 
     pub fn allow_browse(&self, caller: Fingerprint) -> Result<(), Error> {
@@ -262,19 +243,12 @@ impl MemoryTender {
         state.notify()
     }
 
-    /// Continuity for a replacement helper requires an explicit host-side assignment.
-    pub fn assign_replacement(&self, id: PublicationId, replacement: Fingerprint) -> Result<(), Error> {
-        let mut state = self.state()?;
-        state.assignments.insert(id, replacement);
-        state.notify()
-    }
-
     /// Revocation stops new connections and forcibly closes established streams.
-    pub fn revoke(&self, grantee: &Fingerprint, namespace: &Namespace) -> Result<(), Error> {
+    pub fn revoke(&self, grantee: &Fingerprint, scope: &Scope) -> Result<(), Error> {
         let mut state = self.state()?;
-        state.grants.remove(&(grantee.clone(), namespace.clone()));
+        state.grants.remove(&(grantee.clone(), scope.clone()));
         for record in state.records.values_mut() {
-            if &record.publication.publisher == grantee && &record.publication.namespace == namespace {
+            if &record.publication.publisher == grantee && &record.publication.id.scope == scope {
                 retire(record, true);
             }
         }
@@ -303,10 +277,23 @@ impl MemoryTender {
     }
 }
 
+fn endpoint(host: &Fingerprint, id: &PublicationId) -> String {
+    format!("memory:{}/{id}", host.0)
+}
+
 fn abort_streams(record: &mut Record) {
     for stream in record.streams.drain(..) {
         stream.task.abort();
     }
+}
+
+fn close_streams_of(record: &mut Record, closes: impl Fn(&OpenStream) -> bool) {
+    for stream in &record.streams {
+        if closes(stream) {
+            stream.task.abort();
+        }
+    }
+    record.streams.retain(|stream| !stream.task.is_finished());
 }
 
 fn retire(record: &mut Record, abort: bool) {
@@ -325,11 +312,35 @@ struct Hosting {
     epoch: String,
 }
 
-// Version 1 is the first durable Tender shape. Future generations must decode
-// this shape, as `tests/fixtures/authority-v1.json` pins; wire records remain independent of storage versioning.
+// Version 2 keys publications by scope and name. Future generations must
+// decode both this and version 1, as `tests/fixtures/authority-v1.json` and
+// `authority-v2.json` pin; wire records remain independent of storage versioning.
 #[derive(Serialize, Deserialize)]
 struct Stored {
     version: u32,
+    host: Fingerprint,
+    clock: ClockReading,
+    grants: Vec<Grant>,
+    browse: BTreeSet<Fingerprint>,
+    connect: BTreeSet<Fingerprint>,
+    intermediaries: BTreeSet<Fingerprint>,
+    trusted_group: BTreeSet<Fingerprint>,
+    records: Vec<StoredRecord>,
+}
+#[derive(Serialize, Deserialize)]
+struct StoredRecord {
+    publication: Publication,
+    requested_audience: Option<BTreeSet<Fingerprint>>,
+    expires_at: u64,
+}
+
+/// Version 1 assigned numeric identities and allowed several to share a
+/// scope and name. Each name keeps its latest record, at the highest
+/// generation any of them reached, so no generation is ever reissued.
+/// Replacement assignments are dropped: a grant for the scope now admits a
+/// takeover.
+#[derive(Deserialize)]
+struct StoredV1 {
     host: Fingerprint,
     clock: ClockReading,
     next_id: u64,
@@ -337,14 +348,88 @@ struct Stored {
     browse: BTreeSet<Fingerprint>,
     connect: BTreeSet<Fingerprint>,
     intermediaries: BTreeSet<Fingerprint>,
-    assignments: Vec<(PublicationId, Fingerprint)>,
-    records: Vec<StoredRecord>,
+    records: Vec<StoredRecordV1>,
 }
-#[derive(Serialize, Deserialize)]
-struct StoredRecord {
-    publication: Publication,
+#[derive(Deserialize)]
+struct StoredRecordV1 {
+    publication: PublicationV1,
     requested_audience: BTreeSet<Fingerprint>,
     expires_at: u64,
+}
+#[derive(Deserialize)]
+struct PublicationV1 {
+    id: u64,
+    namespace: Scope,
+    name: String,
+    publisher: Fingerprint,
+    audience: BTreeSet<Fingerprint>,
+    generation: u64,
+    availability: Availability,
+}
+
+impl Stored {
+    fn decode(bytes: &[u8]) -> std_io::Result<Self> {
+        #[derive(Deserialize)]
+        struct Version {
+            version: u32,
+        }
+        let invalid = |message: &str| std_io::Error::other(message.to_owned());
+        let stored = match serde_json::from_slice::<Version>(bytes).map_err(std_io::Error::other)?.version {
+            1 => Self::from_v1(serde_json::from_slice(bytes).map_err(std_io::Error::other)?)?,
+            2 => serde_json::from_slice::<Self>(bytes).map_err(std_io::Error::other)?,
+            _ => return Err(invalid("unsupported Tender store version")),
+        };
+        if stored.records.iter().any(|record| record.publication.generation == 0)
+            || stored.records.iter().map(|record| &record.publication.id).collect::<BTreeSet<_>>().len() != stored.records.len()
+        {
+            return Err(invalid("invalid Tender publication identities"));
+        }
+        Ok(stored)
+    }
+
+    fn from_v1(stored: StoredV1) -> std_io::Result<Self> {
+        if stored.next_id == 0
+            || stored
+                .records
+                .iter()
+                .any(|record| record.publication.id == 0 || record.publication.id >= stored.next_id || record.publication.generation == 0)
+            || stored.records.iter().map(|record| record.publication.id).collect::<BTreeSet<_>>().len() != stored.records.len()
+        {
+            return Err(std_io::Error::other("invalid Tender identity counters"));
+        }
+        let mut records = stored.records;
+        records.sort_by_key(|record| record.publication.id);
+        let mut by_identity: BTreeMap<PublicationId, StoredRecord> = BTreeMap::new();
+        for record in records {
+            let old = record.publication;
+            let id = PublicationId { scope: old.namespace, name: old.name };
+            let generation = by_identity.get(&id).map_or(old.generation, |prior| prior.publication.generation.max(old.generation));
+            let publication = Publication {
+                id: id.clone(),
+                label: Label::default(),
+                display: String::new(),
+                publisher: old.publisher,
+                audience: old.audience,
+                generation,
+                availability: old.availability,
+            };
+            by_identity.insert(
+                id,
+                StoredRecord { publication, requested_audience: Some(record.requested_audience), expires_at: record.expires_at },
+            );
+        }
+        Ok(Self {
+            version: 2,
+            host: stored.host,
+            clock: stored.clock,
+            grants: stored.grants,
+            browse: stored.browse,
+            connect: stored.connect,
+            intermediaries: stored.intermediaries,
+            trusted_group: BTreeSet::new(),
+            records: by_identity.into_values().collect(),
+        })
+    }
 }
 
 impl State {
@@ -368,15 +453,14 @@ impl State {
             return Ok(());
         };
         let stored = Stored {
-            version: 1,
+            version: 2,
             host: self.host.clone(),
             clock: ClockReading { epoch: runtime.epoch.clone(), tick: self.now },
-            next_id: self.next_id,
             grants: self.grants.values().cloned().collect(),
             browse: self.browse.clone(),
             connect: self.connect.clone(),
             intermediaries: self.intermediaries.clone(),
-            assignments: self.assignments.iter().map(|(id, publisher)| (*id, publisher.clone())).collect(),
+            trusted_group: self.trusted_group.clone(),
             records: self
                 .records
                 .values()
@@ -400,6 +484,44 @@ impl State {
             return Err(Error::Storage);
         }
         Ok(())
+    }
+
+    /// The host publishes under any scope on its own authority, within its
+    /// Trusted Group and without expiry; every other publisher needs a grant.
+    fn ceiling(&self, publisher: &Fingerprint, scope: &Scope) -> Option<(BTreeSet<Fingerprint>, u64)> {
+        if publisher == &self.host {
+            return Some((self.trusted_group.clone(), u64::MAX));
+        }
+        self.grants.get(&(publisher.clone(), scope.clone())).map(|grant| (grant.audience_ceiling.clone(), grant.expires_at))
+    }
+
+    fn audience(&self, requested: &Option<BTreeSet<Fingerprint>>, ceiling: &BTreeSet<Fingerprint>) -> BTreeSet<Fingerprint> {
+        requested.as_ref().unwrap_or(&self.trusted_group).intersection(ceiling).cloned().collect()
+    }
+
+    /// Recompute every live record from its publisher's current ceiling, closing
+    /// streams whose callers fall outside the narrowed audience.
+    fn reaudience(&mut self) {
+        let now = self.now;
+        let updates: Vec<_> = self
+            .records
+            .iter()
+            .filter(|(_, record)| record.publication.availability != Availability::Withdrawn)
+            .filter_map(|(id, record)| {
+                let (ceiling, expires_at) = self.ceiling(&record.publication.publisher, &id.scope)?;
+                Some((id.clone(), self.audience(&record.requested_audience, &ceiling), expires_at))
+            })
+            .collect();
+        for (id, audience, expires_at) in updates {
+            let record = self.records.get_mut(&id).expect("record collected above");
+            record.expires_at = expires_at;
+            record.publication.audience = audience;
+            let audience = record.publication.audience.clone();
+            close_streams_of(record, |stream| !audience.contains(&stream.caller));
+            if expires_at <= now {
+                retire(record, false);
+            }
+        }
     }
 
     fn authenticate(&self, session: &Session) -> Result<(), Error> {
@@ -436,12 +558,12 @@ impl State {
             .collect();
     }
 
-    fn record_for_connect(&mut self, session: &Session, id: PublicationId) -> Result<&mut Record, Error> {
+    fn record_for_connect(&mut self, session: &Session, id: &PublicationId) -> Result<&mut Record, Error> {
         self.authenticate(session)?;
         if !self.connect.contains(&session.caller) {
             return Err(Error::Denied);
         }
-        let record = self.records.get_mut(&id).ok_or(Error::Denied)?;
+        let record = self.records.get_mut(id).ok_or(Error::Denied)?;
         if !record.publication.audience.contains(&session.caller) {
             return Err(Error::Denied);
         }
@@ -476,59 +598,36 @@ impl Tender for MemoryTender {
     async fn publish(&self, session: &Session, request: PublishRequest) -> Result<Published, Error> {
         let mut state = self.state()?;
         state.authenticate(session)?;
-        let grant = state.grants.get(&(session.caller.clone(), request.namespace.clone())).ok_or(Error::Denied)?.clone();
-        if grant.expires_at <= state.now {
+        let (ceiling, expires_at) = state.ceiling(&session.caller, &request.id.scope).ok_or(Error::Denied)?;
+        if expires_at <= state.now {
             return Err(Error::GrantExpired);
         }
-        let audience = request.audience.intersection(&grant.audience_ceiling).cloned().collect();
+        let audience = state.audience(&request.audience, &ceiling);
+        let generation = match state.records.get(&request.id) {
+            Some(record) if record.publication.availability == Availability::Available => return Err(Error::LivePublisher),
+            Some(record) => record.publication.generation.checked_add(1).ok_or(Error::Storage)?,
+            None => 1,
+        };
         let (sender, incoming) = mpsc::unbounded_channel();
         let closure_sender = sender.clone();
-        let lease = if let Some(id) = request.reclaim {
-            let assigned = state.assignments.get(&id) == Some(&session.caller);
-            let record = state.records.get_mut(&id).ok_or(Error::Denied)?;
-            if record.publication.namespace != request.namespace || (record.publication.publisher != session.caller && !assigned) {
-                return Err(Error::Denied);
-            }
-            if record.publication.availability == Availability::Withdrawn {
-                return Err(Error::Withdrawn);
-            }
-            if record.publication.availability == Availability::Available {
-                return Err(Error::LivePublisher);
-            }
-            let generation = record.publication.generation.checked_add(1).ok_or(Error::Storage)?;
-            record.publication.publisher = session.caller.clone();
-            record.publication.name = request.name;
-            record.requested_audience = request.audience;
-            record.publication.audience = audience;
-            record.publication.generation = generation;
-            record.publication.availability = Availability::Available;
-            record.expires_at = grant.expires_at;
-            record.sender = Some(sender);
-            Lease { id, generation: record.publication.generation, publisher: session.caller.clone() }
-        } else {
-            let id = PublicationId(state.next_id);
-            state.next_id = state.next_id.checked_add(1).ok_or(Error::Storage)?;
-            let publication = Publication {
-                id,
-                namespace: request.namespace,
-                name: request.name,
-                publisher: session.caller.clone(),
-                audience,
-                generation: 1,
-                availability: Availability::Available,
-            };
-            state.records.insert(
-                id,
-                Record {
-                    publication,
-                    requested_audience: request.audience,
-                    expires_at: grant.expires_at,
-                    sender: Some(sender),
-                    streams: Vec::new(),
-                },
-            );
-            Lease { id, generation: 1, publisher: session.caller.clone() }
+        let publication = Publication {
+            id: request.id.clone(),
+            label: request.label,
+            display: request.display,
+            publisher: session.caller.clone(),
+            audience,
+            generation,
+            availability: Availability::Available,
         };
+        // A takeover keeps nothing from the previous generation: its streams
+        // stayed on the old route and broke with it.
+        if let Some(mut previous) = state.records.insert(
+            request.id.clone(),
+            Record { publication, requested_audience: request.audience, expires_at, sender: Some(sender), streams: Vec::new() },
+        ) {
+            abort_streams(&mut previous);
+        }
+        let lease = Lease { id: request.id, generation, publisher: session.caller.clone() };
         state.notify()?;
         drop(state);
         let inner = self.inner.clone();
@@ -573,7 +672,7 @@ impl Tender for MemoryTender {
         Ok(receiver)
     }
 
-    async fn connect(&self, session: &Session, id: PublicationId) -> Result<ByteStream, Error> {
+    async fn connect(&self, session: &Session, id: &PublicationId) -> Result<ByteStream, Error> {
         let mut state = self.state()?;
         let record = state.record_for_connect(session, id)?;
         let sender = record.sender.as_ref().ok_or(Error::Unavailable)?;
@@ -590,24 +689,32 @@ impl Tender for MemoryTender {
         Ok(Box::new(client))
     }
 
-    async fn expose_local(&self, session: &Session, id: PublicationId) -> Result<Exposure, Error> {
-        let state = self.state()?;
+    async fn bind(&self, session: &Session, id: &PublicationId) -> Result<Binding, Error> {
+        let mut state = self.state()?;
+        let state = &mut *state;
         state.authenticate(session)?;
-        if !state.connect.contains(&session.caller) {
-            return Err(Error::Denied);
+        let key = (session.caller.clone(), id.clone());
+        let admitted = state.connect.contains(&session.caller)
+            && state.records.get(id).is_some_and(|record| record.publication.audience.contains(&session.caller));
+        let route = Route { instance: state.host.clone(), via: session.via.clone() };
+        if !admitted {
+            return if state.bound.contains(&key) {
+                Ok(Binding { publication: id.clone(), local_endpoint: endpoint(&state.host, id), state: BindingState::Revoked })
+            } else {
+                Err(Error::Denied)
+            };
         }
-        let record = state.records.get(&id).ok_or(Error::Denied)?;
-        if !record.publication.audience.contains(&session.caller) {
-            return Err(Error::Denied);
-        }
-        Ok(Exposure { host: state.host.clone(), publication: id, local_name: format!("tender-{}-{}", state.host.0, id.0) })
+        state.bound.insert(key);
+        let binding_state = match state.records[id].publication.availability {
+            Availability::Available => BindingState::Available { route },
+            Availability::Unavailable => BindingState::Unavailable { reason: UnavailableReason::PublisherUnavailable, route: Some(route) },
+            Availability::Withdrawn => BindingState::Unavailable { reason: UnavailableReason::Withdrawn, route: Some(route) },
+        };
+        Ok(Binding { publication: id.clone(), local_endpoint: endpoint(&state.host, id), state: binding_state })
     }
 
-    async fn open_exposure(&self, session: &Session, exposure: &Exposure) -> Result<ByteStream, Error> {
-        if session.pinned_host != exposure.host {
-            return Err(Error::IdentityMismatch);
-        }
-        self.connect(session, exposure.publication).await
+    async fn open_binding(&self, session: &Session, binding: &Binding) -> Result<ByteStream, Error> {
+        self.connect(session, &binding.publication).await
     }
 
     async fn disconnect(&self, session: &Session, lease: &Lease) -> Result<(), Error> {

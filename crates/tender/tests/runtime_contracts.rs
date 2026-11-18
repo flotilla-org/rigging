@@ -6,7 +6,7 @@ use std::{
 };
 
 use tender::{
-    Availability, Error, Fingerprint, Grant, Namespace, PublicationId, PublishRequest, Session, Tender,
+    Availability, Error, Fingerprint, Grant, Label, PublicationId, PublishRequest, Scope, Session, Tender,
     memory::MemoryTender,
     runtime::{Clock, ClockReading, MemoryStore, Store},
 };
@@ -116,18 +116,18 @@ impl Rig {
         self.authority
             .grant(Grant {
                 grantee: self.session.caller.clone(),
-                namespace: Namespace("n".into()),
+                scope: Scope("n".into()),
                 audience_ceiling: BTreeSet::from([self.session.caller.clone()]),
                 expires_at: expiry,
             })
             .unwrap();
     }
-    fn request(&self, reclaim: Option<PublicationId>) -> PublishRequest {
+    fn request(&self, name: &str) -> PublishRequest {
         PublishRequest {
-            namespace: Namespace("n".into()),
-            name: "same name".into(),
-            audience: BTreeSet::from([self.session.caller.clone()]),
-            reclaim,
+            id: PublicationId::new("n", name),
+            label: Label("echo".into()),
+            display: name.into(),
+            audience: Some(BTreeSet::from([self.session.caller.clone()])),
         }
     }
 }
@@ -136,54 +136,54 @@ impl Rig {
 // with no publisher activity. Expiry grandfathers streams; later revocation severs them.
 async fn expiry(mut rig: Rig) {
     rig.authorize(10);
-    let mut published = rig.client.publish(&rig.session, rig.request(None)).await.unwrap();
-    let mut held = rig.client.connect(&rig.session, published.lease.id).await.unwrap();
+    let mut published = rig.client.publish(&rig.session, rig.request("service")).await.unwrap();
+    let mut held = rig.client.connect(&rig.session, &published.lease.id).await.unwrap();
     let mut service = timeout(Duration::from_secs(2), published.incoming.recv()).await.unwrap().unwrap();
     rig.clock.set(9);
-    assert!(rig.client.connect(&rig.session, published.lease.id).await.is_ok());
+    assert!(rig.client.connect(&rig.session, &published.lease.id).await.is_ok());
     rig.clock.set(10);
-    assert!(matches!(rig.client.connect(&rig.session, published.lease.id).await, Err(Error::Withdrawn)));
-    assert!(matches!(rig.client.publish(&rig.session, rig.request(None)).await, Err(Error::GrantExpired)));
+    assert!(matches!(rig.client.connect(&rig.session, &published.lease.id).await, Err(Error::Withdrawn)));
+    assert!(matches!(rig.client.publish(&rig.session, rig.request("service")).await, Err(Error::GrantExpired)));
     held.write_all(b"after expiry").await.unwrap();
     let mut bytes = [0; 12];
     timeout(Duration::from_secs(2), service.read_exact(&mut bytes)).await.unwrap().unwrap();
     assert_eq!(&bytes, b"after expiry");
-    rig.authority.revoke(&rig.session.caller, &Namespace("n".into())).unwrap();
+    rig.authority.revoke(&rig.session.caller, &Scope("n".into())).unwrap();
     let mut byte = [0];
     let closed = timeout(Duration::from_secs(2), held.read(&mut byte)).await.unwrap();
     assert!(matches!(closed, Ok(0)) || closed.is_err());
     rig.reload();
     assert_eq!(rig.client.browse(&rig.session).await.unwrap()[0].availability, Availability::Withdrawn);
-    assert!(matches!(rig.client.publish(&rig.session, rig.request(None)).await, Err(Error::Denied)));
+    assert!(matches!(rig.client.publish(&rig.session, rig.request("service")).await, Err(Error::Denied)));
 }
 
-// Restart restores authority, grants, assignment, retired and reserved identity,
-// and counters, but never a live route. Reclaim changes generation, not identity.
+// Restart restores authority, grants, retired and reserved identities and
+// their generations, but never a live route. Publishing an identity again
+// changes its generation, not the identity.
 async fn restart(mut rig: Rig) {
     rig.authorize(10);
-    let first = rig.client.publish(&rig.session, rig.request(None)).await.unwrap();
-    let mut held = rig.client.connect(&rig.session, first.lease.id).await.unwrap();
-    let withdrawn = rig.client.publish(&rig.session, rig.request(None)).await.unwrap();
+    let first = rig.client.publish(&rig.session, rig.request("service")).await.unwrap();
+    let mut held = rig.client.connect(&rig.session, &first.lease.id).await.unwrap();
+    let withdrawn = rig.client.publish(&rig.session, rig.request("retired")).await.unwrap();
     rig.client.withdraw(&rig.session, &withdrawn.lease).await.unwrap();
-    rig.authority.assign_replacement(first.lease.id, Fingerprint("replacement".into())).unwrap();
     rig.clock.set(9);
     rig.reload();
     let mut byte = [0];
     let closed = timeout(Duration::from_secs(2), held.read(&mut byte)).await.unwrap();
     assert!(matches!(closed, Ok(0)) || closed.is_err());
     let snapshot = rig.client.browse(&rig.session).await.unwrap();
-    assert_eq!(snapshot[0].id, first.lease.id);
-    assert_eq!(snapshot[0].availability, Availability::Unavailable);
-    assert_eq!(snapshot[1].availability, Availability::Withdrawn);
-    assert!(matches!(rig.client.connect(&rig.session, first.lease.id).await, Err(Error::Unavailable)));
-    let reclaimed = rig.client.publish(&rig.session, rig.request(Some(first.lease.id))).await.unwrap();
-    assert_eq!(reclaimed.lease.generation, first.lease.generation + 1);
-    let fresh = rig.client.publish(&rig.session, rig.request(None)).await.unwrap();
-    assert!(fresh.lease.id > withdrawn.lease.id);
+    let state = |id: &PublicationId| snapshot.iter().find(|publication| &publication.id == id).unwrap().availability;
+    assert_eq!(state(&first.lease.id), Availability::Unavailable);
+    assert_eq!(state(&withdrawn.lease.id), Availability::Withdrawn);
+    assert!(matches!(rig.client.connect(&rig.session, &first.lease.id).await, Err(Error::Unavailable)));
+    let republished = rig.client.publish(&rig.session, rig.request("service")).await.unwrap();
+    assert_eq!((republished.lease.id, republished.lease.generation), (first.lease.id, first.lease.generation + 1));
+    let retaken = rig.client.publish(&rig.session, rig.request("retired")).await.unwrap();
+    assert_eq!(retaken.lease.generation, withdrawn.lease.generation + 1);
     rig.clock.set(10);
     rig.reload();
     assert!(rig.client.browse(&rig.session).await.unwrap().iter().all(|record| record.availability == Availability::Withdrawn));
-    assert!(matches!(rig.client.publish(&rig.session, rig.request(None)).await, Err(Error::GrantExpired)));
+    assert!(matches!(rig.client.publish(&rig.session, rig.request("service")).await, Err(Error::GrantExpired)));
 }
 
 macro_rules! contract {
@@ -219,7 +219,7 @@ fn expiry_never_resurrects(tc: hegel::TestCase) {
     tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
         let mut rig = Rig::new(false, false);
         rig.authorize(10);
-        let published = rig.client.publish(&rig.session, rig.request(None)).await.unwrap();
+        let published = rig.client.publish(&rig.session, rig.request("service")).await.unwrap();
         let mut prior = 0;
         let mut retired = false;
         for (tick, reload) in steps {
@@ -231,7 +231,7 @@ fn expiry_never_resurrects(tc: hegel::TestCase) {
             let state = rig.client.browse(&rig.session).await.unwrap()[0].availability;
             assert_eq!(state == Availability::Withdrawn, retired);
             if retired {
-                assert!(matches!(rig.client.connect(&rig.session, published.lease.id).await, Err(Error::Withdrawn)));
+                assert!(matches!(rig.client.connect(&rig.session, &published.lease.id).await, Err(Error::Withdrawn)));
             }
             prior = if reload { tick } else { prior.max(tick) };
         }
@@ -253,42 +253,43 @@ fn failed_initial_save_refuses_hosting() {
     assert!(MemoryTender::hosted(Fingerprint("host".into()), Arc::new(ManualClock::new()), Arc::new(FailingStore)).is_err());
 }
 
-// Version 1 is the first durable generation; keep this fixture unchanged when
-// adding N+1 fields. Policy, relay trust and explicit assignments must reload.
+// Keep both fixtures unchanged when adding fields. Version 1's numeric
+// identities become scope and name; its replacement assignments give way to
+// grants. Policy, relay trust and generations must reload from either.
 #[tokio::test]
-async fn stored_v1_remains_decodable() {
-    let store = Arc::new(MemoryStore::default());
-    store.save(include_bytes!("fixtures/authority-v1.json")).unwrap();
-    let clock = Arc::new(ManualClock::new());
-    clock.set(9);
-    let host = Fingerprint("host".into());
-    let authority = MemoryTender::hosted(host.clone(), clock.clone(), store.clone()).unwrap();
-    let consumer = Session { caller: Fingerprint("consumer".into()), pinned_host: host.clone(), via: Some(Fingerprint("relay".into())) };
-    assert_eq!(authority.browse(&consumer).await.unwrap()[0].generation, 7);
-    let publisher = Session { caller: Fingerprint("replacement".into()), pinned_host: host, via: None };
-    authority
-        .grant(Grant {
-            grantee: publisher.caller.clone(),
-            namespace: Namespace("n".into()),
-            audience_ceiling: BTreeSet::from([consumer.caller.clone()]),
-            expires_at: 10,
-        })
-        .unwrap();
-    let published = authority
-        .publish(
-            &publisher,
-            PublishRequest {
-                namespace: Namespace("n".into()),
-                name: "assigned".into(),
-                audience: BTreeSet::from([consumer.caller.clone()]),
-                reclaim: Some(PublicationId(1)),
-            },
-        )
-        .await
-        .unwrap();
-    assert_eq!(published.lease.generation, 8);
-    assert!(authority.connect(&consumer, published.lease.id).await.is_ok());
-    assert!(MemoryTender::hosted(Fingerprint("different".into()), clock, store).is_err());
+async fn stored_v1_and_v2_remain_decodable() {
+    for fixture in [include_bytes!("fixtures/authority-v1.json").as_slice(), include_bytes!("fixtures/authority-v2.json")] {
+        let store = Arc::new(MemoryStore::default());
+        store.save(fixture).unwrap();
+        let clock = Arc::new(ManualClock::new());
+        clock.set(9);
+        let host = Fingerprint("host".into());
+        let authority = MemoryTender::hosted(host.clone(), clock.clone(), store.clone()).unwrap();
+        let consumer =
+            Session { caller: Fingerprint("consumer".into()), pinned_host: host.clone(), via: Some(Fingerprint("relay".into())) };
+        let service = PublicationId::new("n", "service");
+        let visible = authority.browse(&consumer).await.unwrap();
+        assert_eq!(visible.iter().find(|publication| publication.id == service).unwrap().generation, 7);
+        let publisher = Session { caller: Fingerprint("replacement".into()), pinned_host: host, via: None };
+        authority
+            .grant(Grant {
+                grantee: publisher.caller.clone(),
+                scope: Scope("n".into()),
+                audience_ceiling: BTreeSet::from([consumer.caller.clone()]),
+                expires_at: 10,
+            })
+            .unwrap();
+        let request = PublishRequest {
+            id: service.clone(),
+            label: Label("echo".into()),
+            display: "taken over".into(),
+            audience: Some(BTreeSet::from([consumer.caller.clone()])),
+        };
+        let published = authority.publish(&publisher, request).await.unwrap();
+        assert_eq!(published.lease.generation, 8);
+        assert!(authority.connect(&consumer, &published.lease.id).await.is_ok());
+        assert!(MemoryTender::hosted(Fingerprint("different".into()), clock, store).is_err());
+    }
 }
 
 // Epoch replacement and rollback both expire grants on reload, including tick
@@ -298,7 +299,7 @@ async fn changed_epoch_and_backward_clock_expire_on_reload() {
     for changed_epoch in [false, true] {
         let mut rig = Rig::new(false, false);
         rig.authorize(100);
-        let published = rig.client.publish(&rig.session, rig.request(None)).await.unwrap();
+        let published = rig.client.publish(&rig.session, rig.request("service")).await.unwrap();
         rig.clock.set(50);
         rig.authority.browse(&rig.session).await.unwrap();
         if changed_epoch {
@@ -308,8 +309,8 @@ async fn changed_epoch_and_backward_clock_expire_on_reload() {
         }
         rig.reload();
         assert_eq!(rig.client.browse(&rig.session).await.unwrap()[0].availability, Availability::Withdrawn);
-        assert!(matches!(rig.client.connect(&rig.session, published.lease.id).await, Err(Error::Withdrawn)));
-        assert!(matches!(rig.client.publish(&rig.session, rig.request(None)).await, Err(Error::GrantExpired)));
+        assert!(matches!(rig.client.connect(&rig.session, &published.lease.id).await, Err(Error::Withdrawn)));
+        assert!(matches!(rig.client.publish(&rig.session, rig.request("service")).await, Err(Error::GrantExpired)));
     }
 }
 
@@ -337,13 +338,13 @@ async fn storage_failure_closes_streams_and_refuses_new_work() {
     rig.authority = MemoryTender::hosted(rig.session.pinned_host.clone(), rig.clock.clone(), store.clone()).unwrap();
     rig.attach();
     rig.authorize(10);
-    let mut published = rig.client.publish(&rig.session, rig.request(None)).await.unwrap();
-    let mut stream = rig.client.connect(&rig.session, published.lease.id).await.unwrap();
+    let mut published = rig.client.publish(&rig.session, rig.request("service")).await.unwrap();
+    let mut stream = rig.client.connect(&rig.session, &published.lease.id).await.unwrap();
     let _service = published.incoming.recv().await.unwrap();
     store.fail.store(true, std::sync::atomic::Ordering::SeqCst);
     assert_eq!(rig.authority.allow_connect(Fingerprint("other".into())), Err(Error::Storage));
-    assert!(matches!(rig.client.publish(&rig.session, rig.request(None)).await, Err(Error::Storage)));
-    assert!(matches!(rig.client.connect(&rig.session, published.lease.id).await, Err(Error::Storage)));
+    assert!(matches!(rig.client.publish(&rig.session, rig.request("service")).await, Err(Error::Storage)));
+    assert!(matches!(rig.client.connect(&rig.session, &published.lease.id).await, Err(Error::Storage)));
     let mut byte = [0];
     assert_eq!(timeout(Duration::from_secs(2), stream.read(&mut byte)).await.unwrap().unwrap(), 0);
 }
@@ -379,13 +380,13 @@ async fn durable_server_open_preserves_identity_and_refuses_competing_store() {
     assert_eq!(std::fs::read(directory.path().join("authority.json")).unwrap(), b"broken");
 }
 
-// A reserved identity admits exactly one concurrent reclaim. Both adapters
+// A reserved identity admits exactly one concurrent republish. Both adapters
 // serialize admission and durable generation updates through the same authority.
 async fn concurrent_reclaim(mut rig: Rig) {
     rig.authorize(100);
-    let published = rig.client.publish(&rig.session, rig.request(None)).await.unwrap();
+    let published = rig.client.publish(&rig.session, rig.request("service")).await.unwrap();
     rig.reload();
-    let request = rig.request(Some(published.lease.id));
+    let request = rig.request("service");
     let (one, two) = tokio::join!(rig.client.publish(&rig.session, request.clone()), rig.client.publish(&rig.session, request));
     let winner = match (one, two) {
         (Ok(winner), Err(Error::LivePublisher)) | (Err(Error::LivePublisher), Ok(winner)) => winner,
@@ -409,35 +410,42 @@ contract!(socket_file_concurrent_reclaim, concurrent_reclaim, true, true);
 async fn zero_maximum_and_renewal_boundaries() {
     let rig = Rig::new(false, false);
     rig.authorize(0);
-    assert!(matches!(rig.client.publish(&rig.session, rig.request(None)).await, Err(Error::GrantExpired)));
+    assert!(matches!(rig.client.publish(&rig.session, rig.request("service")).await, Err(Error::GrantExpired)));
     rig.authorize(10);
-    let published = rig.client.publish(&rig.session, rig.request(None)).await.unwrap();
+    let published = rig.client.publish(&rig.session, rig.request("service")).await.unwrap();
     rig.clock.set(9);
     rig.authorize(u64::MAX);
     rig.clock.set(10);
-    assert!(rig.client.connect(&rig.session, published.lease.id).await.is_ok());
+    assert!(rig.client.connect(&rig.session, &published.lease.id).await.is_ok());
     rig.clock.set(u64::MAX);
-    assert!(matches!(rig.client.connect(&rig.session, published.lease.id).await, Err(Error::Withdrawn)));
-    assert!(matches!(rig.client.publish(&rig.session, rig.request(None)).await, Err(Error::GrantExpired)));
+    assert!(matches!(rig.client.connect(&rig.session, &published.lease.id).await, Err(Error::Withdrawn)));
+    assert!(matches!(rig.client.publish(&rig.session, rig.request("service")).await, Err(Error::GrantExpired)));
 }
 
-// Invalid version/counters and duplicate IDs cannot silently reuse a prior
-// publication identity. Failed reloads leave the previous document untouched.
+// Invalid versions, counters, generations and duplicate identities cannot
+// silently reuse a prior publication identity. Failed reloads leave the
+// previous document untouched.
 #[test]
-fn corrupt_identity_counters_and_versions_are_refused() {
-    let original: serde_json::Value = serde_json::from_slice(include_bytes!("fixtures/authority-v1.json")).unwrap();
-    for variant in 0..4 {
-        let mut value = original.clone();
+fn corrupt_identities_and_versions_are_refused() {
+    let v1: serde_json::Value = serde_json::from_slice(include_bytes!("fixtures/authority-v1.json")).unwrap();
+    let v2: serde_json::Value = serde_json::from_slice(include_bytes!("fixtures/authority-v2.json")).unwrap();
+    for variant in 0..6 {
+        let mut value = if variant < 4 { v1.clone() } else { v2.clone() };
         match variant {
-            0 => value["version"] = 2.into(),
+            0 => value["version"] = 3.into(),
             1 => value["next_id"] = 1.into(),
             2 => value["records"][0]["publication"]["generation"] = 0.into(),
-            _ => value["records"][1]["publication"]["id"] = 1.into(),
+            3 => value["records"][1]["publication"]["id"] = 1.into(),
+            4 => value["records"][1]["publication"]["generation"] = 0.into(),
+            _ => value["records"][1]["publication"]["id"] = value["records"][0]["publication"]["id"].clone(),
         }
         let bytes = serde_json::to_vec(&value).unwrap();
         let store = Arc::new(MemoryStore::default());
         store.save(&bytes).unwrap();
-        assert!(MemoryTender::hosted(Fingerprint("host".into()), Arc::new(ManualClock::new()), store.clone()).is_err());
+        assert!(
+            MemoryTender::hosted(Fingerprint("host".into()), Arc::new(ManualClock::new()), store.clone()).is_err(),
+            "variant {variant}"
+        );
         assert_eq!(store.load().unwrap().unwrap(), bytes);
     }
 }
@@ -446,12 +454,12 @@ fn corrupt_identity_counters_and_versions_are_refused() {
 // alive. Restoring the clock alone does not clear the fail-closed latch.
 async fn clock_failure(rig: Rig) {
     rig.authorize(100);
-    let mut published = rig.client.publish(&rig.session, rig.request(None)).await.unwrap();
-    let mut stream = rig.client.connect(&rig.session, published.lease.id).await.unwrap();
+    let mut published = rig.client.publish(&rig.session, rig.request("service")).await.unwrap();
+    let mut stream = rig.client.connect(&rig.session, &published.lease.id).await.unwrap();
     let _service = timeout(Duration::from_secs(2), published.incoming.recv()).await.unwrap().unwrap();
     rig.clock.1.store(true, std::sync::atomic::Ordering::SeqCst);
-    assert!(matches!(rig.client.publish(&rig.session, rig.request(None)).await, Err(Error::Storage)));
-    assert!(matches!(rig.client.connect(&rig.session, published.lease.id).await, Err(Error::Storage)));
+    assert!(matches!(rig.client.publish(&rig.session, rig.request("service")).await, Err(Error::Storage)));
+    assert!(matches!(rig.client.connect(&rig.session, &published.lease.id).await, Err(Error::Storage)));
     let mut byte = [0];
     let closed = timeout(Duration::from_secs(2), stream.read(&mut byte)).await.unwrap();
     assert!(matches!(closed, Ok(0)) || closed.is_err());
