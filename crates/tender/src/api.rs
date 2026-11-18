@@ -36,6 +36,15 @@ pub struct PublishEndpoint {
     pub audience: Option<BTreeSet<Fingerprint>>,
 }
 
+/// `GET /v1/publications`. The epoch changes whenever the daemon starts, and
+/// a start withdraws every publication made through the API, so a publisher
+/// that sees a new epoch publishes again.
+#[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
+pub struct PublicationList {
+    pub epoch: String,
+    pub publications: Vec<PublicationEntry>,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
 pub struct PublicationEntry {
     pub publication: Publication,

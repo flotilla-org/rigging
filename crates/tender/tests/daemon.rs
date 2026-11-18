@@ -3,13 +3,13 @@
 #[path = "common/control.rs"]
 mod control;
 
-use std::{collections::BTreeSet, os::unix::fs::PermissionsExt, path::Path, time::Duration};
+use std::{collections::BTreeSet, fs, os::unix::fs::PermissionsExt, path::Path, time::Duration};
 
 use control::{Control, Format};
 use reqwest::Method;
 use tender::{
-    Availability, Error, Fingerprint, Label, PublicationId, PublishRequest, Session, Tender,
-    api::{self, Instance, PublicationEntry, PublishEndpoint, TrustedInstance, TrustedMember, Untrust},
+    Availability, Error, Fingerprint, Label, PublicationId, PublishRequest, Scope, Session, Tender,
+    api::{self, Instance, PublicationList, PublishEndpoint, TrustedInstance, TrustedMember, Untrust},
     daemon::{Daemon, Paths},
     ssh::{Identity, SshTender},
 };
@@ -17,7 +17,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{UnixListener, UnixStream},
     task::JoinHandle,
-    time::timeout,
+    time::{sleep, timeout},
 };
 
 fn root() -> tempfile::TempDir {
@@ -68,8 +68,8 @@ async fn eventually<F: Future<Output = bool>>(what: &str, mut check: impl FnMut(
 }
 
 async fn state_of(control: &Control, id: &PublicationId) -> Option<(Availability, u64)> {
-    let entries: Vec<PublicationEntry> = control.get(api::PUBLICATIONS).await.expect("publications");
-    entries
+    let list: PublicationList = control.get(api::PUBLICATIONS).await.expect("publications");
+    list.publications
         .into_iter()
         .find(|entry| &entry.publication.id == id)
         .map(|entry| (entry.publication.availability, entry.publication.generation))
@@ -135,8 +135,8 @@ async fn published_endpoint_follows_its_service() {
     assert_eq!((published.availability, published.audience.clone()), (Availability::Available, BTreeSet::from([peer.fingerprint()])));
     let refused: Result<tender::Publication, _> = control.post(api::PUBLISH, &publish_request(&id, &service)).await;
     assert_eq!(refused.expect_err("live incumbent").1.code, "live_publisher");
-    let entries: Vec<PublicationEntry> = control.get(api::PUBLICATIONS).await.expect("publications");
-    assert_eq!(entries[0].endpoint.as_deref(), Some(service.as_path()));
+    let list: PublicationList = control.get(api::PUBLICATIONS).await.expect("publications");
+    assert_eq!(list.publications[0].endpoint.as_deref(), Some(service.as_path()));
 
     let client = SshTender::new(paths.peer_socket(), host.clone(), vec![peer.clone()]).expect("peer client");
     let session = Session { caller: peer.fingerprint(), pinned_host: host, via: None };
@@ -158,8 +158,9 @@ async fn published_endpoint_follows_its_service() {
     let _: () = control.post(api::WITHDRAW, &id).await.expect("withdraw");
     assert_eq!(state_of(&control, &id).await, Some((Availability::Withdrawn, 2)));
     assert_eq!(client.connect(&session, &id).await.err(), Some(Error::Withdrawn));
-    let again: Result<(), _> = control.post(api::WITHDRAW, &id).await;
-    assert_eq!(again.expect_err("nothing to withdraw").0, http::StatusCode::NOT_FOUND);
+    let _: () = control.post(api::WITHDRAW, &id).await.expect("withdrawing again changes nothing");
+    let unknown: Result<(), _> = control.post(api::WITHDRAW, &PublicationId::new("vessel/test", "never")).await;
+    assert_eq!(unknown.expect_err("never published").0, http::StatusCode::NOT_FOUND);
 }
 
 // Only Trusted Group members reach the peer socket's publications; removing a
@@ -245,7 +246,7 @@ async fn configuration_publishes_endpoints_and_grants_scopes() {
     pump.abort();
 
     // An own publication taken over by the helper is reported, not withdrawn
-    // on the helper's behalf, and is no longer this instance's to withdraw.
+    // on the helper's behalf, however often it is asked.
     let taken = PublicationId::new("vessel/7", "taken");
     let dead = publish_request(&taken, &root.path().join("absent"));
     let own: tender::Publication = control.post(api::PUBLISH, &dead).await.expect("publish a dead endpoint");
@@ -254,8 +255,8 @@ async fn configuration_publishes_endpoints_and_grants_scopes() {
     let _helper_lease = client.publish(&as_helper, request).await.expect("helper takes over");
     let refused: Result<(), _> = control.post(api::WITHDRAW, &taken).await;
     assert_eq!(refused.expect_err("taken over").1.code, "denied");
-    let forgotten: Result<(), _> = control.post(api::WITHDRAW, &taken).await;
-    assert_eq!(forgotten.expect_err("no longer ours").0, http::StatusCode::NOT_FOUND);
+    let again: Result<(), _> = control.post(api::WITHDRAW, &taken).await;
+    assert_eq!(again.expect_err("still not ours").1.code, "denied");
     let (availability, generation) = state_of(&control, &taken).await.expect("still listed");
     assert_eq!(availability, Availability::Available);
     assert!(generation > own.generation);
@@ -321,4 +322,109 @@ async fn binary_serves_until_terminated() {
     let status = timeout(Duration::from_secs(10), child.wait()).await.expect("exit deadline").expect("exit");
     assert!(status.success(), "{status}");
     assert!(!socket.exists(), "the control socket is removed on exit");
+}
+
+// A restart publishes the configured endpoints again and withdraws the rest:
+// API publications do not persist, and neither does an entry since removed
+// from the configuration. The listing's epoch tells publishers to republish.
+#[tokio::test]
+async fn restart_resumes_configuration_and_withdraws_the_rest() {
+    let root = root();
+    let paths = paths(root.path());
+    let service = root.path().join("echo");
+    let _echo = echo(&service);
+    let entry = |name: &str| format!("[[publication]]\nname = \"{name}\"\nlabel = \"echo\"\nendpoint = \"{}\"\n", service.display());
+    fs::create_dir_all(&paths.config).expect("config directory");
+    fs::write(paths.config_file(), format!("{}\n{}", entry("kept"), entry("dropped"))).expect("config");
+    let daemon = Daemon::start(paths.clone()).await.expect("daemon");
+    let scope = Scope::instance(&daemon.instance().fingerprint).0;
+    let (kept, dropped) = (PublicationId::new(scope.clone(), "kept"), PublicationId::new(scope, "dropped"));
+    let control = Control::new(&paths.control_socket());
+    let api = PublicationId::new("vessel/1", "api");
+    let _: tender::Publication = control.post(api::PUBLISH, &publish_request(&api, &service)).await.expect("publish");
+    let before: PublicationList = control.get(api::PUBLICATIONS).await.expect("publications");
+    daemon.shutdown().await;
+
+    fs::write(paths.config_file(), entry("kept")).expect("config without the dropped entry");
+    let _daemon = restart(root.path()).await;
+    let after: PublicationList = control.get(api::PUBLICATIONS).await.expect("publications");
+    assert_ne!(after.epoch, before.epoch);
+    assert_eq!(state_of(&control, &kept).await.map(|state| state.0), Some(Availability::Available));
+    assert_eq!(state_of(&control, &dropped).await.map(|state| state.0), Some(Availability::Withdrawn));
+    assert_eq!(state_of(&control, &api).await.map(|state| state.0), Some(Availability::Withdrawn));
+}
+
+// An endpoint is published by absolute path only: a relative one would
+// resolve against the daemon's working directory.
+#[tokio::test]
+async fn relative_endpoint_is_refused() {
+    let root = root();
+    let paths = paths(root.path());
+    let _daemon = Daemon::start(paths.clone()).await.expect("daemon");
+    let control = Control::new(&paths.control_socket());
+    let request = publish_request(&PublicationId::new("vessel/1", "echo"), Path::new("echo.sock"));
+    let refused: Result<tender::Publication, _> = control.post(api::PUBLISH, &request).await;
+    let (status, error) = refused.expect_err("relative endpoint");
+    assert_eq!((status, error.code.as_str()), (http::StatusCode::BAD_REQUEST, "relative_endpoint"));
+}
+
+// A publication whose endpoint does not answer is never announced as
+// available; it becomes available once the endpoint answers.
+#[tokio::test]
+async fn dead_endpoint_is_never_announced_available() {
+    let root = root();
+    let paths = paths(root.path());
+    let daemon = Daemon::start(paths.clone()).await.expect("daemon");
+    let host = daemon.instance().fingerprint;
+    let control = Control::new(&paths.control_socket());
+    let peer = Identity::generate();
+    let _: TrustedMember = control.post(api::TRUSTED, &trusted(&peer)).await.expect("trust");
+    let client = SshTender::new(paths.peer_socket(), host.clone(), vec![peer.clone()]).expect("peer client");
+    let mut watch = client.watch(&Session { caller: peer.fingerprint(), pinned_host: host, via: None }).await.expect("watch");
+    let service = root.path().join("late");
+    let id = PublicationId::new("vessel/1", "late");
+    let published: tender::Publication = control.post(api::PUBLISH, &publish_request(&id, &service)).await.expect("publish");
+    assert_eq!(published.availability, Availability::Unavailable);
+    let announced = |snapshot: &[tender::Publication]| {
+        snapshot.iter().any(|publication| publication.id == id && publication.availability == Availability::Available)
+    };
+    while let Ok(Some(snapshot)) = timeout(Duration::from_millis(300), watch.recv()).await {
+        assert!(!announced(&snapshot), "announced before its endpoint answered");
+    }
+    let _echo = echo(&service);
+    timeout(Duration::from_secs(10), async { while !announced(&watch.recv().await.expect("watch")) {} })
+        .await
+        .expect("available once the endpoint answers");
+}
+
+// A service that is briefly away, as when it restarts, does not make its
+// publication flap: the stream that found it gone waits for it.
+#[tokio::test]
+async fn brief_endpoint_outage_keeps_the_publication() {
+    let root = root();
+    let paths = paths(root.path());
+    let daemon = Daemon::start(paths.clone()).await.expect("daemon");
+    let host = daemon.instance().fingerprint;
+    let control = Control::new(&paths.control_socket());
+    let peer = Identity::generate();
+    let _: TrustedMember = control.post(api::TRUSTED, &trusted(&peer)).await.expect("trust");
+    let service = root.path().join("echo");
+    let first = echo(&service);
+    let id = PublicationId::new("vessel/1", "echo");
+    let published: tender::Publication = control.post(api::PUBLISH, &publish_request(&id, &service)).await.expect("publish");
+    first.abort();
+    let _ = first.await;
+    fs::remove_file(&service).expect("service away");
+    let returning = tokio::spawn({
+        let service = service.clone();
+        async move {
+            sleep(Duration::from_millis(100)).await;
+            let _ = echo(&service).await;
+        }
+    });
+    let client = SshTender::new(paths.peer_socket(), host.clone(), vec![peer.clone()]).expect("peer client");
+    let session = Session { caller: peer.fingerprint(), pinned_host: host, via: None };
+    echoes(client.connect(&session, &id).await.expect("connect")).await;
+    returning.abort();
+    assert_eq!(state_of(&control, &id).await, Some((Availability::Available, published.generation)));
 }

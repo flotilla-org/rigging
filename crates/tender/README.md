@@ -49,8 +49,12 @@ contract suite in `tests/contracts.rs` states each rule against both adapters.
 `tender serve` runs one instance per OS account (`daemon::serve`, Unix only).
 Directories come from `daemon::Paths::from_env`: configuration and state
 follow `rigging-paths` (`TENDER_ROOT`, then XDG), and sockets live in the
-runtime directory, `$TENDER_ROOT/runtime`, else `$XDG_RUNTIME_DIR/tender`,
-else `tender-<uid>` in the temporary directory. All three are created 0700.
+runtime directory, `rigging_paths::runtime_dir("tender", uid, env)`:
+`$TENDER_ROOT/runtime`, else `$XDG_RUNTIME_DIR/tender` when this user owns it,
+else `/run/user/<uid>/tender` when this user owns `/run/user/<uid>`, else
+`tender-<uid>` in the temporary directory. Clients use the same function, so
+a cron job or a `sudo -u` shell finds the same daemon. All three are created
+0700.
 
 - **State:** the instance key (`identity`) and the authority store, as for
   `ssh::Server::open`. The key is the instance's identity for as long as the
@@ -65,9 +69,9 @@ else `tender-<uid>` in the temporary directory. All three are created 0700.
   | Route | Body | Answer |
   |---|---|---|
   | `GET /v1/identity` | | `Instance`: public key, fingerprint, peer socket |
-  | `GET /v1/publications` | | every `PublicationEntry` this instance hosts |
-  | `POST /v1/publish` | `PublishEndpoint` | the `Publication`; 409 `live_publisher` while one is live |
-  | `POST /v1/withdraw` | `PublicationId` | 404 unless this instance published it; a publication already withdrawn or taken over is forgotten with its error, so a repeat answers 404 |
+  | `GET /v1/publications` | | `PublicationList`: the start `epoch` and every `PublicationEntry` this instance hosts |
+  | `POST /v1/publish` | `PublishEndpoint` | the `Publication`, unavailable when the endpoint does not answer yet; 400 `relative_endpoint`; 409 `live_publisher` while one is live |
+  | `POST /v1/withdraw` | `PublicationId` | withdraws a publication this instance published, again harmlessly; 403 `denied` once another publisher has taken it over; 404 when the authority has no such publication |
   | `GET /v1/trusted` | | the Trusted Group, as `TrustedMember`s |
   | `POST /v1/trusted` | `TrustedInstance` | adds or replaces a member |
   | `POST /v1/trusted/remove` | `Untrust` | 404 unless a member |
@@ -75,7 +79,7 @@ else `tender-<uid>` in the temporary directory. All three are created 0700.
 
 - **`config.toml`** (read at start) lists `[[publication]]`s, each with an
   optional `scope` (default `tender/<fingerprint>`), `name`, `label`,
-  `display`, `endpoint` and optional `audience`, and `[[grant]]`s letting
+  `display`, `endpoint` (an absolute path) and optional `audience`, and `[[grant]]`s letting
   another instance's key publish into this one under a `scope`, for the
   Trusted Group. Grants no longer configured are revoked at start.
 - **`trusted.toml`** holds the Trusted Group as `[[instance]]`s with `key`,
@@ -83,13 +87,16 @@ else `tender-<uid>` in the temporary directory. All three are created 0700.
   changes through the control API.
 
 The daemon publishes a local socket as itself and never starts or stops the
-service behind it. A connection that cannot open the endpoint makes the
+service behind it. It probes the endpoint first: one that does not answer is
+published unavailable, never announced as available. A connection that cannot
+open the endpoint after a few tries over about half a second makes the
 publication unavailable; the daemon checks unavailable endpoints once a second
-and publishes again, at the next generation, once one answers. A publication
+and publishes again, at a new generation, once one answers. A publication
 taken over by another publisher, or withdrawn, is no longer the daemon's.
-Shutting down leaves its publications unavailable and their identities kept;
-publications from `config.toml` are published again at the next start, and
-those from the control API wait for their publisher.
+Shutting down leaves its publications unavailable. The next start publishes
+the `config.toml` entries again and withdraws every other publication this
+instance made, including all from the control API, which do not persist; the
+new `epoch` in the listing tells their publisher to publish them again.
 
 ```toml
 # config.toml
