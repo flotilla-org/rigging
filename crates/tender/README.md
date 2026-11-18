@@ -60,7 +60,7 @@ else `tender-<uid>` in the temporary directory. All three are created 0700.
   | `GET /v1/identity` | | `Instance`: public key, fingerprint, peer socket |
   | `GET /v1/publications` | | every `PublicationEntry` this instance hosts |
   | `POST /v1/publish` | `PublishEndpoint` | the `Publication`; 409 `live_publisher` while one is live |
-  | `POST /v1/withdraw` | `PublicationId` | 404 unless this instance published it |
+  | `POST /v1/withdraw` | `PublicationId` | 404 unless this instance published it; a publication already withdrawn or taken over is forgotten with its error, so a repeat answers 404 |
   | `GET /v1/trusted` | | the Trusted Group, as `TrustedMember`s |
   | `POST /v1/trusted` | `TrustedInstance` | adds or replaces a member |
   | `POST /v1/trusted/remove` | `Untrust` | 404 unless a member |

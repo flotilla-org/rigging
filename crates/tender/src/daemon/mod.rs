@@ -302,7 +302,9 @@ impl Inner {
         let state = self.state.lock().await;
         if state.local.get(id).is_some_and(|local| &local.lease == lease) {
             // A failure leaves a stale or withdrawn lease, which maintenance forgets.
-            let _ = self.policy().disconnect(&self.session, lease).await;
+            if let Err(error) = self.policy().disconnect(&self.session, lease).await {
+                tracing::debug!(%id, %error, "disconnecting an unreachable endpoint failed");
+            }
         }
     }
 
