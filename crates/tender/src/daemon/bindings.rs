@@ -478,7 +478,8 @@ async fn follow(fingerprint: Fingerprint, route: PeerRoute, identity: Identity, 
                     return;
                 }
                 // Only a route that stayed up earns a quick retry; one that
-                // drops as soon as it opens backs off like a failure.
+                // drops as soon as it opens backs off like a failure, so a
+                // route that keeps flapping is retried at the longest delay.
                 delay = if connected.elapsed() >= ROUTE_SETTLED { RETRY_FIRST } else { (delay * 2).min(RETRY_LONGEST) };
             }
             Err(reason) => {
