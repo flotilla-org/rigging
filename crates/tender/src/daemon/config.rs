@@ -20,6 +20,10 @@ pub struct Config {
     pub publications: Vec<ConfiguredPublication>,
     #[serde(default, rename = "grant")]
     pub grants: Vec<ConfiguredGrant>,
+    /// How long a Binding outlives its publication's withdrawal, or its loss
+    /// of every copy, before it is removed. Default: a minute, which covers
+    /// a vessel moving host.
+    pub binding_grace_seconds: Option<u64>,
 }
 
 /// An endpoint published whenever the daemon runs, such as a hand-run

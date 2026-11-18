@@ -30,7 +30,7 @@ use tokio::{
     time::{interval, sleep, timeout},
 };
 
-use self::bindings::{Bindings, Endpoints};
+use self::bindings::{BINDING_GRACE, Bindings, Endpoints};
 pub use self::config::{Config, ConfiguredGrant, ConfiguredPublication, TrustedFile};
 #[cfg(target_os = "linux")]
 use crate::runtime::BootClock;
@@ -165,7 +165,8 @@ impl Daemon {
         apply_trust(&server.policy, &fingerprint, &state).map_err(io::Error::other)?;
         let endpoints = Endpoints::default();
         let own = server.policy.watch(&session).await.map_err(io::Error::other)?;
-        let bindings = Bindings::start(&paths.runtime, identity.clone(), server.policy.clone(), endpoints.clone(), own)?;
+        let grace = config.binding_grace_seconds.map_or(BINDING_GRACE, Duration::from_secs);
+        let bindings = Bindings::start(&paths.runtime, identity.clone(), server.policy.clone(), endpoints.clone(), own, grace)?;
         bindings.trust(state.trusted.clone());
         let mut epoch = [0; 16];
         OsRng.fill_bytes(&mut epoch);

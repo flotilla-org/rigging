@@ -14,19 +14,22 @@ use std::{
 use rigging_ssh::Target as SshTarget;
 use tokio::{
     net::UnixListener,
+    select,
     sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
     task::JoinHandle,
-    time::{Instant, sleep},
+    time::{Instant, interval, sleep},
 };
 
 use crate::{
-    Availability, BindingState, Fingerprint, Publication, PublicationId, Route, Session, Tender, UnavailableReason,
+    Availability, BindingState, Fingerprint, Publication, PublicationId, Route, Session, Tender, UnavailableReason, Watch,
     api::{BindingEntry, PeerRoute, PeerState, PeerStatus, TrustedInstance},
     memory::MemoryTender,
     paths,
     ssh::{Forward, Identity, SshTender},
 };
 
+/// How long a Binding outlives the last copy of its publication by default.
+pub(super) const BINDING_GRACE: Duration = Duration::from_secs(60);
 const RETRY_FIRST: Duration = Duration::from_millis(100);
 const RETRY_LONGEST: Duration = Duration::from_secs(8);
 const ROUTE_SETTLED: Duration = Duration::from_secs(10);
@@ -79,7 +82,8 @@ impl Bindings {
         identity: Identity,
         policy: MemoryTender,
         endpoints: Endpoints,
-        local: crate::Watch,
+        local: Watch,
+        grace: Duration,
     ) -> io::Result<Self> {
         let directory = paths::bindings_dir(runtime);
         // Bindings belong to a running daemon; a previous run's are stale.
@@ -103,6 +107,7 @@ impl Bindings {
             identity,
             policy,
             endpoints,
+            grace,
             local: Vec::new(),
             peers: BTreeMap::new(),
             bound: BTreeMap::new(),
@@ -145,6 +150,7 @@ struct Binder {
     identity: Identity,
     policy: MemoryTender,
     endpoints: Endpoints,
+    grace: Duration,
     local: Vec<Publication>,
     peers: BTreeMap<Fingerprint, Peer>,
     bound: BTreeMap<PublicationId, Bound>,
@@ -187,13 +193,16 @@ impl Candidate<'_> {
     }
 }
 
-/// Which candidate carries a Binding: the current carrier while it is live,
-/// else the first live one, else the current one, else the first. `None`
-/// only when no candidate admits this instance any more.
+/// Which candidate carries a Binding: this instance's own copy while it is
+/// live, else the current carrier while it is live, else the first live one,
+/// else the current one, else the first. `None` only when no candidate admits
+/// this instance any more.
 fn choose(current: Option<&Carrier>, candidates: &[Candidate<'_>]) -> Option<usize> {
     let incumbent = current.and_then(|current| candidates.iter().position(|candidate| &candidate.carrier == current));
-    incumbent
-        .filter(|&index| candidates[index].live())
+    candidates
+        .iter()
+        .position(|candidate| candidate.carrier == Carrier::Local && candidate.live())
+        .or(incumbent.filter(|&index| candidates[index].live()))
         .or_else(|| candidates.iter().position(Candidate::live))
         .or(incumbent)
         .or((!candidates.is_empty()).then_some(0))
@@ -219,6 +228,8 @@ enum Endpoint {
 struct Bound {
     path: PathBuf,
     carrier: Option<Carrier>,
+    /// Since when no copy has been more than withdrawn.
+    ending: Option<Instant>,
     entry: BindingEntry,
     endpoint: Option<Endpoint>,
 }
@@ -233,11 +244,20 @@ impl Drop for Bound {
 }
 
 impl Binder {
+    /// Rebinds after every batch of events, and once a second so that
+    /// ending Bindings go when their grace runs out.
     async fn run(mut self, mut events: UnboundedReceiver<Event>) {
-        while let Some(event) = events.recv().await {
-            self.apply(event);
-            while let Ok(event) = events.try_recv() {
-                self.apply(event);
+        let mut tick = interval(Duration::from_secs(1));
+        loop {
+            select! {
+                event = events.recv() => {
+                    let Some(event) = event else { break };
+                    self.apply(event);
+                    while let Ok(event) = events.try_recv() {
+                        self.apply(event);
+                    }
+                }
+                _ = tick.tick() => {}
             }
             self.rebind();
         }
@@ -312,15 +332,32 @@ impl Binder {
     }
 
     fn bind(&mut self, id: &PublicationId) {
+        // A `tender/<fingerprint>` scope is followed from that instance alone.
+        let owner = id.scope.owner();
+        let follows = |instance: &Fingerprint| owner.as_ref().is_none_or(|owner| owner == instance);
         let mut candidates = Vec::new();
-        if let Some(publication) = self.local.iter().find(|publication| &publication.id == id) {
+        if let Some(publication) = self.local.iter().find(|publication| &publication.id == id).filter(|_| follows(&self.own)) {
             candidates.push(Candidate { carrier: Carrier::Local, publication, reachable: true });
         }
-        for (fingerprint, peer) in &self.peers {
+        for (fingerprint, peer) in self.peers.iter().filter(|(fingerprint, _)| follows(fingerprint)) {
             if let Some(publication) = peer.publications.iter().find(|publication| &publication.id == id) {
                 let reachable = peer.adapter.is_some() && matches!(peer.state, PeerState::Following { .. });
                 candidates.push(Candidate { carrier: Carrier::Peer(fingerprint.clone()), publication, reachable });
             }
+        }
+        // Withdrawn everywhere, or no copy left: a Binding stays for its grace,
+        // which covers a move, and none is made for such an identity.
+        let ending = candidates.iter().all(|candidate| candidate.publication.availability == Availability::Withdrawn);
+        match (self.bound.get_mut(id), ending) {
+            (None, true) => return,
+            (Some(bound), true) => {
+                if bound.ending.get_or_insert_with(Instant::now).elapsed() >= self.grace {
+                    self.bound.remove(id);
+                    return;
+                }
+            }
+            (Some(bound), false) => bound.ending = None,
+            (None, false) => {}
         }
         let path = paths::binding_path(&self.runtime, id);
         let current = self.bound.get(id).and_then(|bound| bound.carrier.clone());
@@ -371,6 +408,7 @@ impl Binder {
         let bound = self.bound.entry(id.clone()).or_insert_with(|| Bound {
             path: path.clone(),
             carrier: None,
+            ending: None,
             entry: BindingEntry {
                 publication: id.clone(),
                 label: label.clone(),
@@ -522,11 +560,12 @@ mod tests {
         }
     }
 
-    // Over any set of carriers and any current carrier: a live incumbent is
-    // kept; otherwise a live carrier is chosen if one exists; a Binding is
-    // left without a carrier only when nothing admits this instance.
+    // Over any set of carriers and any current carrier: this instance's own
+    // live copy is taken; otherwise a live incumbent is kept; otherwise a live
+    // carrier is chosen if one exists; a Binding is left without a carrier
+    // only when nothing admits this instance.
     #[hegel::test]
-    fn live_incumbent_wins_and_bindings_follow_live_carriers(tc: hegel::TestCase) {
+    fn own_copy_then_live_incumbent_win(tc: hegel::TestCase) {
         let states = [Availability::Available, Availability::Unavailable, Availability::Withdrawn];
         let count = tc.draw(gs::integers::<usize>().max_value(4));
         let records: Vec<_> =
@@ -545,7 +584,9 @@ mod tests {
         let chosen = choose(current.as_ref(), &candidates);
         assert_eq!(chosen.is_none(), candidates.is_empty());
         let incumbent = candidates.iter().position(|candidate| Some(&candidate.carrier) == current.as_ref());
-        if let Some(index) = incumbent.filter(|&index| candidates[index].live()) {
+        if candidates.first().is_some_and(Candidate::live) {
+            assert_eq!(chosen, Some(0), "the own copy, carried locally");
+        } else if let Some(index) = incumbent.filter(|&index| candidates[index].live()) {
             assert_eq!(chosen, Some(index));
         } else if candidates.iter().any(Candidate::live) {
             assert!(candidates[chosen.expect("a carrier")].live());

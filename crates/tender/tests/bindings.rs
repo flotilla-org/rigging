@@ -10,6 +10,7 @@ mod node;
 mod ssh_fixture;
 
 use std::{
+    fs,
     os::unix::fs::{FileTypeExt, MetadataExt},
     path::Path,
     time::Duration,
@@ -17,9 +18,9 @@ use std::{
 
 use node::{Node, eventually};
 use tender::{
-    BindingState, Label, PublicationId, PublishRequest, Session, Tender, UnavailableReason,
+    BindingState, Label, PublicationId, PublishRequest, Scope, Session, Tender, UnavailableReason,
     api::{self, BindingEntry, Diagnostics, PeerState},
-    paths,
+    paths::{self, binding_path},
     ssh::{Identity, SshTender},
 };
 use tokio::{
@@ -52,9 +53,12 @@ async fn round_trip(path: &Path, message: &[u8]) -> bool {
     matches!(timeout(Duration::from_secs(5), stream.read_exact(&mut reply)).await, Ok(Ok(_))) && reply == message
 }
 
-/// A connection the Binding refuses: no connection at all, or one closed at
-/// once without a byte.
+/// A connection the Binding, which must be there, refuses: no connection at
+/// all, or one closed at once without a byte.
 async fn refused_promptly(path: &Path) -> bool {
+    if fs::symlink_metadata(path).is_err() {
+        return false;
+    }
     let Ok(mut stream) = UnixStream::connect(path).await else { return true };
     let _ = stream.write_all(b"x").await;
     let mut bytes = Vec::new();
@@ -280,4 +284,81 @@ async fn corrected_route_restarts_following() {
     })
     .await;
     assert!(round_trip(&paths::binding_path(&viewer.runtime(), &id), b"rerouted").await);
+}
+
+// A withdrawn publication's Binding stays for its grace, then goes, on the
+// publishing instance and on the one following it; publishing the identity
+// again brings it back at the same path.
+#[tokio::test]
+async fn withdrawn_bindings_end_after_their_grace() {
+    let a = Node::start("binding_grace_seconds = 1\n").await;
+    let b = Node::start("binding_grace_seconds = 1\n").await;
+    a.trust(&b).await;
+    b.trust(&a).await;
+    let service = a.root.path().join("echo.sock");
+    let _echo = echo(&service);
+    let endpoint = service.to_str().expect("path");
+    let id = PublicationId::new("vessel/4", "echo");
+    a.cli(&["publish", "vessel/4", "echo", "--label", "echo", "--endpoint", endpoint]).await;
+    let (path, own) = (binding_path(&b.runtime(), &id), binding_path(&a.runtime(), &id));
+    eventually("B binds it", || async { round_trip(&path, b"before").await }).await;
+    a.cli(&["withdraw", "vessel/4", "echo"]).await;
+    eventually("withdrawal reaches B", || async {
+        b.binding(&id)
+            .await
+            .is_some_and(|binding| matches!(binding.state, BindingState::Unavailable { reason: UnavailableReason::Withdrawn, .. }))
+    })
+    .await;
+    assert!(refused_promptly(&path).await, "during its grace the Binding refuses");
+    eventually("the grace ends the Bindings", || async {
+        b.binding(&id).await.is_none() && a.binding(&id).await.is_none() && !path.exists() && fs::symlink_metadata(&own).is_err()
+    })
+    .await;
+    a.cli(&["publish", "vessel/4", "echo", "--label", "echo", "--endpoint", endpoint]).await;
+    eventually("publishing again binds it again at the same path", || async { round_trip(&path, b"after").await }).await;
+}
+
+// A `tender/<fingerprint>` scope is followed from that instance alone: a
+// helper's instance scope published into A is bound neither on A nor on B,
+// while A's own instance scope is.
+#[tokio::test]
+async fn instance_scopes_are_followed_from_their_instance_only() {
+    let helper = Identity::generate();
+    let helper_scope = Scope::instance(&helper.fingerprint()).0;
+    let a = Node::start(&format!("[[grant]]\ngrantee = \"{}\"\nscope = \"{helper_scope}\"\n", helper.fingerprint().0)).await;
+    let b = Node::start("").await;
+    a.trust(&b).await;
+    b.trust(&a).await;
+    let client = SshTender::new(a.instance.peer_socket.clone(), a.instance.fingerprint.clone(), vec![helper.clone()]).expect("helper");
+    let session = Session { caller: helper.fingerprint(), pinned_host: a.instance.fingerprint.clone(), via: None };
+    let helpers = PublicationId::new(helper_scope, "terminal");
+    let request = PublishRequest { id: helpers.clone(), label: Label("echo".into()), display: String::new(), audience: None };
+    let _published = client.publish(&session, request).await.expect("the helper publishes its own instance scope");
+    let service = a.root.path().join("echo.sock");
+    let _echo = echo(&service);
+    let own_scope = Scope::instance(&a.instance.fingerprint).0;
+    a.cli(&["publish", &own_scope, "terminal", "--label", "echo", "--endpoint", service.to_str().expect("path")]).await;
+    let own = PublicationId::new(own_scope, "terminal");
+    eventually("B binds A's own instance scope", || async { b.binding(&own).await.is_some() }).await;
+    eventually("A binds its own", || async { a.binding(&own).await.is_some() }).await;
+    assert!(a.binding(&helpers).await.is_none() && b.binding(&helpers).await.is_none(), "not from the instance it names");
+    assert!(!binding_path(&b.runtime(), &helpers).exists());
+}
+
+// A viewer that publishes an identity itself carries it on its own copy,
+// even while another instance's copy is live.
+#[tokio::test]
+async fn own_copy_is_chosen_first() {
+    let host = Node::start("").await;
+    let viewer = Node::start("").await;
+    host.trust(&viewer).await;
+    viewer.trust(&host).await;
+    let (remote, local) = (host.root.path().join("remote.sock"), viewer.root.path().join("local.sock"));
+    let (_remote, _local) = (echo(&remote), echo(&local));
+    let id = PublicationId::new("vessel/5", "http");
+    host.cli(&["publish", "vessel/5", "http", "--label", "http", "--endpoint", remote.to_str().expect("path")]).await;
+    let path = binding_path(&viewer.runtime(), &id);
+    eventually("the viewer binds the host's copy", || async { round_trip(&path, b"remote").await }).await;
+    viewer.cli(&["publish", "vessel/5", "http", "--label", "http", "--endpoint", local.to_str().expect("path")]).await;
+    eventually("the viewer's own copy carries it", || async { fs::read_link(&path).ok() == Some(local.clone()) }).await;
 }
