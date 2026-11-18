@@ -37,6 +37,66 @@ contract suite in `tests/contracts.rs` states each rule against both adapters.
   follows the group as it changes. The host's own publications never reach
   beyond its group.
 
+## The daemon
+
+`tender serve` runs one instance per OS account (`daemon::serve`, Unix only).
+Directories come from `daemon::Paths::from_env`: configuration and state
+follow `rigging-paths` (`TENDER_ROOT`, then XDG), and sockets live in the
+runtime directory, `$TENDER_ROOT/runtime`, else `$XDG_RUNTIME_DIR/tender`,
+else `tender-<uid>` in the temporary directory. All three are created 0700.
+
+- **State:** the instance key (`identity`) and the authority store, as for
+  `ssh::Server::open`. The key is the instance's identity for as long as the
+  state directory lasts.
+- **`runtime/peer`:** the Tender protocol socket other instances reach, over
+  SSH or on this machine. Trusted Group members may browse and connect;
+  anyone else is refused.
+- **`runtime/control`:** the control API, HTTP over the Local Endpoint
+  (`rigging-http-serve`), with JSON or CBOR bodies (`rigging-http-wire`). Its
+  paths and bodies are in `api`:
+
+  | Route | Body | Answer |
+  |---|---|---|
+  | `GET /v1/identity` | | `Instance`: public key, fingerprint, peer socket |
+  | `GET /v1/publications` | | every `PublicationEntry` this instance hosts |
+  | `POST /v1/publish` | `PublishEndpoint` | the `Publication`; 409 `live_publisher` while one is live |
+  | `POST /v1/withdraw` | `PublicationId` | 404 unless this instance published it |
+  | `GET /v1/trusted` | | the Trusted Group, as `TrustedMember`s |
+  | `POST /v1/trusted` | `TrustedInstance` | adds or replaces a member |
+  | `POST /v1/trusted/remove` | `Untrust` | 404 unless a member |
+  | `GET /v1/diagnostics` | | `Diagnostics` |
+
+- **`config.toml`** (read at start) lists `[[publication]]`s, each with an
+  optional `scope` (default `tender/<fingerprint>`), `name`, `label`,
+  `display`, `endpoint` and optional `audience`, and `[[grant]]`s letting
+  another instance's key publish into this one under a `scope`, for the
+  Trusted Group. Grants no longer configured are revoked at start.
+- **`trusted.toml`** holds the Trusted Group as `[[instance]]`s with `key`,
+  `name` and an optional `route`. The daemon rewrites it when the group
+  changes through the control API.
+
+The daemon publishes a local socket as itself and never starts or stops the
+service behind it. A connection that cannot open the endpoint makes the
+publication unavailable; the daemon checks unavailable endpoints once a second
+and publishes again, at the next generation, once one answers. A publication
+taken over by another publisher, or withdrawn, is no longer the daemon's.
+Shutting down leaves its publications unavailable and their identities kept;
+publications from `config.toml` are published again at the next start, and
+those from the control API wait for their publisher.
+
+```toml
+# config.toml
+[[publication]]
+name = "cleat"
+label = "cleat"
+display = "Desktop cleat"
+endpoint = "/run/user/1000/cleat/default/socket"
+
+[[grant]]
+grantee = "<helper fingerprint>"
+scope = "vessel/7"
+```
+
 ## SSH adapter
 
 `ssh::Server` hosts the slice-1 publication authority behind a private Unix

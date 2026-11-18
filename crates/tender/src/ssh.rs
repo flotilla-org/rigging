@@ -34,8 +34,8 @@ use tokio::{
 };
 
 use crate::{
-    Binding, BindingState, ByteStream, Dial, Error, Fingerprint, Lease, Publication, PublicationId, PublishRequest, Published, Router,
-    Session, Tender, UnavailableReason, Watch,
+    Binding, BindingState, ByteStream, Dial, Error, Fingerprint, Lease, PublicKey, Publication, PublicationId, PublishRequest, Published,
+    Router, Session, Tender, UnavailableReason, Watch,
     memory::MemoryTender,
     runtime::{Clock, FileStore},
 };
@@ -95,6 +95,10 @@ impl Identity {
 
     pub fn fingerprint(&self) -> Fingerprint {
         fingerprint(&self.0.verifying_key().to_bytes())
+    }
+
+    pub fn public_key(&self) -> PublicKey {
+        PublicKey::from_bytes(&self.0.verifying_key().to_bytes())
     }
 }
 

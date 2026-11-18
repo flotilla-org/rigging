@@ -247,6 +247,26 @@ impl MemoryTender {
         state.connect.insert(caller);
         state.notify()
     }
+    /// Replace who may browse and connect, closing the streams of anyone dropped.
+    pub fn set_access(&self, callers: BTreeSet<Fingerprint>) -> Result<(), Error> {
+        let mut state = self.state()?;
+        for record in state.records.values_mut() {
+            close_streams_of(record, |stream| !callers.contains(&stream.caller));
+        }
+        state.browse = callers.clone();
+        state.connect = callers;
+        state.notify()
+    }
+
+    pub fn grants(&self) -> Vec<Grant> {
+        self.inner.lock().expect("state lock").grants.values().cloned().collect()
+    }
+
+    /// Every record, whatever its audience: the host's own view.
+    pub fn publications(&self) -> Vec<Publication> {
+        self.inner.lock().expect("state lock").records.values().map(|record| record.publication.clone()).collect()
+    }
+
     pub fn trust_intermediary(&self, relay: Fingerprint) -> Result<(), Error> {
         let mut state = self.state()?;
         state.intermediaries.insert(relay);

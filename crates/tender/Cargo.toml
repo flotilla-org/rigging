@@ -18,20 +18,34 @@ ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 sha2 = "0.10"
 tempfile = { workspace = true }
+rigging-paths = { path = "../rigging-paths" }
+rigging-process = { path = "../rigging-process" }
+rigging-http-wire = { path = "../rigging-http-wire" }
+axum = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+toml = "1"
+tracing-subscriber = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 rigging-ssh = { path = "../rigging-ssh" }
-
-[target.'cfg(target_os = "linux")'.dependencies]
+rigging-http-serve = { path = "../rigging-http-serve" }
 libc = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 hegeltest.workspace = true
+rigging-http-client = { path = "../rigging-http-client", default-features = false }
+reqwest = { workspace = true }
+http = { workspace = true }
+flotilla-cbor = { path = "../flotilla-cbor" }
 
 [features]
 # Dedicated provisioned Linux CI job; normal contracts need neither cleat nor sshd.
 ssh-cleat-proof = []
+
+[[bin]]
+name = "tender"
+path = "src/main.rs"
 
 [[test]]
 name = "ssh_cleat"
