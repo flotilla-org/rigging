@@ -292,6 +292,8 @@ impl Inner {
         let lease = published.lease;
         let pump =
             tokio::spawn(pump(published.incoming, request.endpoint.clone(), self.policy().clone(), self.session.clone(), lease.clone()));
+        // Replacing an earlier Local drops it, which stops its pump; its
+        // streams already open keep running on their own tasks.
         state.local.insert(request.id.clone(), Local { lease: lease.clone(), request, pump });
         Ok(lease)
     }
@@ -304,13 +306,23 @@ impl Inner {
         }
     }
 
-    /// The daemon forgets a publication only once the authority has withdrawn it.
+    /// The daemon forgets a publication once the authority has withdrawn it,
+    /// or once it turns out no longer to be this instance's. Another
+    /// publisher's takeover is reported, not withdrawn on its behalf.
     pub(crate) async fn withdraw(&self, id: &PublicationId) -> Result<(), Error> {
         let mut state = self.state.lock().await;
         let lease = state.local.get(id).ok_or(Error::UnknownPublication)?.lease.clone();
-        self.policy().withdraw(&self.session, &lease).await?;
-        state.local.remove(id);
-        Ok(())
+        match self.policy().withdraw(&self.session, &lease).await {
+            Ok(()) | Err(Error::Withdrawn) => {
+                state.local.remove(id);
+                Ok(())
+            }
+            Err(error @ (Error::Denied | Error::StaleGeneration)) => {
+                state.local.remove(id);
+                Err(error)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     pub(crate) async fn publications(&self) -> Vec<PublicationEntry> {

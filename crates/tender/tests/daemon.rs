@@ -243,6 +243,20 @@ async fn configuration_publishes_endpoints_and_grants_scopes() {
     });
     echoes(stream).await;
     pump.abort();
+
+    // An own publication taken over by the helper is reported, not withdrawn
+    // on the helper's behalf, and is no longer this instance's to withdraw.
+    let taken = PublicationId::new("vessel/7", "taken");
+    let dead = publish_request(&taken, &root.path().join("absent"));
+    let own: tender::Publication = control.post(api::PUBLISH, &dead).await.expect("publish a dead endpoint");
+    assert_eq!(own.availability, Availability::Unavailable);
+    let request = PublishRequest { id: taken.clone(), ..request("vessel/7") };
+    let _helper_lease = client.publish(&as_helper, request).await.expect("helper takes over");
+    let refused: Result<(), _> = control.post(api::WITHDRAW, &taken).await;
+    assert_eq!(refused.expect_err("taken over").1.code, "denied");
+    let forgotten: Result<(), _> = control.post(api::WITHDRAW, &taken).await;
+    assert_eq!(forgotten.expect_err("no longer ours").0, http::StatusCode::NOT_FOUND);
+    assert_eq!(state_of(&control, &taken).await, Some((Availability::Available, 2)));
 }
 
 // A Trusted Group that cannot be saved is not applied either: the member
