@@ -159,7 +159,7 @@ async fn expiry(mut rig: Rig) {
 
 // Restart restores authority, grants, retired and reserved identities and
 // their generations, but never a live route. Publishing an identity again
-// changes its generation, not the identity.
+// changes its generation, not the identity, and no generation is reissued.
 async fn restart(mut rig: Rig) {
     rig.authorize(10);
     let first = rig.client.publish(&rig.session, rig.request("service")).await.unwrap();
@@ -177,9 +177,10 @@ async fn restart(mut rig: Rig) {
     assert_eq!(state(&withdrawn.lease.id), Availability::Withdrawn);
     assert!(matches!(rig.client.connect(&rig.session, &first.lease.id).await, Err(Error::Unavailable)));
     let republished = rig.client.publish(&rig.session, rig.request("service")).await.unwrap();
-    assert_eq!((republished.lease.id, republished.lease.generation), (first.lease.id, first.lease.generation + 1));
+    assert_eq!(republished.lease.id, first.lease.id);
+    assert!(republished.lease.generation > withdrawn.lease.generation.max(first.lease.generation));
     let retaken = rig.client.publish(&rig.session, rig.request("retired")).await.unwrap();
-    assert_eq!(retaken.lease.generation, withdrawn.lease.generation + 1);
+    assert!(retaken.lease.generation > republished.lease.generation);
     rig.clock.set(10);
     rig.reload();
     assert!(rig.client.browse(&rig.session).await.unwrap().iter().all(|record| record.availability == Availability::Withdrawn));

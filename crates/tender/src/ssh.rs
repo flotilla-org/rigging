@@ -530,8 +530,9 @@ async fn forward(
 }
 
 /// A held SSH route: its own session and a stream-local forward to the remote
-/// Tender listener. The private forward is separate from stable public exposures
-/// so an SSH outage cannot rebind an exposure to a different service.
+/// Tender listener. The forward's socket is private and separate from every
+/// Binding's Local Endpoint, so an SSH outage cannot point a Binding at a
+/// different service.
 pub struct Forward {
     // Fields drop in order: cancel the forward before its session closes.
     route: Option<(Box<dyn UnixForward>, OpenSsh)>,

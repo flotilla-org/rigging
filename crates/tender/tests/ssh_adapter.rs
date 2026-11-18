@@ -135,7 +135,7 @@ async fn ordinary_service_survives_route_loss_and_fresh_client_recovers() {
     })
     .await
     .expect("prior requests");
-    let mut fresh = UnixStream::connect(&binding.local_endpoint).await.expect("fresh exposed client");
+    let mut fresh = UnixStream::connect(&binding.local_endpoint).await.expect("fresh Binding client");
     fresh.write_all(b"after").await.expect("fresh request");
     fresh.shutdown().await.expect("fresh EOF");
     let mut response = Vec::new();
@@ -166,7 +166,7 @@ async fn identity_pin_and_unknown_caller_are_refused_before_service_bytes() {
 // An ordinary raw listener closes denied connections without inserting a
 // diagnostic frame into the application's stream.
 #[tokio::test]
-async fn exposure_failure_is_eof_without_protocol_bytes() {
+async fn binding_failure_is_eof_without_protocol_bytes() {
     let root = tempfile::Builder::new().permissions(std::fs::Permissions::from_mode(0o700)).tempdir().expect("directory");
     let host = Identity::generate();
     let caller = Identity::generate();

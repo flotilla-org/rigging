@@ -2,8 +2,11 @@ use std::{collections::BTreeSet, time::Duration};
 
 use tender::{
     Availability, BindingState, ByteStream, Error, Fingerprint, Grant, Label, PublicationId, PublishRequest, Route, Scope, Session, Tender,
-    UnavailableReason, memory::MemoryTender,
+    UnavailableReason,
+    memory::{MemoryTender, WITHDRAWN_RETENTION},
 };
+#[cfg(unix)]
+use tokio::net::UnixStream;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     sync::mpsc::UnboundedReceiver,
@@ -361,6 +364,14 @@ async fn takeover_keeps_binding_without_replay(rig: Rig) {
     rig.tender.disconnect(&first_helper, &first.lease).await.expect("disconnect");
     let mut byte = [0];
     assert_eq!(timeout(Duration::from_secs(1), old_stream.read(&mut byte)).await.expect("close").expect("read"), 0);
+    // Between the publisher dropping and the takeover the Binding stays, and
+    // says why it cannot carry; a client of its socket is closed promptly.
+    let waiting = rig.tender.bind(&client, &first.lease.id).await.expect("bind while unavailable");
+    assert_eq!(waiting.state, unavailable(&rig, UnavailableReason::PublisherUnavailable));
+    #[cfg(unix)]
+    if let Ok(mut raw) = UnixStream::connect(&waiting.local_endpoint).await {
+        assert_eq!(timeout(Duration::from_secs(1), raw.read(&mut byte)).await.expect("closed promptly").unwrap_or(0), 0);
+    }
     let mut second = rig.tender.publish(&second_helper, request("n", "same-name", &["consumer"])).await.expect("takeover");
     let rebound = rig.tender.bind(&client, &first.lease.id).await.expect("rebind");
     assert_eq!((rebound.local_endpoint.as_str(), &rebound.state), (binding.local_endpoint.as_str(), &available(&rig, None)));
@@ -371,6 +382,48 @@ async fn takeover_keeps_binding_without_replay(rig: Rig) {
     let mut fresh = [0; 5];
     new_service.read_exact(&mut fresh).await.expect("new read");
     assert_eq!(&fresh, b"fresh");
+}
+
+// The host publishes under its own instance scope and under vessel scopes;
+// any other scope needs a grant, which the host may hold too. Only the
+// instance a `tender/<fingerprint>` scope names publishes under it, grant or no.
+async fn instance_and_vessel_scopes(rig: Rig) {
+    let host = session("host-key", &rig.host_id);
+    let helper = session("owner", &rig.host_id);
+    let own = Scope::instance(&rig.host_id).0;
+    rig.host.set_trusted_group(set(&["consumer"]));
+    rig.tender.publish(&host, request(&own, "terminal", &["consumer"])).await.expect("own instance scope");
+    rig.tender.publish(&host, request("vessel/7", "cleat/default", &["consumer"])).await.expect("vessel scope");
+    assert!(matches!(rig.tender.publish(&host, request("team", "board", &["consumer"])).await, Err(Error::Denied)));
+    grant(&rig, "host-key", "team", &["consumer"], 100);
+    rig.tender.publish(&host, request("team", "board", &["consumer"])).await.expect("granted scope");
+
+    let helper_scope = Scope::instance(&fp("owner")).0;
+    grant(&rig, "owner", &own, &["consumer"], 100);
+    assert!(matches!(rig.tender.publish(&helper, request(&own, "other", &["consumer"])).await, Err(Error::Denied)));
+    let other = Scope::instance(&fp("consumer")).0;
+    grant(&rig, "host-key", &other, &["consumer"], 100);
+    assert!(matches!(rig.tender.publish(&host, request(&other, "terminal", &["consumer"])).await, Err(Error::Denied)));
+    grant(&rig, "owner", &helper_scope, &["consumer"], 100);
+    rig.tender.publish(&helper, request(&helper_scope, "terminal", &["consumer"])).await.expect("helper's own instance scope");
+}
+
+// The authority forgets a withdrawn publication once followers have had time
+// to see the withdrawal; publishing it again never reissues a generation.
+async fn withdrawn_publications_are_forgotten(rig: Rig) {
+    let publisher = session("owner", &rig.host_id);
+    let client = reader(&rig, "consumer");
+    grant(&rig, "owner", "n", &["consumer"], u64::MAX);
+    let first = rig.tender.publish(&publisher, request("n", "service", &["consumer"])).await.expect("publish");
+    rig.host.advance_to(10);
+    rig.tender.withdraw(&publisher, &first.lease).await.expect("withdraw");
+    rig.host.advance_to(10 + WITHDRAWN_RETENTION - 1);
+    assert_eq!(rig.tender.browse(&client).await.expect("browse")[0].availability, Availability::Withdrawn);
+    assert!(matches!(rig.tender.connect(&client, &first.lease.id).await, Err(Error::Withdrawn)));
+    rig.host.advance_to(10 + WITHDRAWN_RETENTION);
+    assert!(rig.tender.browse(&client).await.expect("browse").is_empty());
+    let again = rig.tender.publish(&publisher, request("n", "service", &["consumer"])).await.expect("publish again");
+    assert!(again.lease.generation > first.lease.generation);
 }
 
 async fn restart_and_replacement(rig: Rig) {
@@ -429,7 +482,8 @@ async fn default_audience_is_trusted_group(rig: Rig) {
     rig.host.set_trusted_group(set(&["laptop", "outsider"]));
     assert_eq!(rig.tender.browse(&outsider).await.expect("browse")[0].audience, set(&["laptop", "outsider"]));
     rig.host.set_trusted_group(set(&["laptop"]));
-    let own = rig.tender.publish(&host, request("tender/host", "terminal", &["laptop", "outsider"])).await.expect("host publishes");
+    let own_scope = Scope::instance(&rig.host_id).0;
+    let own = rig.tender.publish(&host, request(&own_scope, "terminal", &["laptop", "outsider"])).await.expect("host publishes");
     let visible = rig.tender.browse(&laptop).await.expect("browse");
     assert_eq!(visible.iter().find(|publication| publication.id == own.lease.id).expect("own publication").audience, set(&["laptop"]));
     assert!(rig.tender.browse(&outsider).await.expect("browse").is_empty());
@@ -546,6 +600,8 @@ contract!(ungranted_scope_reveals_nothing);
 contract!(grant_loss_and_expiry);
 contract!(takeover_keeps_binding_without_replay);
 contract!(restart_and_replacement);
+contract!(instance_and_vessel_scopes);
+contract!(withdrawn_publications_are_forgotten);
 contract!(labels_and_display_are_carried);
 contract!(default_audience_is_trusted_group);
 contract!(publisher_receiver_closure);
