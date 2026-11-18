@@ -18,14 +18,19 @@ contract suite in `tests/contracts.rs` states each rule against both adapters.
   instance scope, `tender/<fingerprint>` (`Scope::instance`), and under
   `vessel/…` scopes; any other scope needs a grant, which the host may hold
   too. Only the instance a `tender/<fingerprint>` scope names ever publishes
-  under it, whatever grants say. Publishing an identity whose publisher is
+  under it, whatever grants say. Both kinds of scope are part of Tender's
+  identity model (flotilla#3995), not a convention of one consumer. Tender
+  cannot tell which vessels a host holds: what it checks is that only the
+  host's own key publishes as the host, which in a daemon means the host
+  account's own control socket. A live incumbent still wins. Publishing an identity whose publisher is
   unavailable or withdrawn takes it over at a new generation, whoever was
   there before; a live incumbent wins with `LivePublisher`. Withdrawal is not
   terminal: any publisher granted the scope may publish a withdrawn identity
   again, including one that is not the publisher that withdrew it, since
   withdrawal ends a publisher's claim rather than the identity. The authority
   forgets a withdrawn publication after `WITHDRAWN_RETENTION` (a minute), and
-  generations come from one counter, so none is ever reissued. Streams already
+  generations come from one counter, so none is ever reissued. Once forgotten,
+  it reads as never published, to callers that had bound it too. Streams already
   open stay on the old route and break with it; nothing is replayed or moved.
 - **Bindings.** An adapter's `bind` gives a Local Endpoint over its one route,
   keyed by publication identity and the instance that bound it. It is a

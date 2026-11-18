@@ -1,5 +1,5 @@
 #[cfg(unix)]
-use std::{collections::BTreeMap, fs::Permissions, os::unix::fs::PermissionsExt, sync::Arc};
+use std::{collections::BTreeMap, fs::Permissions, os::unix::fs::PermissionsExt, path::Path, sync::Arc};
 use std::{collections::BTreeSet, time::Duration};
 
 #[cfg(unix)]
@@ -374,8 +374,9 @@ async fn takeover_keeps_binding_without_replay(rig: Rig) {
     let waiting = rig.tender.bind(&client, &first.lease.id).await.expect("bind while unavailable");
     assert_eq!(waiting.state, unavailable(&rig, UnavailableReason::PublisherUnavailable));
     #[cfg(unix)]
-    if let Ok(mut raw) = UnixStream::connect(&waiting.local_endpoint).await {
-        assert_eq!(timeout(Duration::from_secs(1), raw.read(&mut byte)).await.expect("closed promptly").unwrap_or(0), 0);
+    if Path::new(&waiting.local_endpoint).is_absolute() {
+        let mut raw = UnixStream::connect(&waiting.local_endpoint).await.expect("the Local Endpoint stays");
+        assert_eq!(timeout(Duration::from_secs(1), raw.read(&mut byte)).await.expect("closed promptly").expect("clean close"), 0);
     }
     let mut second = rig.tender.publish(&second_helper, request("n", "same-name", &["consumer"])).await.expect("takeover");
     let rebound = rig.tender.bind(&client, &first.lease.id).await.expect("rebind");

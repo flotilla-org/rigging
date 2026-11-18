@@ -17,9 +17,10 @@ use crate::{
     runtime::{Clock, ClockReading, Store},
 };
 
-/// How long, in clock ticks (milliseconds), the authority keeps a withdrawn
-/// publication before forgetting it: long enough for followers to see the
-/// withdrawal, and for a vessel moving host to publish it again.
+/// How long, in ticks of the authority's `Clock` (milliseconds for the
+/// runtime clocks), the authority keeps a withdrawn publication before
+/// forgetting it: long enough for followers to see the withdrawal, and for a
+/// vessel moving host to publish it again.
 pub const WITHDRAWN_RETENTION: u64 = 60_000;
 
 #[derive(Clone)]
@@ -540,6 +541,9 @@ impl State {
             .map(|(id, _)| id.clone())
             .collect();
         for id in forgotten {
+            // Forgotten entirely: a caller that had bound it reads it as one
+            // that never existed, as any other caller does.
+            self.bound.retain(|(_, bound)| bound != &id);
             let record = self.records.remove(&id).expect("record collected above");
             let publisher = record.publication.publisher;
             let carried = record.streams.into_iter().map(|stream| Lingering { id: id.clone(), publisher: publisher.clone(), stream });
