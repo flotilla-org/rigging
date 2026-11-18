@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
+use std::{collections::BTreeMap, io, path::PathBuf, sync::Arc};
 
 use tender::{ByteStream, Dial, Fingerprint, Router};
 use tokio::net::UnixStream;
@@ -12,8 +12,8 @@ pub struct Links {
 
 #[async_trait::async_trait]
 impl Dial for Links {
-    async fn dial(&self, instance: &Fingerprint) -> std::io::Result<ByteStream> {
-        let path = self.paths.get(instance).ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?;
+    async fn dial(&self, instance: &Fingerprint) -> io::Result<ByteStream> {
+        let path = self.paths.get(instance).ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
         Ok(Box::new(UnixStream::connect(path).await?))
     }
 }

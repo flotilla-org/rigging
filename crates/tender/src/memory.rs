@@ -17,6 +17,11 @@ use crate::{
     runtime::{Clock, ClockReading, Store},
 };
 
+/// How long, in clock ticks (milliseconds), the authority keeps a withdrawn
+/// publication before forgetting it: long enough for followers to see the
+/// withdrawal, and for a vessel moving host to publish it again.
+pub const WITHDRAWN_RETENTION: u64 = 60_000;
+
 #[derive(Clone)]
 pub struct MemoryTender {
     inner: Arc<Mutex<State>>,
@@ -26,6 +31,7 @@ struct Record {
     publication: Publication,
     requested_audience: Option<BTreeSet<Fingerprint>>,
     expires_at: u64,
+    withdrawn_at: Option<u64>,
     sender: Option<mpsc::UnboundedSender<ByteStream>>,
     streams: Vec<OpenStream>,
 }
@@ -52,6 +58,9 @@ struct State {
     intermediaries: BTreeSet<Fingerprint>,
     trusted_group: BTreeSet<Fingerprint>,
     records: BTreeMap<PublicationId, Record>,
+    /// The highest generation issued. Every publication takes the next, so a
+    /// forgotten identity published again never matches an earlier lease.
+    generation: u64,
     lingering: Vec<Lingering>,
     /// Callers that have bound each identity, so losing admission reads as
     /// Revoked rather than as an identity that never existed.
@@ -75,6 +84,7 @@ impl MemoryTender {
                 intermediaries: BTreeSet::new(),
                 trusted_group: BTreeSet::new(),
                 records: BTreeMap::new(),
+                generation: 0,
                 lingering: Vec::new(),
                 bound: BTreeSet::new(),
                 runtime: None,
@@ -111,6 +121,7 @@ impl MemoryTender {
                 state.connect = stored.connect;
                 state.intermediaries = stored.intermediaries;
                 state.trusted_group = stored.trusted_group;
+                state.generation = stored.generation;
                 state.records = stored
                     .records
                     .into_iter()
@@ -121,12 +132,16 @@ impl MemoryTender {
                         if record.publication.availability == Availability::Available {
                             record.publication.availability = Availability::Unavailable;
                         }
+                        // A withdrawal from another clock epoch is long past.
+                        let withdrawn_at = (record.publication.availability == Availability::Withdrawn)
+                            .then(|| if invalid_clock { 0 } else { record.withdrawn_at.unwrap_or(reading.tick) });
                         (
                             record.publication.id.clone(),
                             Record {
                                 publication: record.publication,
                                 requested_audience: record.requested_audience,
                                 expires_at: record.expires_at,
+                                withdrawn_at,
                                 sender: None,
                                 streams: Vec::new(),
                             },
@@ -278,9 +293,10 @@ impl MemoryTender {
         let mut state = self.state()?;
         state.grants.remove(&(grantee.clone(), scope.clone()));
         state.close_lingering(|lingering| &lingering.publisher == grantee && &lingering.id.scope == scope);
+        let now = state.now;
         for record in state.records.values_mut() {
             if &record.publication.publisher == grantee && &record.publication.id.scope == scope {
-                retire(record, true);
+                retire(record, true, now);
             }
         }
         state.notify()
@@ -328,12 +344,13 @@ fn close_streams_of(record: &mut Record, closes: impl Fn(&OpenStream) -> bool) {
     record.streams.retain(|stream| !stream.task.is_finished());
 }
 
-fn retire(record: &mut Record, abort: bool) {
+fn retire(record: &mut Record, abort: bool, now: u64) {
     if abort {
         abort_streams(record);
     }
     if record.publication.availability != Availability::Withdrawn {
         record.publication.availability = Availability::Withdrawn;
+        record.withdrawn_at = Some(now);
         record.sender = None;
     }
 }
@@ -358,12 +375,17 @@ struct Stored {
     intermediaries: BTreeSet<Fingerprint>,
     trusted_group: BTreeSet<Fingerprint>,
     records: Vec<StoredRecord>,
+    /// At least every record's generation once decoded.
+    #[serde(default)]
+    generation: u64,
 }
 #[derive(Serialize, Deserialize)]
 struct StoredRecord {
     publication: Publication,
     requested_audience: Option<BTreeSet<Fingerprint>>,
     expires_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    withdrawn_at: Option<u64>,
 }
 
 /// Version 1 assigned numeric identities and allowed several to share a
@@ -406,7 +428,7 @@ impl Stored {
             version: u32,
         }
         let invalid = |message: &str| std_io::Error::other(message.to_owned());
-        let stored = match serde_json::from_slice::<Version>(bytes).map_err(std_io::Error::other)?.version {
+        let mut stored = match serde_json::from_slice::<Version>(bytes).map_err(std_io::Error::other)?.version {
             1 => Self::from_v1(serde_json::from_slice(bytes).map_err(std_io::Error::other)?)?,
             2 => serde_json::from_slice::<Self>(bytes).map_err(std_io::Error::other)?,
             _ => return Err(invalid("unsupported Tender store version")),
@@ -416,6 +438,8 @@ impl Stored {
         {
             return Err(invalid("invalid Tender publication identities"));
         }
+        let highest = stored.records.iter().map(|record| record.publication.generation).max().unwrap_or(0);
+        stored.generation = stored.generation.max(highest);
         Ok(stored)
     }
 
@@ -447,7 +471,12 @@ impl Stored {
             };
             by_identity.insert(
                 id,
-                StoredRecord { publication, requested_audience: Some(record.requested_audience), expires_at: record.expires_at },
+                StoredRecord {
+                    publication,
+                    requested_audience: Some(record.requested_audience),
+                    expires_at: record.expires_at,
+                    withdrawn_at: None,
+                },
             );
         }
         Ok(Self {
@@ -460,6 +489,7 @@ impl Stored {
             intermediaries: stored.intermediaries,
             trusted_group: BTreeSet::new(),
             records: by_identity.into_values().collect(),
+            generation: 0,
         })
     }
 }
@@ -469,7 +499,7 @@ impl State {
         self.failed = true;
         self.close_lingering(|_| true);
         for record in self.records.values_mut() {
-            retire(record, true);
+            retire(record, true, self.now);
         }
     }
 
@@ -482,12 +512,30 @@ impl State {
         self.lingering.retain(|lingering| !lingering.stream.task.is_finished());
     }
 
+    /// Retire expired publications, and forget those withdrawn for longer
+    /// than [`WITHDRAWN_RETENTION`]. Their streams run on to close.
     fn expire(&mut self) {
+        let now = self.now;
         for record in self.records.values_mut() {
-            if record.expires_at <= self.now {
-                retire(record, false);
+            if record.expires_at <= now {
+                retire(record, false, now);
             }
         }
+        let forgotten: Vec<_> = self
+            .records
+            .iter()
+            .filter(|(_, record)| {
+                record.withdrawn_at.and_then(|withdrawn| withdrawn.checked_add(WITHDRAWN_RETENTION)).is_some_and(|until| until <= now)
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in forgotten {
+            let record = self.records.remove(&id).expect("record collected above");
+            let publisher = record.publication.publisher;
+            let carried = record.streams.into_iter().map(|stream| Lingering { id: id.clone(), publisher: publisher.clone(), stream });
+            self.lingering.extend(carried);
+        }
+        self.lingering.retain(|lingering| !lingering.stream.task.is_finished());
     }
 
     fn persist(&mut self) -> Result<(), Error> {
@@ -516,8 +564,10 @@ impl State {
                     },
                     requested_audience: record.requested_audience.clone(),
                     expires_at: record.expires_at,
+                    withdrawn_at: record.withdrawn_at,
                 })
                 .collect(),
+            generation: self.generation,
         };
         let result = serde_json::to_vec(&stored).map_err(std_io::Error::other).and_then(|bytes| runtime.store.save(&bytes));
         if let Err(error) = result {
@@ -528,10 +578,14 @@ impl State {
         Ok(())
     }
 
-    /// The host publishes under any scope on its own authority, within its
-    /// Trusted Group and without expiry; every other publisher needs a grant.
+    /// The host publishes under its own instance scope and vessel scopes,
+    /// within its Trusted Group and without expiry; any other scope needs a
+    /// grant. Only the instance it names publishes under an instance scope.
     fn ceiling(&self, publisher: &Fingerprint, scope: &Scope) -> Option<(BTreeSet<Fingerprint>, u64)> {
-        if publisher == &self.host {
+        if scope.owner().is_some_and(|owner| &owner != publisher) {
+            return None;
+        }
+        if publisher == &self.host && (scope.owner().is_some() || scope.is_vessel()) {
             return Some((self.trusted_group.clone(), u64::MAX));
         }
         self.grants.get(&(publisher.clone(), scope.clone())).map(|grant| (grant.audience_ceiling.clone(), grant.expires_at))
@@ -561,7 +615,7 @@ impl State {
             let audience = record.publication.audience.clone();
             close_streams_of(record, |stream| !audience.contains(&stream.caller));
             if expires_at <= now {
-                retire(record, false);
+                retire(record, false, now);
             }
         }
         let ceilings: Vec<_> = self.lingering.iter().map(|lingering| self.ceiling(&lingering.publisher, &lingering.id.scope)).collect();
@@ -652,11 +706,11 @@ impl Tender for MemoryTender {
             return Err(Error::GrantExpired);
         }
         let audience = state.audience(&request.audience, &ceiling);
-        let generation = match state.records.get(&request.id) {
-            Some(record) if record.publication.availability == Availability::Available => return Err(Error::LivePublisher),
-            Some(record) => record.publication.generation.checked_add(1).ok_or(Error::Storage)?,
-            None => 1,
-        };
+        if state.records.get(&request.id).is_some_and(|record| record.publication.availability == Availability::Available) {
+            return Err(Error::LivePublisher);
+        }
+        let generation = state.generation.checked_add(1).ok_or(Error::Storage)?;
+        state.generation = generation;
         let (sender, incoming) = mpsc::unbounded_channel();
         let closure_sender = sender.clone();
         let publication = Publication {
@@ -672,7 +726,14 @@ impl Tender for MemoryTender {
         // still has (expiry lets them run to close) stay on their old route.
         if let Some(previous) = state.records.insert(
             request.id.clone(),
-            Record { publication, requested_audience: request.audience, expires_at, sender: Some(sender), streams: Vec::new() },
+            Record {
+                publication,
+                requested_audience: request.audience,
+                expires_at,
+                withdrawn_at: None,
+                sender: Some(sender),
+                streams: Vec::new(),
+            },
         ) {
             let publisher = previous.publication.publisher;
             let carried =
@@ -788,7 +849,8 @@ impl Tender for MemoryTender {
     async fn withdraw(&self, session: &Session, lease: &Lease) -> Result<(), Error> {
         let mut state = self.state()?;
         state.check_lease(session, lease)?;
-        retire(state.records.get_mut(&lease.id).expect("validated lease"), true);
+        let now = state.now;
+        retire(state.records.get_mut(&lease.id).expect("validated lease"), true, now);
         state.notify()?;
         Ok(())
     }

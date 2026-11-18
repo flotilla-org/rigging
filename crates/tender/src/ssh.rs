@@ -540,8 +540,9 @@ async fn forward(
 }
 
 /// A held SSH route: its own session and a stream-local forward to the remote
-/// Tender listener. The private forward is separate from stable public exposures
-/// so an SSH outage cannot rebind an exposure to a different service.
+/// Tender listener. The forward's socket is private and separate from every
+/// Binding's Local Endpoint, so an SSH outage cannot point a Binding at a
+/// different service.
 pub struct Forward {
     // Fields drop in order: cancel the forward before its session closes.
     route: Option<(Box<dyn UnixForward>, OpenSsh)>,
@@ -928,19 +929,25 @@ impl Tender for SshTender {
 
 #[cfg(test)]
 mod tests {
+    use std::{collections::BTreeSet, fs, io::Write};
+
+    use tempfile::{TempDir, tempdir};
+    use tokio::spawn;
+
     use super::*;
+    use crate::{Availability, Grant, Label, Scope};
 
     // Every Binding listener fits in a socket path, however deep the
     // temporary directory: a macOS-length one stays, a deeper one gives way.
     #[test]
     fn binding_listeners_fit_a_socket_path() {
-        let longest = |directory: &tempfile::TempDir| directory.path().join("f".repeat(MAX_BINDING_NAME)).as_os_str().len();
-        let base = tempfile::tempdir().expect("base");
+        let longest = |directory: &TempDir| directory.path().join("f".repeat(MAX_BINDING_NAME)).as_os_str().len();
+        let base = tempdir().expect("base");
         let mut macos = base.path().to_path_buf();
         while macos.as_os_str().len() < 49 {
             macos.push("d");
         }
-        std::fs::create_dir_all(&macos).expect("deep base");
+        fs::create_dir_all(&macos).expect("deep base");
         let shallow = binding_directory(&macos).expect("directory");
         assert!(shallow.path().starts_with(&macos) && longest(&shallow) <= MAX_SOCKET_PATH);
         let deep = binding_directory(&macos.join("d".repeat(40))).expect("directory");
@@ -950,10 +957,10 @@ mod tests {
     // A failed partial write must not install an invalid permanent key file.
     #[test]
     fn failed_key_write_leaves_no_destination() {
-        let directory = tempfile::tempdir().expect("directory");
+        let directory = tempdir().expect("directory");
         let path = directory.path().join("key");
         let result = Identity::install_key(&path, |file| {
-            std::io::Write::write_all(file, b"partial")?;
+            Write::write_all(file, b"partial")?;
             Err(io::Error::other("injected filesystem write failure"))
         });
         assert!(result.is_err());
@@ -971,10 +978,10 @@ mod tests {
         let caller = publisher.fingerprint();
         policy.allow_browse(caller.clone()).expect("host policy");
         policy
-            .grant(crate::Grant {
+            .grant(Grant {
                 grantee: caller.clone(),
-                scope: crate::Scope("n".into()),
-                audience_ceiling: std::collections::BTreeSet::from([caller.clone()]),
+                scope: Scope("n".into()),
+                audience_ceiling: BTreeSet::from([caller.clone()]),
                 expires_at: 100,
             })
             .expect("host policy");
@@ -984,9 +991,9 @@ mod tests {
                 &session,
                 PublishRequest {
                     id: PublicationId::new("n", "service"),
-                    label: crate::Label("echo".into()),
+                    label: Label("echo".into()),
                     display: "Service".into(),
-                    audience: Some(std::collections::BTreeSet::from([caller])),
+                    audience: Some(BTreeSet::from([caller])),
                 },
             )
             .await
@@ -998,7 +1005,7 @@ mod tests {
         let (mut client, server) = UnixStream::pair().expect("transport pair");
         let authority = policy.clone();
         let server_identity = host.clone();
-        let pending = tokio::spawn(async move { serve(server, server_identity, authority, registrations, None).await });
+        let pending = spawn(async move { serve(server, server_identity, authority, registrations, None).await });
         client_handshake(&mut client, &publisher, &host.fingerprint()).await.expect("authenticate publisher");
         write_control(&mut client, &Request::Accept(lease)).await.expect("duplicate accept request");
         drop(client);
@@ -1007,7 +1014,7 @@ mod tests {
             .expect("duplicate cancelled without releasing incumbent lock")
             .expect("server task")
             .expect("cancellation");
-        assert_eq!(policy.browse(&session).await.expect("host metadata")[0].availability, crate::Availability::Available);
+        assert_eq!(policy.browse(&session).await.expect("host metadata")[0].availability, Availability::Available);
         drop(incumbent);
     }
 
@@ -1022,7 +1029,7 @@ mod tests {
         policy.trust_intermediary(trusted.fingerprint()).expect("host policy");
         for (relay, admitted) in [(trusted, true), (Identity::generate(), false)] {
             let (mut client, server) = UnixStream::pair().expect("transport pair");
-            let pending = tokio::spawn(serve(server, host.clone(), policy.clone(), Arc::new(Mutex::new(BTreeMap::new())), None));
+            let pending = spawn(serve(server, host.clone(), policy.clone(), Arc::new(Mutex::new(BTreeMap::new())), None));
             client_handshake(&mut client, &relay, &host.fingerprint()).await.expect("authenticate relay");
             write_control(&mut client, &Request::Relay { host: host.fingerprint(), hops: 1 }).await.expect("relay request");
             match read_control(&mut client).await.expect("admission") {
@@ -1042,7 +1049,7 @@ mod tests {
         for cause in ["owner", "registration"] {
             let (sender, receiver) = mpsc::unbounded_channel();
             let (mut registration, remote) = UnixStream::pair().expect("registration pair");
-            let paused = tokio::spawn(async move { pause_publisher_retry(&sender, &mut registration, Duration::from_secs(8)).await });
+            let paused = spawn(async move { pause_publisher_retry(&sender, &mut registration, Duration::from_secs(8)).await });
             match cause {
                 "owner" => drop(receiver),
                 "registration" => drop(remote),

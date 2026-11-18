@@ -14,16 +14,23 @@ contract suite in `tests/contracts.rs` states each rule against both adapters.
 - **Identity is scope and name.** A `PublicationId` is a `Scope` (a vessel, or
   the publishing instance for a host endpoint) plus a name chosen by whoever
   asks. The publisher and its route are not part of it. A `Grant` names who may
-  publish under a scope; the host publishes under any scope on its own
-  authority. Publishing an identity whose publisher is unavailable or withdrawn
-  takes it over at the next generation, whoever was there before; a live
-  incumbent wins with `LivePublisher`. Withdrawal is not terminal: any
-  publisher granted the scope may publish a withdrawn identity again,
-  including one that is not the publisher that withdrew it, since withdrawal
-  ends a publisher's claim rather than the identity. Streams already open stay
-  on the old route and break with it; nothing is replayed or moved.
-- **Bindings.** `bind` gives a Local Endpoint keyed by publication identity
-  and the instance that bound it. Its streams are authorised as that
+  publish under a scope. The host publishes on its own authority under its
+  instance scope, `tender/<fingerprint>` (`Scope::instance`), and under
+  `vessel/…` scopes; any other scope needs a grant, which the host may hold
+  too. Only the instance a `tender/<fingerprint>` scope names ever publishes
+  under it, whatever grants say. Publishing an identity whose publisher is
+  unavailable or withdrawn takes it over at a new generation, whoever was
+  there before; a live incumbent wins with `LivePublisher`. Withdrawal is not
+  terminal: any publisher granted the scope may publish a withdrawn identity
+  again, including one that is not the publisher that withdrew it, since
+  withdrawal ends a publisher's claim rather than the identity. The authority
+  forgets a withdrawn publication after `WITHDRAWN_RETENTION` (a minute), and
+  generations come from one counter, so none is ever reissued. Streams already
+  open stay on the old route and break with it; nothing is replayed or moved.
+- **Bindings.** An adapter's `bind` gives a Local Endpoint over its one route,
+  keyed by publication identity and the instance that bound it. It is a
+  building block: the daemon's Bindings choose among the Trusted Group's
+  instances and live at a computed path. Its streams are authorised as that
   instance, and every local client of the instance shares it. Its `BindingState` is available
   (with its `Route`: the carrying instance and any relay), unavailable (with
   an `UnavailableReason`) or revoked (the audience or grant no longer admits

@@ -1,9 +1,20 @@
+#[cfg(unix)]
+use std::{collections::BTreeMap, fs::Permissions, os::unix::fs::PermissionsExt, sync::Arc};
 use std::{collections::BTreeSet, time::Duration};
 
+#[cfg(unix)]
+use sha2::{Digest, Sha256};
+#[cfg(unix)]
+use tempfile::{Builder, TempDir};
+#[cfg(unix)]
+use tender::ssh::{Identity, Server, SshTender};
 use tender::{
-    Availability, BindingState, ByteStream, Error, Fingerprint, Grant, Label, PublicationId, PublishRequest, Route, Scope, Session, Tender,
-    UnavailableReason, memory::MemoryTender,
+    Availability, BindingState, ByteStream, Error, Fingerprint, Grant, Label, Lease, PublicationId, PublishRequest, Route, Scope, Session,
+    Tender, UnavailableReason,
+    memory::{MemoryTender, WITHDRAWN_RETENTION},
 };
+#[cfg(unix)]
+use tokio::net::UnixStream;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     sync::mpsc::UnboundedReceiver,
@@ -61,7 +72,7 @@ struct Rig {
     host: Box<dyn HostControls>,
     host_id: Fingerprint,
     #[cfg(unix)]
-    _server: Option<(Vec<tender::ssh::Server>, tempfile::TempDir)>,
+    _server: Option<(Vec<Server>, TempDir)>,
 }
 
 fn memory() -> Rig {
@@ -87,21 +98,19 @@ fn fp(value: &str) -> Fingerprint {
     }
 }
 #[cfg(unix)]
-fn identity(label: &str) -> tender::ssh::Identity {
-    use sha2::{Digest, Sha256};
-    tender::ssh::Identity::from_secret(Sha256::digest(label.as_bytes()).into())
+fn identity(label: &str) -> Identity {
+    Identity::from_secret(Sha256::digest(label.as_bytes()).into())
 }
 
 #[cfg(unix)]
 async fn local_adapter() -> Rig {
-    use std::os::unix::fs::PermissionsExt;
-    let directory = tempfile::Builder::new().permissions(std::fs::Permissions::from_mode(0o700)).tempdir().expect("private directory");
+    let directory = Builder::new().permissions(Permissions::from_mode(0o700)).tempdir().expect("private directory");
     let host_identity = identity("host-key");
     let host_id = host_identity.fingerprint();
     let host = MemoryTender::new(host_id.clone());
     let endpoint = directory.path().join("tender");
-    let server = tender::ssh::Server::bind(endpoint.clone(), host_identity, host.clone()).expect("Tender listener");
-    let adapter = tender::ssh::SshTender::new(endpoint, host_id.clone(), CALLERS.into_iter().map(identity).collect()).expect("adapter");
+    let server = Server::bind(endpoint.clone(), host_identity, host.clone()).expect("Tender listener");
+    let adapter = SshTender::new(endpoint, host_id.clone(), CALLERS.into_iter().map(identity).collect()).expect("adapter");
     Rig { tender: Box::new(adapter), host: Box::new(host), host_id, _server: Some((vec![server], directory)) }
 }
 
@@ -130,28 +139,27 @@ const CALLERS: [&str; 16] = [
 // both relays admit every caller and forward to the host.
 #[cfg(unix)]
 async fn relayed_adapter() -> Rig {
-    use std::{os::unix::fs::PermissionsExt, sync::Arc};
-    let directory = tempfile::Builder::new().permissions(std::fs::Permissions::from_mode(0o700)).tempdir().expect("private directory");
+    let directory = Builder::new().permissions(Permissions::from_mode(0o700)).tempdir().expect("private directory");
     let host_identity = identity("host-key");
     let host_id = host_identity.fingerprint();
     let host = MemoryTender::new(host_id.clone());
     let relays = ["relay-key", "impostor"];
-    let mut paths = std::collections::BTreeMap::from([(host_id.clone(), directory.path().join("host"))]);
+    let mut paths = BTreeMap::from([(host_id.clone(), directory.path().join("host"))]);
     for relay in relays {
         paths.insert(fp(relay), directory.path().join(relay));
     }
-    let links = Arc::new(Links { paths: Arc::new(paths), next: std::collections::BTreeMap::from([(host_id.clone(), host_id.clone())]) });
-    let mut servers = vec![tender::ssh::Server::bind(links.paths[&host_id].clone(), host_identity, host.clone()).expect("host listener")];
+    let links = Arc::new(Links { paths: Arc::new(paths), next: BTreeMap::from([(host_id.clone(), host_id.clone())]) });
+    let mut servers = vec![Server::bind(links.paths[&host_id].clone(), host_identity, host.clone()).expect("host listener")];
     for relay in relays {
         let policy = MemoryTender::new(fp(relay));
         for caller in CALLERS {
             policy.allow_connect(fp(caller)).expect("relay policy");
         }
-        let server = tender::ssh::Server::bind(links.paths[&fp(relay)].clone(), identity(relay), policy).expect("relay listener");
+        let server = Server::bind(links.paths[&fp(relay)].clone(), identity(relay), policy).expect("relay listener");
         server.route_relays(links.clone());
         servers.push(server);
     }
-    let adapter = tender::ssh::SshTender::with_dial(links, host_id.clone(), CALLERS.into_iter().map(identity).collect()).expect("adapter");
+    let adapter = SshTender::with_dial(links, host_id.clone(), CALLERS.into_iter().map(identity).collect()).expect("adapter");
     Rig { tender: Box::new(adapter), host: Box::new(host), host_id, _server: Some((servers, directory)) }
 }
 
@@ -273,9 +281,9 @@ async fn identity_is_scope_and_name(rig: Rig) {
     grant(&rig, "outsider", "elsewhere", &["consumer"], 100);
     let first = rig.tender.publish(&owner, request("n", "service", &["consumer"])).await.expect("first");
     assert_eq!(first.lease.id, id("n", "service"));
-    let forged = tender::Lease { id: first.lease.id.clone(), generation: 1, publisher: fp("contender") };
+    let forged = Lease { id: first.lease.id.clone(), generation: 1, publisher: fp("contender") };
     assert!(matches!(rig.tender.withdraw(&contender, &forged).await, Err(Error::Denied)));
-    let missing = tender::Lease { id: id("n", "missing"), generation: 1, publisher: fp("contender") };
+    let missing = Lease { id: id("n", "missing"), generation: 1, publisher: fp("contender") };
     assert!(matches!(rig.tender.withdraw(&contender, &missing).await, Err(Error::Denied)));
     assert!(matches!(rig.tender.publish(&owner, request("n", "service", &["consumer"])).await, Err(Error::LivePublisher)));
     assert!(matches!(rig.tender.publish(&contender, request("n", "service", &["consumer"])).await, Err(Error::LivePublisher)));
@@ -361,6 +369,14 @@ async fn takeover_keeps_binding_without_replay(rig: Rig) {
     rig.tender.disconnect(&first_helper, &first.lease).await.expect("disconnect");
     let mut byte = [0];
     assert_eq!(timeout(Duration::from_secs(1), old_stream.read(&mut byte)).await.expect("close").expect("read"), 0);
+    // Between the publisher dropping and the takeover the Binding stays, and
+    // says why it cannot carry; a client of its socket is closed promptly.
+    let waiting = rig.tender.bind(&client, &first.lease.id).await.expect("bind while unavailable");
+    assert_eq!(waiting.state, unavailable(&rig, UnavailableReason::PublisherUnavailable));
+    #[cfg(unix)]
+    if let Ok(mut raw) = UnixStream::connect(&waiting.local_endpoint).await {
+        assert_eq!(timeout(Duration::from_secs(1), raw.read(&mut byte)).await.expect("closed promptly").unwrap_or(0), 0);
+    }
     let mut second = rig.tender.publish(&second_helper, request("n", "same-name", &["consumer"])).await.expect("takeover");
     let rebound = rig.tender.bind(&client, &first.lease.id).await.expect("rebind");
     assert_eq!((rebound.local_endpoint.as_str(), &rebound.state), (binding.local_endpoint.as_str(), &available(&rig, None)));
@@ -371,6 +387,48 @@ async fn takeover_keeps_binding_without_replay(rig: Rig) {
     let mut fresh = [0; 5];
     new_service.read_exact(&mut fresh).await.expect("new read");
     assert_eq!(&fresh, b"fresh");
+}
+
+// The host publishes under its own instance scope and under vessel scopes;
+// any other scope needs a grant, which the host may hold too. Only the
+// instance a `tender/<fingerprint>` scope names publishes under it, grant or no.
+async fn instance_and_vessel_scopes(rig: Rig) {
+    let host = session("host-key", &rig.host_id);
+    let helper = session("owner", &rig.host_id);
+    let own = Scope::instance(&rig.host_id).0;
+    rig.host.set_trusted_group(set(&["consumer"]));
+    rig.tender.publish(&host, request(&own, "terminal", &["consumer"])).await.expect("own instance scope");
+    rig.tender.publish(&host, request("vessel/7", "cleat/default", &["consumer"])).await.expect("vessel scope");
+    assert!(matches!(rig.tender.publish(&host, request("team", "board", &["consumer"])).await, Err(Error::Denied)));
+    grant(&rig, "host-key", "team", &["consumer"], 100);
+    rig.tender.publish(&host, request("team", "board", &["consumer"])).await.expect("granted scope");
+
+    let helper_scope = Scope::instance(&fp("owner")).0;
+    grant(&rig, "owner", &own, &["consumer"], 100);
+    assert!(matches!(rig.tender.publish(&helper, request(&own, "other", &["consumer"])).await, Err(Error::Denied)));
+    let other = Scope::instance(&fp("consumer")).0;
+    grant(&rig, "host-key", &other, &["consumer"], 100);
+    assert!(matches!(rig.tender.publish(&host, request(&other, "terminal", &["consumer"])).await, Err(Error::Denied)));
+    grant(&rig, "owner", &helper_scope, &["consumer"], 100);
+    rig.tender.publish(&helper, request(&helper_scope, "terminal", &["consumer"])).await.expect("helper's own instance scope");
+}
+
+// The authority forgets a withdrawn publication once followers have had time
+// to see the withdrawal; publishing it again never reissues a generation.
+async fn withdrawn_publications_are_forgotten(rig: Rig) {
+    let publisher = session("owner", &rig.host_id);
+    let client = reader(&rig, "consumer");
+    grant(&rig, "owner", "n", &["consumer"], u64::MAX);
+    let first = rig.tender.publish(&publisher, request("n", "service", &["consumer"])).await.expect("publish");
+    rig.host.advance_to(10);
+    rig.tender.withdraw(&publisher, &first.lease).await.expect("withdraw");
+    rig.host.advance_to(10 + WITHDRAWN_RETENTION - 1);
+    assert_eq!(rig.tender.browse(&client).await.expect("browse")[0].availability, Availability::Withdrawn);
+    assert!(matches!(rig.tender.connect(&client, &first.lease.id).await, Err(Error::Withdrawn)));
+    rig.host.advance_to(10 + WITHDRAWN_RETENTION);
+    assert!(rig.tender.browse(&client).await.expect("browse").is_empty());
+    let again = rig.tender.publish(&publisher, request("n", "service", &["consumer"])).await.expect("publish again");
+    assert!(again.lease.generation > first.lease.generation);
 }
 
 async fn restart_and_replacement(rig: Rig) {
@@ -429,7 +487,8 @@ async fn default_audience_is_trusted_group(rig: Rig) {
     rig.host.set_trusted_group(set(&["laptop", "outsider"]));
     assert_eq!(rig.tender.browse(&outsider).await.expect("browse")[0].audience, set(&["laptop", "outsider"]));
     rig.host.set_trusted_group(set(&["laptop"]));
-    let own = rig.tender.publish(&host, request("tender/host", "terminal", &["laptop", "outsider"])).await.expect("host publishes");
+    let own_scope = Scope::instance(&rig.host_id).0;
+    let own = rig.tender.publish(&host, request(&own_scope, "terminal", &["laptop", "outsider"])).await.expect("host publishes");
     let visible = rig.tender.browse(&laptop).await.expect("browse");
     assert_eq!(visible.iter().find(|publication| publication.id == own.lease.id).expect("own publication").audience, set(&["laptop"]));
     assert!(rig.tender.browse(&outsider).await.expect("browse").is_empty());
@@ -470,7 +529,7 @@ async fn narrowed_grant_revokes_binding(rig: Rig) {
     grant(&rig, "owner", "n", &["kept"], 100);
     assert!(watch.recv().await.expect("narrowed").is_empty());
     assert!(matches!(rig.tender.connect(&removed, &id).await, Err(Error::Denied)));
-    assert!(matches!(rig.tender.connect(&removed, &tender::PublicationId::new("n", "missing")).await, Err(Error::Denied)));
+    assert!(matches!(rig.tender.connect(&removed, &PublicationId::new("n", "missing")).await, Err(Error::Denied)));
     let revoked = rig.tender.bind(&removed, &id).await.expect("revoked binding");
     assert_eq!((revoked.local_endpoint.as_str(), &revoked.state), (binding.local_endpoint.as_str(), &BindingState::Revoked));
     assert!(matches!(rig.tender.open_binding(&removed, &binding).await, Err(Error::Denied)));
@@ -546,6 +605,8 @@ contract!(ungranted_scope_reveals_nothing);
 contract!(grant_loss_and_expiry);
 contract!(takeover_keeps_binding_without_replay);
 contract!(restart_and_replacement);
+contract!(instance_and_vessel_scopes);
+contract!(withdrawn_publications_are_forgotten);
 contract!(labels_and_display_are_carried);
 contract!(default_audience_is_trusted_group);
 contract!(publisher_receiver_closure);

@@ -3,21 +3,35 @@
 #[path = "common/ssh.rs"]
 mod ssh_fixture;
 
-use std::{collections::BTreeSet, os::unix::fs::PermissionsExt, path::PathBuf, time::Duration};
+use std::{
+    collections::BTreeSet,
+    env,
+    fs::{self, Permissions},
+    os::unix::fs::PermissionsExt,
+    path::{Path, PathBuf},
+    process::Output,
+    time::Duration,
+};
+
+use libc::{SIGTERM, kill};
+use tempfile::{Builder, TempDir};
 
 use tender::{
     Availability, Grant, Label, PublicationId, PublishRequest, Scope, Session, Tender,
     memory::MemoryTender,
     ssh::{Forward, Identity, Server, SshTender},
 };
-use tokio::{process::Command, time::timeout};
+use tokio::{
+    process::Command,
+    time::{sleep, timeout},
+};
 
 const SESSION: &str = "tender-proof";
 const DEADLINE: Duration = Duration::from_secs(15);
 
 struct Cleat {
     binary: PathBuf,
-    root: tempfile::TempDir,
+    root: TempDir,
 }
 
 impl Cleat {
@@ -35,7 +49,7 @@ impl Cleat {
     }
 
     fn socket(&self) -> PathBuf {
-        std::fs::read_dir(self.root.path())
+        fs::read_dir(self.root.path())
             .expect("runtime directory")
             .filter_map(Result::ok)
             .map(|entry| entry.path().join("socket"))
@@ -53,7 +67,7 @@ impl Cleat {
         command
     }
 
-    async fn packets(&self, socket: &str, session: &str) -> std::process::Output {
+    async fn packets(&self, socket: &str, session: &str) -> Output {
         timeout(DEADLINE, self.client().args(["packets", "--socket", socket, session]).output())
             .await
             .expect("connect-only packet deadline")
@@ -63,7 +77,7 @@ impl Cleat {
     async fn attach(&self, socket: &str, id: &str) {
         let script = self.root.path().join(format!("{id}.sh"));
         let quote = |value: &str| format!("'{}'", value.replace('\'', "'\"'\"'"));
-        std::fs::write(
+        fs::write(
             &script,
             format!("exec {} attach --socket {} {SESSION}\n", quote(self.binary.to_str().expect("binary path")), quote(socket)),
         )
@@ -95,13 +109,13 @@ impl Cleat {
 impl Drop for Cleat {
     fn drop(&mut self) {
         // Daemon owns only this private runtime. Clean up even after an assertion panic.
-        if let Ok(entries) = std::fs::read_dir(self.root.path()) {
+        if let Ok(entries) = fs::read_dir(self.root.path()) {
             for entry in entries.flatten() {
-                if let Ok(pid) = std::fs::read_to_string(entry.path().join("daemon.pid"))
+                if let Ok(pid) = fs::read_to_string(entry.path().join("daemon.pid"))
                     && let Ok(pid) = pid.trim().parse::<i32>()
                     && pid > 1
                 {
-                    unsafe { libc::kill(pid, libc::SIGTERM) };
+                    unsafe { kill(pid, SIGTERM) };
                 }
             }
         }
@@ -114,14 +128,10 @@ impl Drop for Cleat {
 #[tokio::test]
 async fn cleat_survives_ssh_loss_and_fresh_client_recovers() {
     let cleat = Cleat {
-        binary: std::env::var_os("TENDER_TEST_CLEAT").expect("provision pinned cleat with TENDER_TEST_CLEAT").into(),
-        root: tempfile::Builder::new()
-            .prefix("tc-")
-            .permissions(std::fs::Permissions::from_mode(0o700))
-            .tempdir()
-            .expect("private runtime"),
+        binary: env::var_os("TENDER_TEST_CLEAT").expect("provision pinned cleat with TENDER_TEST_CLEAT").into(),
+        root: Builder::new().prefix("tc-").permissions(Permissions::from_mode(0o700)).tempdir().expect("private runtime"),
     };
-    std::fs::create_dir(cleat.root.path().join("empty-client")).expect("empty client home");
+    fs::create_dir(cleat.root.path().join("empty-client")).expect("empty client home");
     let version = cleat.output(&["version"]).await;
     eprintln!("cleat provenance: {}", version.trim());
     assert!(version.contains("00c072b207dc") && version.contains("vt ghostty"), "proof requires pinned functional cleat");
@@ -129,17 +139,13 @@ async fn cleat_survives_ssh_loss_and_fresh_client_recovers() {
     // and each input appends exactly one line to an independent no-replay log.
     let log = cleat.root.path().join("inputs");
     let script = cleat.root.path().join("service.sh");
-    std::fs::write(&script, format!("stty -echo\nprintf 'READY\\n'\nwhile IFS= read -r line; do printf '%s\\n' \"$line\" >> '{}'; printf 'REPLY:%s\\n' \"$line\"; done\n", log.display())).expect("service script");
+    fs::write(&script, format!("stty -echo\nprintf 'READY\\n'\nwhile IFS= read -r line; do printf '%s\\n' \"$line\" >> '{}'; printf 'REPLY:%s\\n' \"$line\"; done\n", log.display())).expect("service script");
     cleat.output(&["launch", SESSION, "--cmd", &format!("sh {}", script.display()), "--no-record", "--json"]).await;
     let terminal = Cleat {
         binary: cleat.binary.clone(),
-        root: tempfile::Builder::new()
-            .prefix("tt-")
-            .permissions(std::fs::Permissions::from_mode(0o700))
-            .tempdir()
-            .expect("private terminal harness"),
+        root: Builder::new().prefix("tt-").permissions(Permissions::from_mode(0o700)).tempdir().expect("private terminal harness"),
     };
-    std::fs::create_dir(terminal.root.path().join("empty-client")).expect("empty attach client home");
+    fs::create_dir(terminal.root.path().join("empty-client")).expect("empty attach client home");
     let service_socket = cleat.socket();
     let sshd = ssh_fixture::Sshd::start().await;
     let host = Identity::generate();
@@ -187,7 +193,7 @@ async fn cleat_survives_ssh_loss_and_fresh_client_recovers() {
     terminal.output(&["send", "client-before", "before"]).await;
     terminal.rendered("client-before", "REPLY:before").await;
     let before = cleat.output(&["capture", SESSION]).await;
-    assert_eq!(std::fs::read_to_string(&log).expect("input log"), "before\n");
+    assert_eq!(fs::read_to_string(&log).expect("input log"), "before\n");
 
     // Kill only SSH; the existing daemon/session and its screen stay alive.
     forward.stop();
@@ -205,7 +211,7 @@ async fn cleat_survives_ssh_loss_and_fresh_client_recovers() {
                 );
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            sleep(Duration::from_millis(20)).await;
         }
     })
     .await
@@ -218,7 +224,7 @@ async fn cleat_survives_ssh_loss_and_fresh_client_recovers() {
     assert_eq!(cleat.output(&["capture", SESSION]).await, before, "cleat screen survives SSH loss");
     let unavailable = cleat.packets(&binding.local_endpoint, SESSION).await;
     assert!(!unavailable.status.success(), "socket-only client must refuse an unavailable route");
-    assert!(std::path::Path::new(&binding.local_endpoint).exists(), "stable Tender binding survives route loss");
+    assert!(Path::new(&binding.local_endpoint).exists(), "stable Tender binding survives route loss");
 
     let restored = Forward::start(sshd.target.clone(), &endpoint).await.expect("fresh SSH route");
     adapter.replace_route(restored.socket().to_owned());
@@ -226,16 +232,16 @@ async fn cleat_survives_ssh_loss_and_fresh_client_recovers() {
     assert!(cleat.packets(&binding.local_endpoint, SESSION).await.status.success(), "fresh packet client discovers living session");
     terminal.attach(&binding.local_endpoint, "client-after").await;
     terminal.rendered("client-after", "REPLY:before").await;
-    assert_eq!(std::fs::read_to_string(&log).expect("no replay log"), "before\n", "fresh initial render does not replay old input");
+    assert_eq!(fs::read_to_string(&log).expect("no replay log"), "before\n", "fresh initial render does not replay old input");
     terminal.output(&["send", "client-after", "after"]).await;
     terminal.rendered("client-after", "REPLY:after").await;
-    assert_eq!(std::fs::read_to_string(&log).expect("input log"), "before\nafter\n", "each input delivered exactly once");
+    assert_eq!(fs::read_to_string(&log).expect("input log"), "before\nafter\n", "each input delivered exactly once");
     assert!(
-        std::fs::read_dir(cleat.root.path().join("empty-client")).expect("client home").next().is_none(),
+        fs::read_dir(cleat.root.path().join("empty-client")).expect("client home").next().is_none(),
         "socket clients never create a local daemon"
     );
     assert!(
-        std::fs::read_dir(terminal.root.path().join("empty-client")).expect("attach home").next().is_none(),
+        fs::read_dir(terminal.root.path().join("empty-client")).expect("attach home").next().is_none(),
         "attach never creates local metadata"
     );
     terminal.output(&["kill", "client-after"]).await;

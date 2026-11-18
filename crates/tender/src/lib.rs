@@ -59,6 +59,24 @@ impl PublicKey {
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct Scope(pub String);
 
+impl Scope {
+    /// `tender/<fingerprint>`: the scope of one instance's own endpoints,
+    /// published by and followed from that instance alone.
+    pub fn instance(fingerprint: &Fingerprint) -> Self {
+        Self(format!("tender/{}", fingerprint.0))
+    }
+
+    /// The instance whose scope this is, for a `tender/<fingerprint>` scope.
+    pub fn owner(&self) -> Option<Fingerprint> {
+        self.0.strip_prefix("tender/").map(|fingerprint| Fingerprint(fingerprint.to_owned()))
+    }
+
+    /// A `vessel/…` scope, which whichever host holds the vessel publishes under.
+    pub fn is_vessel(&self) -> bool {
+        self.0.starts_with("vessel/")
+    }
+}
+
 /// A publication's identity. The name is chosen by whoever asks and is opaque
 /// to Tender; the publisher and its route are not part of the identity, so a
 /// publisher that moves keeps its publications (flotilla#3995).
@@ -244,9 +262,13 @@ pub trait Tender: Send + Sync {
     async fn connect_with_deadline(&self, session: &Session, id: &PublicationId, deadline: Duration) -> Result<ByteStream, Error> {
         tokio::time::timeout(deadline, self.connect(session, id)).await.map_err(|_| Error::Deadline)?
     }
-    /// Binding an identity again returns the same Local Endpoint with its
-    /// current state; once bound, a publication that stops admitting the caller
-    /// reports `Revoked` rather than disappearing.
+    /// A Local Endpoint for one identity over this adapter's one route, to the
+    /// host it is pinned to. This is a building block, not the daemon's
+    /// Binding: the daemon follows its whole Trusted Group, chooses a carrier
+    /// among the instances offering the identity, and owns the path clients
+    /// compute. Binding an identity again returns the same Local Endpoint with
+    /// its current state; once bound, a publication that stops admitting the
+    /// caller reports `Revoked` rather than disappearing.
     async fn bind(&self, session: &Session, id: &PublicationId) -> Result<Binding, Error>;
     async fn open_binding(&self, session: &Session, binding: &Binding) -> Result<ByteStream, Error>;
     async fn open_binding_with_deadline(&self, session: &Session, binding: &Binding, deadline: Duration) -> Result<ByteStream, Error> {
