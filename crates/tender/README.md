@@ -22,7 +22,7 @@ contract suite in `tests/contracts.rs` states each rule against both adapters.
   identity model (flotilla#3995), not a convention of one consumer. Tender
   cannot tell which vessels a host holds: what it checks is that only the
   host's own key publishes as the host, which in a daemon means the host
-  account's own control socket. A live incumbent still wins. Publishing an identity whose publisher is
+  account's own control socket. Publishing an identity whose publisher is
   unavailable or withdrawn takes it over at a new generation, whoever was
   there before; a live incumbent wins with `LivePublisher`. Withdrawal is not
   terminal: any publisher granted the scope may publish a withdrawn identity
