@@ -1,7 +1,13 @@
 //! Application directories using XDG conventions on every operating system.
-use std::path::PathBuf;
+#[cfg(unix)]
+mod runtime;
+
+use std::path::{Component, Path, PathBuf};
 
 use rigging_process::EnvVars;
+
+#[cfg(unix)]
+pub use self::runtime::runtime_dir;
 
 /// Resolved directories. Resolution does not create or inspect directories.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,11 +33,8 @@ impl PathPolicy {
     /// HOME is an error rather than falling back to `dirs::home_dir`.
     /// All path values preserve native OS strings.
     pub fn from_env(app: &str, env: &dyn EnvVars) -> Result<Self, String> {
-        let mut components = std::path::Path::new(app).components();
-        if !matches!(components.next(), Some(std::path::Component::Normal(_))) || components.next().is_some() {
-            return Err("application name must be a single normal path component".into());
-        }
-        if let Some(root) = env.get_os(&format!("{}_ROOT", app.to_ascii_uppercase().replace('-', "_"))) {
+        check_app(app)?;
+        if let Some(root) = env.get_os(&root_variable(app)) {
             if root.is_empty() {
                 return Err("application root override is empty".into());
             }
@@ -63,6 +66,18 @@ impl PathPolicy {
             cache_dir: resolve("XDG_CACHE_HOME", ".cache")?,
         })
     }
+}
+
+fn check_app(app: &str) -> Result<(), String> {
+    let mut components = Path::new(app).components();
+    if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
+        return Err("application name must be a single normal path component".into());
+    }
+    Ok(())
+}
+
+fn root_variable(app: &str) -> String {
+    format!("{}_ROOT", app.to_ascii_uppercase().replace('-', "_"))
 }
 
 #[cfg(test)]

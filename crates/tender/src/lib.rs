@@ -17,6 +17,9 @@ pub use rigging_stream::{ByteStream, RawStream};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
+pub mod api;
+#[cfg(unix)]
+pub mod daemon;
 pub mod memory;
 pub mod runtime;
 #[cfg(unix)]
@@ -25,6 +28,31 @@ pub mod ssh;
 /// Fingerprint of a persisted instance key, independent of its current route.
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct Fingerprint(pub String);
+
+/// An instance's Ed25519 public key in lowercase hex. A Trusted Group is a
+/// list of these, much like `authorized_keys`.
+#[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct PublicKey(pub String);
+
+impl PublicKey {
+    pub fn from_bytes(key: &[u8; 32]) -> Self {
+        Self(key.iter().map(|byte| format!("{byte:02x}")).collect())
+    }
+
+    /// `None` unless the key is 32 bytes of hex.
+    pub fn fingerprint(&self) -> Option<Fingerprint> {
+        use sha2::{Digest, Sha256};
+        let bytes = self.0.as_bytes();
+        if bytes.len() != 64 {
+            return None;
+        }
+        let key: Vec<u8> = bytes
+            .chunks(2)
+            .map(|pair| std::str::from_utf8(pair).ok().and_then(|pair| u8::from_str_radix(pair, 16).ok()))
+            .collect::<Option<_>>()?;
+        Some(Fingerprint(Sha256::digest(key).iter().map(|byte| format!("{byte:02x}")).collect()))
+    }
+}
 
 /// A vessel, or the publishing instance for a host endpoint. Who may publish
 /// under a scope is a [`Grant`].

@@ -228,6 +228,16 @@ impl MemoryTender {
         })
     }
 
+    /// Claim an identity without a route yet: the publication is recorded
+    /// unavailable, as one whose publisher has dropped, and publishing it
+    /// once the endpoint answers takes the next generation.
+    pub fn reserve(&self, session: &Session, request: PublishRequest) -> Result<Lease, Error> {
+        let mut state = self.state()?;
+        let lease = state.claim(session, request, None)?;
+        state.notify()?;
+        Ok(lease)
+    }
+
     pub fn host(&self) -> Fingerprint {
         self.inner.lock().expect("state lock").host.clone()
     }
@@ -263,6 +273,26 @@ impl MemoryTender {
         state.connect.insert(caller);
         state.notify()
     }
+    /// Replace who may browse and connect, closing the streams of anyone dropped.
+    pub fn set_access(&self, callers: BTreeSet<Fingerprint>) -> Result<(), Error> {
+        let mut state = self.state()?;
+        for record in state.records.values_mut() {
+            close_streams_of(record, |stream| !callers.contains(&stream.caller));
+        }
+        state.browse = callers.clone();
+        state.connect = callers;
+        state.notify()
+    }
+
+    pub fn grants(&self) -> Vec<Grant> {
+        self.inner.lock().expect("state lock").grants.values().cloned().collect()
+    }
+
+    /// Every record, whatever its audience: the host's own view.
+    pub fn publications(&self) -> Vec<Publication> {
+        self.inner.lock().expect("state lock").records.values().map(|record| record.publication.clone()).collect()
+    }
+
     pub fn trust_intermediary(&self, relay: Fingerprint) -> Result<(), Error> {
         let mut state = self.state()?;
         state.intermediaries.insert(relay);
@@ -611,6 +641,49 @@ impl State {
         self.lingering.retain(|lingering| !lingering.stream.task.is_finished());
     }
 
+    /// Admit `session` to publish `request` at a new generation: available
+    /// with `sender` as its route, or reserved and unavailable without one.
+    fn claim(
+        &mut self,
+        session: &Session,
+        request: PublishRequest,
+        sender: Option<mpsc::UnboundedSender<ByteStream>>,
+    ) -> Result<Lease, Error> {
+        self.authenticate(session)?;
+        let (ceiling, expires_at) = self.ceiling(&session.caller, &request.id.scope).ok_or(Error::Denied)?;
+        if expires_at <= self.now {
+            return Err(Error::GrantExpired);
+        }
+        let audience = self.audience(&request.audience, &ceiling);
+        if self.records.get(&request.id).is_some_and(|record| record.publication.availability == Availability::Available) {
+            return Err(Error::LivePublisher);
+        }
+        let generation = self.generation.checked_add(1).ok_or(Error::Storage)?;
+        self.generation = generation;
+        let availability = if sender.is_some() { Availability::Available } else { Availability::Unavailable };
+        let publication = Publication {
+            id: request.id.clone(),
+            label: request.label,
+            display: request.display,
+            publisher: session.caller.clone(),
+            audience,
+            generation,
+            availability,
+        };
+        // Nothing carries into the new generation. Streams the previous one
+        // still has (expiry lets them run to close) stay on their old route.
+        let record =
+            Record { publication, requested_audience: request.audience, expires_at, withdrawn_at: None, sender, streams: Vec::new() };
+        if let Some(previous) = self.records.insert(request.id.clone(), record) {
+            let publisher = previous.publication.publisher;
+            let carried =
+                previous.streams.into_iter().map(|stream| Lingering { id: request.id.clone(), publisher: publisher.clone(), stream });
+            self.lingering.extend(carried);
+            self.lingering.retain(|lingering| !lingering.stream.task.is_finished());
+        }
+        Ok(Lease { id: request.id, generation, publisher: session.caller.clone() })
+    }
+
     fn authenticate(&self, session: &Session) -> Result<(), Error> {
         if session.pinned_host != self.host {
             return Err(Error::IdentityMismatch);
@@ -684,48 +757,9 @@ impl State {
 impl Tender for MemoryTender {
     async fn publish(&self, session: &Session, request: PublishRequest) -> Result<Published, Error> {
         let mut state = self.state()?;
-        state.authenticate(session)?;
-        let (ceiling, expires_at) = state.ceiling(&session.caller, &request.id.scope).ok_or(Error::Denied)?;
-        if expires_at <= state.now {
-            return Err(Error::GrantExpired);
-        }
-        let audience = state.audience(&request.audience, &ceiling);
-        if state.records.get(&request.id).is_some_and(|record| record.publication.availability == Availability::Available) {
-            return Err(Error::LivePublisher);
-        }
-        let generation = state.generation.checked_add(1).ok_or(Error::Storage)?;
-        state.generation = generation;
         let (sender, incoming) = mpsc::unbounded_channel();
         let closure_sender = sender.clone();
-        let publication = Publication {
-            id: request.id.clone(),
-            label: request.label,
-            display: request.display,
-            publisher: session.caller.clone(),
-            audience,
-            generation,
-            availability: Availability::Available,
-        };
-        // Nothing carries into the new generation. Streams the previous one
-        // still has (expiry lets them run to close) stay on their old route.
-        if let Some(previous) = state.records.insert(
-            request.id.clone(),
-            Record {
-                publication,
-                requested_audience: request.audience,
-                expires_at,
-                withdrawn_at: None,
-                sender: Some(sender),
-                streams: Vec::new(),
-            },
-        ) {
-            let publisher = previous.publication.publisher;
-            let carried =
-                previous.streams.into_iter().map(|stream| Lingering { id: request.id.clone(), publisher: publisher.clone(), stream });
-            state.lingering.extend(carried);
-            state.lingering.retain(|lingering| !lingering.stream.task.is_finished());
-        }
-        let lease = Lease { id: request.id, generation, publisher: session.caller.clone() };
+        let lease = state.claim(session, request, Some(sender))?;
         state.notify()?;
         drop(state);
         let inner = self.inner.clone();
