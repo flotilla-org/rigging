@@ -12,7 +12,10 @@ use std::{
     io,
     os::unix::fs::{FileTypeExt, PermissionsExt},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
@@ -42,6 +45,11 @@ const MAX_CONTROL: usize = 64 * 1024;
 const MAX_CHANNELS: usize = 256;
 /// Bounds a relay chain, so a routing loop between relays fails promptly.
 const MAX_RELAY_HOPS: u8 = 8;
+/// The longest Unix socket path every platform accepts: `sun_path` holds 104
+/// bytes with its terminating NUL on macOS.
+const MAX_SOCKET_PATH: usize = 103;
+/// A Binding listener's name, its number in hex.
+const MAX_BINDING_NAME: usize = 16;
 
 /// Persist this key independently of SSH keys, account names, and routes.
 #[derive(Clone)]
@@ -576,6 +584,7 @@ pub struct SshTender {
     pin: Fingerprint,
     bindings: Bindings,
     directory: Arc<tempfile::TempDir>,
+    named: Arc<AtomicU64>,
     snapshots: Arc<Mutex<BTreeMap<Fingerprint, Vec<Publication>>>>,
 }
 
@@ -596,6 +605,16 @@ impl Drop for LocalBinding {
     }
 }
 
+/// A private directory whose Binding listeners all fit in a socket path. A
+/// temporary directory too deep for that, as macOS's can be, gives way to `/tmp`.
+fn binding_directory(temporary: &Path) -> io::Result<tempfile::TempDir> {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("tender-").permissions(std::fs::Permissions::from_mode(0o700));
+    // `<base>/tender-XXXXXX/<name>`
+    let fits = |base: &Path| base.as_os_str().len() + "/tender-XXXXXX/".len() + MAX_BINDING_NAME <= MAX_SOCKET_PATH;
+    builder.tempdir_in(if fits(temporary) { temporary } else { Path::new("/tmp") })
+}
+
 impl SshTender {
     /// Dial one socket path. It reaches only the pinned host, never a relay a
     /// session names in `via`; use [`Self::with_dial`] for relayed sessions.
@@ -612,9 +631,8 @@ impl SshTender {
             credentials: Arc::new(identities.into_iter().map(|identity| (identity.fingerprint(), identity)).collect()),
             pin,
             bindings: Arc::new(Mutex::new(BTreeMap::new())),
-            directory: Arc::new(
-                tempfile::Builder::new().prefix("tender-bindings-").permissions(std::fs::Permissions::from_mode(0o700)).tempdir()?,
-            ),
+            directory: Arc::new(binding_directory(&std::env::temp_dir())?),
+            named: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -844,8 +862,7 @@ impl Tender for SshTender {
         let path = match existing {
             Some(path) => path,
             None => {
-                let digest = Sha256::digest(serde_json::to_vec(&key).map_err(|_| Error::Unavailable)?);
-                let path = self.directory.path().join(digest.iter().take(16).map(|byte| format!("{byte:02x}")).collect::<String>());
+                let path = self.directory.path().join(format!("{:x}", self.named.fetch_add(1, Ordering::Relaxed)));
                 let listener = UnixListener::bind(&path).map_err(|_| Error::Unavailable)?;
                 std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).map_err(|_| Error::Unavailable)?;
                 // Avoid a reference cycle between the adapter and its owned task.
@@ -902,6 +919,23 @@ impl Tender for SshTender {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Every Binding listener fits in a socket path, however deep the
+    // temporary directory: a macOS-length one stays, a deeper one gives way.
+    #[test]
+    fn binding_listeners_fit_a_socket_path() {
+        let longest = |directory: &tempfile::TempDir| directory.path().join("f".repeat(MAX_BINDING_NAME)).as_os_str().len();
+        let base = tempfile::tempdir().expect("base");
+        let mut macos = base.path().to_path_buf();
+        while macos.as_os_str().len() < 49 {
+            macos.push("d");
+        }
+        std::fs::create_dir_all(&macos).expect("deep base");
+        let shallow = binding_directory(&macos).expect("directory");
+        assert!(shallow.path().starts_with(&macos) && longest(&shallow) <= MAX_SOCKET_PATH);
+        let deep = binding_directory(&macos.join("d".repeat(40))).expect("directory");
+        assert!(deep.path().starts_with("/tmp") && longest(&deep) <= MAX_SOCKET_PATH);
+    }
 
     // A failed partial write must not install an invalid permanent key file.
     #[test]

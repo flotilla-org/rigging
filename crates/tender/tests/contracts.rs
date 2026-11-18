@@ -329,13 +329,18 @@ async fn grant_loss_and_expiry(rig: Rig) {
     grant(&rig, "owner", "n", &["consumer"], 20);
     let mut second = rig.tender.publish(&publisher, request("n", "service", &["consumer"])).await.expect("republish under a new grant");
     assert_eq!(second.lease.generation, 2);
-    let mut connection = rig.tender.connect(&client, &second.lease.id).await.expect("open");
+    connection.write_all(b"!").await.expect("the expired generation's stream survives republish");
+    let mut byte = [0];
+    service.read_exact(&mut byte).await.expect("on its original route");
+    assert_eq!(&byte, b"!");
+    let mut newer = rig.tender.connect(&client, &second.lease.id).await.expect("open");
     let _service = second.incoming.recv().await.expect("incoming");
     rig.host.revoke(&fp("owner"), &Scope("n".into()));
     assert!(matches!(rig.tender.connect(&client, &second.lease.id).await, Err(Error::Withdrawn)));
     assert!(matches!(rig.tender.publish(&publisher, request("n", "newer", &["consumer"])).await, Err(Error::Denied)));
-    let mut byte = [0];
-    assert_eq!(timeout(Duration::from_secs(1), connection.read(&mut byte)).await.expect("revocation closes promptly").expect("read"), 0);
+    for stream in [&mut newer, &mut connection] {
+        assert_eq!(timeout(Duration::from_secs(1), stream.read(&mut byte)).await.expect("revocation closes promptly").expect("read"), 0);
+    }
 }
 
 // A takeover keeps the Binding: streams open on the old route break with it,

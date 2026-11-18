@@ -35,6 +35,14 @@ struct OpenStream {
     task: JoinHandle<()>,
 }
 
+/// A stream that outlived its generation: expiry let it run to close, and a
+/// republish left it on the route it opened on.
+struct Lingering {
+    id: PublicationId,
+    publisher: Fingerprint,
+    stream: OpenStream,
+}
+
 struct State {
     host: Fingerprint,
     now: u64,
@@ -44,6 +52,7 @@ struct State {
     intermediaries: BTreeSet<Fingerprint>,
     trusted_group: BTreeSet<Fingerprint>,
     records: BTreeMap<PublicationId, Record>,
+    lingering: Vec<Lingering>,
     /// Callers that have bound each identity, so losing admission reads as
     /// Revoked rather than as an identity that never existed.
     bound: BTreeSet<(Fingerprint, PublicationId)>,
@@ -66,6 +75,7 @@ impl MemoryTender {
                 intermediaries: BTreeSet::new(),
                 trusted_group: BTreeSet::new(),
                 records: BTreeMap::new(),
+                lingering: Vec::new(),
                 bound: BTreeSet::new(),
                 runtime: None,
                 failed: false,
@@ -247,6 +257,7 @@ impl MemoryTender {
     pub fn revoke(&self, grantee: &Fingerprint, scope: &Scope) -> Result<(), Error> {
         let mut state = self.state()?;
         state.grants.remove(&(grantee.clone(), scope.clone()));
+        state.close_lingering(|lingering| &lingering.publisher == grantee && &lingering.id.scope == scope);
         for record in state.records.values_mut() {
             if &record.publication.publisher == grantee && &record.publication.id.scope == scope {
                 retire(record, true);
@@ -266,6 +277,7 @@ impl MemoryTender {
     /// Persist metadata, never routes or live publisher claims.
     pub fn restart(&self) -> Result<(), Error> {
         let mut state = self.state()?;
+        state.close_lingering(|_| true);
         for record in state.records.values_mut() {
             abort_streams(record);
             if record.publication.availability == Availability::Available {
@@ -435,9 +447,19 @@ impl Stored {
 impl State {
     fn fail(&mut self) {
         self.failed = true;
+        self.close_lingering(|_| true);
         for record in self.records.values_mut() {
             retire(record, true);
         }
+    }
+
+    fn close_lingering(&mut self, closes: impl Fn(&Lingering) -> bool) {
+        for lingering in &self.lingering {
+            if closes(lingering) {
+                lingering.stream.task.abort();
+            }
+        }
+        self.lingering.retain(|lingering| !lingering.stream.task.is_finished());
     }
 
     fn expire(&mut self) {
@@ -522,6 +544,13 @@ impl State {
                 retire(record, false);
             }
         }
+        let ceilings: Vec<_> = self.lingering.iter().map(|lingering| self.ceiling(&lingering.publisher, &lingering.id.scope)).collect();
+        for (lingering, ceiling) in self.lingering.iter().zip(ceilings) {
+            if !ceiling.is_some_and(|(ceiling, _)| ceiling.contains(&lingering.stream.caller)) {
+                lingering.stream.task.abort();
+            }
+        }
+        self.lingering.retain(|lingering| !lingering.stream.task.is_finished());
     }
 
     fn authenticate(&self, session: &Session) -> Result<(), Error> {
@@ -619,13 +648,17 @@ impl Tender for MemoryTender {
             generation,
             availability: Availability::Available,
         };
-        // A takeover keeps nothing from the previous generation: its streams
-        // stayed on the old route and broke with it.
-        if let Some(mut previous) = state.records.insert(
+        // Nothing carries into the new generation. Streams the previous one
+        // still has (expiry lets them run to close) stay on their old route.
+        if let Some(previous) = state.records.insert(
             request.id.clone(),
             Record { publication, requested_audience: request.audience, expires_at, sender: Some(sender), streams: Vec::new() },
         ) {
-            abort_streams(&mut previous);
+            let publisher = previous.publication.publisher;
+            let carried =
+                previous.streams.into_iter().map(|stream| Lingering { id: request.id.clone(), publisher: publisher.clone(), stream });
+            state.lingering.extend(carried);
+            state.lingering.retain(|lingering| !lingering.stream.task.is_finished());
         }
         let lease = Lease { id: request.id, generation, publisher: session.caller.clone() };
         state.notify()?;
