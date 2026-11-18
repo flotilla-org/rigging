@@ -1,0 +1,22 @@
+[package]
+name = "tender-types"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+# Kept light for every Tender client: serde and a hash, no HTTP stack.
+[dependencies]
+serde = { workspace = true }
+sha2 = "0.10"
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[dev-dependencies]
+hegeltest.workspace = true
+serde_json = "1"
+
+[lints]
+workspace = true

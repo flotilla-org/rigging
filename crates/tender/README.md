@@ -42,8 +42,9 @@ contract suite in `tests/contracts.rs` states each rule against both adapters.
 `tender serve` runs one instance per OS account (`daemon::serve`, Unix only).
 Directories come from `daemon::Paths::from_env`: configuration and state
 follow `rigging-paths` (`TENDER_ROOT`, then XDG), and sockets live in the
-runtime directory, `$TENDER_ROOT/runtime`, else `$XDG_RUNTIME_DIR/tender`,
-else `tender-<uid>` in the temporary directory. All three are created 0700.
+runtime directory, `tender_types::paths::runtime_dir`: `$TENDER_ROOT/runtime`,
+else `$XDG_RUNTIME_DIR/tender`, else `tender-<uid>` in the temporary
+directory. All three are created 0700.
 
 - **State:** the instance key (`identity`) and the authority store, as for
   `ssh::Server::open`. The key is the instance's identity for as long as the
@@ -53,7 +54,7 @@ else `tender-<uid>` in the temporary directory. All three are created 0700.
   anyone else is refused.
 - **`runtime/control`:** the control API, HTTP over the Local Endpoint
   (`rigging-http-serve`), with JSON or CBOR bodies (`rigging-http-wire`). Its
-  paths and bodies are in `api`:
+  paths and bodies are in `api` (`tender_types::api`):
 
   | Route | Body | Answer |
   |---|---|---|
@@ -64,7 +65,8 @@ else `tender-<uid>` in the temporary directory. All three are created 0700.
   | `GET /v1/trusted` | | the Trusted Group, as `TrustedMember`s |
   | `POST /v1/trusted` | `TrustedInstance` | adds or replaces a member |
   | `POST /v1/trusted/remove` | `Untrust` | 404 unless a member |
-  | `GET /v1/diagnostics` | | `Diagnostics` |
+  | `GET /v1/bindings` | | this machine's `BindingEntry`s |
+  | `GET /v1/diagnostics` | | `Diagnostics`, with each member's `PeerStatus` |
 
 - **`config.toml`** (read at start) lists `[[publication]]`s, each with an
   optional `scope` (default `tender/<fingerprint>`), `name`, `label`,
@@ -96,6 +98,62 @@ endpoint = "/run/user/1000/cleat/default/socket"
 grantee = "<helper fingerprint>"
 scope = "vessel/7"
 ```
+
+### Eager Bindings
+
+The daemon follows the publication list of every Trusted Group member that
+has a `route`, and keeps a Binding for every publication that admits this
+instance, its own included, for as long as the publication exists. Nothing
+asks for a Binding, and binding never starts anything on either side.
+
+- **Where.** A Binding's Local Endpoint is
+  `tender_types::paths::binding_path(runtime, id)`: `runtime/b/<scope>,<name>`
+  with every byte outside `[A-Za-z0-9._-]` written `%XX`, or `~` and a hash
+  when that would pass the 103-byte socket-path limit. Clients compute it;
+  `tender path` prints it and `GET /v1/bindings` lists it.
+- **Own publications.** When this instance publishes the identity from a
+  local socket, the Binding is a symbolic link to that socket, with nothing
+  in between. Other publications hosted here, such as a granted helper's, are
+  served through this instance's authority.
+- **Others.** A listener at the path opens each connection's stream into the
+  publisher as it arrives. While the publication is unavailable, withdrawn or
+  revoked, connections are closed at once with no bytes; nothing is injected
+  into the application's stream.
+- **Routes.** A member with `route.socket` alone is reached on this machine;
+  with `route.ssh` the daemon holds an SSH forward (`rigging-ssh`, the
+  operator's ssh_config) to that socket on the member's machine. A lost route
+  is restored with backoff, through a fresh forward, and meanwhile its
+  Bindings report `RouteUnavailable`.
+- **Which carrier.** One identity may be published by several instances, as
+  when a vessel moves host. A Binding keeps its current carrier while that
+  carrier's copy is live; otherwise it moves to a live copy, this instance's
+  own first, keeping its Local Endpoint. Streams already open stay on the old
+  route. A Binding whose identity no member offers any more is `Revoked`, and
+  its endpoint closes connections.
+- Bindings belong to a running daemon: it clears `runtime/b` at start.
+
+### The `tender` command
+
+`tender serve` runs the daemon; the other commands are clients of its control
+API, found through `TENDER_ROOT` or `XDG_RUNTIME_DIR` as the daemon does.
+`--json` prints JSON for scripts.
+
+```text
+tender identity | publications | bindings | diagnostics
+tender publish <scope> <name> --label L --endpoint SOCKET [--display D] [--audience FP]...
+tender withdraw <scope> <name>
+tender path <scope> <name>                     # computed, no daemon needed
+tender trust list | add <key> [--socket S [--ssh DEST]] | remove <fingerprint>
+tender trust pair <ssh-destination> [--remote-tender CMD]
+```
+
+`tender trust pair` exchanges keys over a working SSH destination: it runs
+`tender trust accept <own key>` there, which trusts this instance and prints
+the far instance. This instance then trusts the far key and follows it over
+SSH. The far side trusts this one without a route, since it may have none
+back. SSH carries the exchange; each side's trust is the other's key.
+
+Cleat needs no layout from Tender: `cleat attach --socket "$(tender path vessel/<id> cleat/default)"`.
 
 ## SSH adapter
 

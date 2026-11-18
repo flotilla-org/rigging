@@ -15,93 +15,19 @@ use std::{collections::BTreeSet, fmt, io, time::Duration};
 use async_trait::async_trait;
 pub use rigging_stream::{ByteStream, RawStream};
 use serde::{Deserialize, Serialize};
+pub use tender_types::{
+    Availability, BindingState, Fingerprint, Label, PublicKey, Publication, PublicationId, Route, Scope, UnavailableReason, api, paths,
+};
 use tokio::sync::mpsc;
 
-pub mod api;
+#[cfg(unix)]
+pub mod cli;
 #[cfg(unix)]
 pub mod daemon;
 pub mod memory;
 pub mod runtime;
 #[cfg(unix)]
 pub mod ssh;
-
-/// Fingerprint of a persisted instance key, independent of its current route.
-#[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
-pub struct Fingerprint(pub String);
-
-/// An instance's Ed25519 public key in lowercase hex. A Trusted Group is a
-/// list of these, much like `authorized_keys`.
-#[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
-pub struct PublicKey(pub String);
-
-impl PublicKey {
-    pub fn from_bytes(key: &[u8; 32]) -> Self {
-        Self(key.iter().map(|byte| format!("{byte:02x}")).collect())
-    }
-
-    /// `None` unless the key is 32 bytes of hex.
-    pub fn fingerprint(&self) -> Option<Fingerprint> {
-        use sha2::{Digest, Sha256};
-        let bytes = self.0.as_bytes();
-        if bytes.len() != 64 {
-            return None;
-        }
-        let key: Vec<u8> = bytes
-            .chunks(2)
-            .map(|pair| std::str::from_utf8(pair).ok().and_then(|pair| u8::from_str_radix(pair, 16).ok()))
-            .collect::<Option<_>>()?;
-        Some(Fingerprint(Sha256::digest(key).iter().map(|byte| format!("{byte:02x}")).collect()))
-    }
-}
-
-/// A vessel, or the publishing instance for a host endpoint. Who may publish
-/// under a scope is a [`Grant`].
-#[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
-pub struct Scope(pub String);
-
-/// A publication's identity. The name is chosen by whoever asks and is opaque
-/// to Tender; the publisher and its route are not part of the identity, so a
-/// publisher that moves keeps its publications (flotilla#3995).
-#[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
-pub struct PublicationId {
-    pub scope: Scope,
-    pub name: String,
-}
-
-impl PublicationId {
-    pub fn new(scope: impl Into<String>, name: impl Into<String>) -> Self {
-        Self { scope: Scope(scope.into()), name: name.into() }
-    }
-}
-
-impl fmt::Display for PublicationId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}:{}", self.scope.0, self.name)
-    }
-}
-
-/// The protocol a publication claims to speak (`cleat`, `agent-view`, `http`,
-/// …). Tender never checks it; the application's own handshake does.
-#[derive(Serialize, Deserialize, Clone, Debug, Default, Eq, PartialEq, Ord, PartialOrd, Hash)]
-pub struct Label(pub String);
-
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Availability {
-    Available,
-    Unavailable,
-    Withdrawn,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
-pub struct Publication {
-    pub id: PublicationId,
-    pub label: Label,
-    pub display: String,
-    pub publisher: Fingerprint,
-    pub audience: BTreeSet<Fingerprint>,
-    pub generation: u64,
-    pub availability: Availability,
-}
 
 /// The host enforces this grant, including its audience ceiling and expiry.
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -161,39 +87,6 @@ pub struct Published {
     pub lease: Lease,
     /// One accepted raw channel per successful connect.
     pub incoming: mpsc::UnboundedReceiver<ByteStream>,
-}
-
-/// The instance carrying a Binding's streams, and the relay in between if any.
-#[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
-pub struct Route {
-    pub instance: Fingerprint,
-    pub via: Option<Fingerprint>,
-}
-
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, Eq, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum UnavailableReason {
-    /// The publisher went away; another may take the identity over.
-    PublisherUnavailable,
-    Withdrawn,
-    /// No route currently reaches an instance carrying the publication.
-    RouteUnavailable,
-}
-
-/// For display and diagnostics only: clients connect to the Local Endpoint
-/// whatever the state, and an unavailable Binding refuses or closes promptly.
-#[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
-#[serde(rename_all = "snake_case", tag = "state")]
-pub enum BindingState {
-    Available {
-        route: Route,
-    },
-    Unavailable {
-        reason: UnavailableReason,
-        route: Option<Route>,
-    },
-    /// The publication's audience or grant no longer admits this machine.
-    Revoked,
 }
 
 /// A Local Endpoint for a publication, keyed by its identity and the instance

@@ -132,7 +132,8 @@ async fn published_endpoint_follows_its_service() {
     let echo_task = echo(&service);
     let id = PublicationId::new("tender/test", "echo");
     let published: tender::Publication = control.post(api::PUBLISH, &publish_request(&id, &service)).await.expect("publish");
-    assert_eq!((published.availability, published.audience.clone()), (Availability::Available, BTreeSet::from([peer.fingerprint()])));
+    let group = BTreeSet::from([peer.fingerprint(), host.clone()]);
+    assert_eq!((published.availability, published.audience.clone()), (Availability::Available, group));
     let refused: Result<tender::Publication, _> = control.post(api::PUBLISH, &publish_request(&id, &service)).await;
     assert_eq!(refused.expect_err("live incumbent").1.code, "live_publisher");
     let entries: Vec<PublicationEntry> = control.get(api::PUBLICATIONS).await.expect("publications");
@@ -233,7 +234,7 @@ async fn configuration_publishes_endpoints_and_grants_scopes() {
     let mut published = client.publish(&as_helper, request("vessel/7")).await.expect("granted publish");
     let visible = client.browse(&Session { caller: member.fingerprint(), pinned_host: host.clone(), via: None }).await.expect("browse");
     let vessel = visible.iter().find(|publication| publication.id == published.lease.id).expect("visible to the group");
-    assert_eq!(vessel.audience, BTreeSet::from([member.fingerprint()]));
+    assert_eq!(vessel.audience, BTreeSet::from([member.fingerprint(), host.clone()]));
     let as_member = Session { caller: member.fingerprint(), pinned_host: host, via: None };
     let stream = client.connect(&as_member, &published.lease.id).await.expect("member connects");
     let mut service = timeout(Duration::from_secs(5), published.incoming.recv()).await.expect("accept deadline").expect("accepted");

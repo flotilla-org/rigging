@@ -2220,10 +2220,22 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
+ "tender-types",
  "tokio",
  "toml",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "tender-types"
+version = "0.1.0"
+dependencies = [
+ "hegeltest",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]

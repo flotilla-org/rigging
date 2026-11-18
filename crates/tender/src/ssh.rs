@@ -686,6 +686,33 @@ impl SshTender {
         .map_err(|_| Error::Deadline)?
     }
 
+    /// Like [`Tender::watch`], but the receiver closes when the control stream
+    /// does, instead of reconnecting: the caller learns the route failed and
+    /// restores it, perhaps through a new forward, before subscribing again.
+    pub async fn subscribe(&self, session: &Session) -> Result<Watch, Error> {
+        let mut stream = self.request(session, Request::Watch).await?;
+        let first = timeout(OPEN_TIMEOUT, read_control(&mut stream)).await.map_err(|_| Error::Deadline)?.map_err(|_| Error::Unavailable)?;
+        let first = match first {
+            Response::Publications(publications) => publications,
+            Response::Error(error) => return Err(error),
+            _ => return Err(Error::Unavailable),
+        };
+        let (sender, receiver) = mpsc::unbounded_channel();
+        sender.send(first).expect("new watch receiver");
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = sender.closed() => break,
+                    response = read_control(&mut stream) => match response {
+                        Ok(Response::Publications(publications)) => if sender.send(publications).is_err() { break },
+                        _ => break,
+                    },
+                }
+            }
+        });
+        Ok(receiver)
+    }
+
     async fn reply(&self, session: &Session, request: Request) -> Result<Response, Error> {
         let mut stream = self.request(session, request).await?;
         let response =
