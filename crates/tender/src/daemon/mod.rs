@@ -397,13 +397,14 @@ impl Inner {
 
     /// Republish an own publication once its endpoint answers again, and
     /// forget one that another publisher has taken over or that has gone.
-    /// Endpoints are probed outside the state lock.
+    /// The authority is read under the state lock, so a publish cannot land
+    /// between the two; endpoints are probed outside it.
     async fn maintain(&self) {
-        let records: BTreeMap<_, _> =
-            self.policy().publications().into_iter().map(|publication| (publication.id.clone(), publication)).collect();
         let mut recovering = Vec::new();
         {
             let mut state = self.state.lock().await;
+            let records: BTreeMap<_, _> =
+                self.policy().publications().into_iter().map(|publication| (publication.id.clone(), publication)).collect();
             state.local.retain(|id, local| {
                 let ours = records.get(id).filter(|record| {
                     &record.publisher == self.fingerprint()
@@ -480,4 +481,37 @@ pub async fn serve(paths: Paths) -> io::Result<()> {
     }
     daemon.shutdown().await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::net::UnixListener;
+
+    use super::*;
+    use crate::Label;
+
+    // A publish that lands while maintenance waits for the state lock survives
+    // it: maintenance compares against the authority as of holding the lock.
+    #[tokio::test]
+    async fn maintenance_keeps_a_concurrent_publish() {
+        let root = tempfile::Builder::new().prefix("td-").permissions(std::fs::Permissions::from_mode(0o700)).tempdir().expect("root");
+        let paths = Paths { config: root.path().join("config"), state: root.path().join("state"), runtime: root.path().join("runtime") };
+        let daemon = Daemon::start(paths).await.expect("start");
+        let endpoint = root.path().join("service");
+        let _listener = UnixListener::bind(&endpoint).expect("service");
+        let id = PublicationId::new("scope", "service");
+        let request = PublishEndpoint { id: id.clone(), label: Label("echo".into()), display: String::new(), endpoint, audience: None };
+        let inner = daemon.inner.clone();
+        let mut state = inner.state.lock().await;
+        let maintaining = tokio::spawn({
+            let inner = inner.clone();
+            async move { inner.maintain().await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        inner.publish_locked(&mut state, request).await.expect("publish");
+        drop(state);
+        maintaining.await.expect("maintain");
+        assert!(inner.state.lock().await.local.contains_key(&id), "maintenance dropped a publish it raced");
+        daemon.shutdown().await;
+    }
 }
