@@ -4,17 +4,20 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    fs::{self, Permissions},
     io,
-    os::unix::fs::PermissionsExt,
+    os::unix::fs::{PermissionsExt, symlink},
     path::{Path, PathBuf},
+    process,
     sync::{Arc, Mutex},
     time::Duration,
 };
 
 use rigging_ssh::Target as SshTarget;
 use tokio::{
+    io::copy_bidirectional,
     net::UnixListener,
-    select,
+    select, spawn,
     sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
     task::JoinHandle,
     time::{Instant, interval, sleep},
@@ -89,12 +92,12 @@ impl Bindings {
         // Bindings belong to a running daemon; a previous run's are stale.
         // The daemon has already checked that the runtime directory is this
         // user's own and private, so nobody else can plant what is removed.
-        match std::fs::remove_dir_all(&directory) {
+        match fs::remove_dir_all(&directory) {
             Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
             _ => {}
         }
-        std::fs::create_dir(&directory)?;
-        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?;
+        fs::create_dir(&directory)?;
+        fs::set_permissions(&directory, Permissions::from_mode(0o700))?;
         // Unbounded: senders are the followers and the local watch, each one
         // snapshot per change, and the Binder drains every pending event
         // before each rebind, so the backlog stays at a few snapshots.
@@ -114,9 +117,9 @@ impl Bindings {
             events: events.clone(),
             view: view.clone(),
         };
-        let task = tokio::spawn(binder.run(receiver));
+        let task = spawn(binder.run(receiver));
         let forward = events.clone();
-        let local = tokio::spawn(async move {
+        let local = spawn(async move {
             let mut local = local;
             while let Some(snapshot) = local.recv().await {
                 if forward.send(Event::Local(snapshot)).is_err() {
@@ -239,7 +242,7 @@ impl Drop for Bound {
         if let Some(Endpoint::Listener { task, .. }) = &self.endpoint {
             task.abort();
         }
-        let _ = std::fs::remove_file(&self.path);
+        let _ = fs::remove_file(&self.path);
     }
 }
 
@@ -296,9 +299,10 @@ impl Binder {
                 peer.name = member.name;
                 continue;
             }
-            let follower = member.route.clone().map(|route| {
-                tokio::spawn(follow(fingerprint.clone(), route, self.identity.clone(), self.own.clone(), self.events.clone()))
-            });
+            let follower = member
+                .route
+                .clone()
+                .map(|route| spawn(follow(fingerprint.clone(), route, self.identity.clone(), self.own.clone(), self.events.clone())));
             let state = if follower.is_some() { PeerState::Connecting } else { PeerState::NoRoute };
             self.peers.insert(
                 fingerprint,
@@ -435,11 +439,11 @@ fn place(bound: &mut Bound, id: &PublicationId, link: Option<PathBuf>, target: T
         (Some(Endpoint::Link(current)), Some(link)) if current == &link => Ok(()),
         (_, Some(link)) => {
             let mut staging = bound.path.clone().into_os_string();
-            staging.push(format!(".link-{}", std::process::id()));
+            staging.push(format!(".link-{}", process::id()));
             let staging = PathBuf::from(staging);
-            let _ = std::fs::remove_file(&staging);
-            std::os::unix::fs::symlink(&link, &staging)?;
-            std::fs::rename(&staging, &bound.path)?;
+            let _ = fs::remove_file(&staging);
+            symlink(&link, &staging)?;
+            fs::rename(&staging, &bound.path)?;
             if let Some(Endpoint::Listener { task, .. }) = bound.endpoint.replace(Endpoint::Link(link)) {
                 task.abort();
             }
@@ -450,14 +454,14 @@ fn place(bound: &mut Bound, id: &PublicationId, link: Option<PathBuf>, target: T
             Ok(())
         }
         (_, None) => {
-            match std::fs::remove_file(&bound.path) {
+            match fs::remove_file(&bound.path) {
                 Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
                 _ => {}
             }
             let listener = UnixListener::bind(&bound.path)?;
-            std::fs::set_permissions(&bound.path, std::fs::Permissions::from_mode(0o600))?;
+            fs::set_permissions(&bound.path, Permissions::from_mode(0o600))?;
             let shared = Arc::new(Mutex::new(target));
-            let task = tokio::spawn(serve(listener, id.clone(), shared.clone()));
+            let task = spawn(serve(listener, id.clone(), shared.clone()));
             if let Some(Endpoint::Listener { task, .. }) = bound.endpoint.replace(Endpoint::Listener { target: shared, task }) {
                 task.abort();
             }
@@ -473,14 +477,14 @@ async fn serve(listener: UnixListener, id: PublicationId, target: Arc<Mutex<Targ
         let Ok((mut local, _)) = listener.accept().await else { break };
         let target = target.lock().expect("target lock").clone();
         let id = id.clone();
-        tokio::spawn(async move {
+        spawn(async move {
             let remote = match target {
                 Target::Refuse => return,
                 Target::Peer { adapter, session } => adapter.connect(&session, &id).await,
                 Target::Authority { policy, session } => policy.connect(&session, &id).await,
             };
             if let Ok(mut remote) = remote {
-                let _ = tokio::io::copy_bidirectional(&mut local, &mut remote).await;
+                let _ = copy_bidirectional(&mut local, &mut remote).await;
             }
         });
     }
@@ -543,7 +547,7 @@ async fn follow(fingerprint: Fingerprint, route: PeerRoute, identity: Identity, 
 
 #[cfg(test)]
 mod tests {
-    use hegel::generators as gs;
+    use hegel::{TestCase, generators as gs};
 
     use super::*;
     use crate::{Label, PublicationId};
@@ -565,7 +569,7 @@ mod tests {
     // carrier is chosen if one exists; a Binding is left without a carrier
     // only when nothing admits this instance.
     #[hegel::test]
-    fn own_copy_then_live_incumbent_win(tc: hegel::TestCase) {
+    fn own_copy_then_live_incumbent_win(tc: TestCase) {
         let states = [Availability::Available, Availability::Unavailable, Availability::Withdrawn];
         let count = tc.draw(gs::integers::<usize>().max_value(4));
         let records: Vec<_> =

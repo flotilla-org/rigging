@@ -4,21 +4,25 @@
 use std::{
     collections::BTreeSet,
     io::{IsTerminal, stdin},
-    path::{PathBuf, absolute},
+    path::{Path, PathBuf, absolute},
 };
 
 use clap::{Args, Parser, Subcommand};
+use libc::gethostname;
 use reqwest::{Method, Request, Url, header};
 use rigging_http_client::{HttpClient, ReqwestHttpClient, http_channel_label};
+use rigging_process::ProcessEnvVars;
 use rigging_ssh::{DEFAULT_CONNECT_TIMEOUT, OpenSsh, SshSession, Target};
 use serde::{Serialize, de::DeserializeOwned};
+use serde_json::{from_slice, to_string, to_string_pretty, to_vec};
 
 use crate::{
-    Fingerprint, Label, PublicKey, PublicationId,
+    BindingState, Fingerprint, Label, PublicKey, Publication, PublicationId,
     api::{
         self, BindingEntry, Diagnostics, ErrorBody, Instance, PeerRoute, PublicationList, PublishEndpoint, TrustedInstance, TrustedMember,
         Untrust,
     },
+    daemon::{self, Paths},
     paths,
 };
 
@@ -136,8 +140,8 @@ pub async fn main() -> Result<(), String> {
     let json = cli.json;
     match cli.command {
         Command::Serve => {
-            let paths = crate::daemon::Paths::from_env(&rigging_process::ProcessEnvVars)?;
-            crate::daemon::serve(paths).await.map_err(|error| error.to_string())
+            let paths = Paths::from_env(&ProcessEnvVars)?;
+            daemon::serve(paths).await.map_err(|error| error.to_string())
         }
         Command::Identity => {
             let instance: Instance = control.get(api::IDENTITY).await?;
@@ -155,7 +159,7 @@ pub async fn main() -> Result<(), String> {
                 endpoint: absolute(&publish.endpoint).map_err(|error| format!("{}: {error}", publish.endpoint.display()))?,
                 audience,
             };
-            let publication: crate::Publication = control.post(api::PUBLISH, &request).await?;
+            let publication: Publication = control.post(api::PUBLISH, &request).await?;
             show(json, &publication, || format!("{} {:?} generation {}", publication.id, publication.availability, publication.generation))
         }
         Command::Withdraw(identity) => {
@@ -246,7 +250,7 @@ async fn trust(control: &Control, json: bool, trust: Trust) -> Result<(), String
             let route = socket.map(|socket| PeerRoute { ssh, socket }).or(existing);
             let _: TrustedMember = control.post(api::TRUSTED, &TrustedInstance { key, name, route }).await?;
             let instance: Instance = control.get(api::IDENTITY).await?;
-            println!("{}", serde_json::to_string(&instance).map_err(|error| error.to_string())?);
+            println!("{}", to_string(&instance).map_err(|error| error.to_string())?);
             Ok(())
         }
         Trust::Pair { destination, name, as_name, return_destination, expect_fingerprint, remote_tender } => {
@@ -254,9 +258,8 @@ async fn trust(control: &Control, json: bool, trust: Trust) -> Result<(), String
             let session = OpenSsh::connect(Target::Ambient { destination: destination.clone() }, DEFAULT_CONNECT_TIMEOUT)
                 .await
                 .map_err(|error| format!("ssh {destination}: {error}"))?;
-            let remote: Instance =
-                serde_json::from_slice(&remotely(&session, &destination, &format!("{remote_tender} --json identity")).await?)
-                    .map_err(|error| format!("{destination} answered something other than an instance: {error}"))?;
+            let remote: Instance = from_slice(&remotely(&session, &destination, &format!("{remote_tender} --json identity")).await?)
+                .map_err(|error| format!("{destination} answered something other than an instance: {error}"))?;
             let fingerprint = remote
                 .key
                 .fingerprint()
@@ -309,7 +312,7 @@ fn confirm(destination: &str, fingerprint: &Fingerprint, expected: Option<&str>)
 
 fn show<T: Serialize>(json: bool, value: &T, text: impl FnOnce() -> String) -> Result<(), String> {
     if json {
-        println!("{}", serde_json::to_string_pretty(value).map_err(|error| error.to_string())?);
+        println!("{}", to_string_pretty(value).map_err(|error| error.to_string())?);
     } else {
         let text = text();
         if !text.is_empty() {
@@ -319,11 +322,11 @@ fn show<T: Serialize>(json: bool, value: &T, text: impl FnOnce() -> String) -> R
     Ok(())
 }
 
-fn describe(state: &crate::BindingState) -> String {
+fn describe(state: &BindingState) -> String {
     match state {
-        crate::BindingState::Available { route } => format!("available via {}", route.instance.0),
-        crate::BindingState::Unavailable { reason, .. } => format!("unavailable ({reason:?})"),
-        crate::BindingState::Revoked => "revoked".into(),
+        BindingState::Available { route } => format!("available via {}", route.instance.0),
+        BindingState::Unavailable { reason, .. } => format!("unavailable ({reason:?})"),
+        BindingState::Revoked => "revoked".into(),
     }
 }
 
@@ -342,7 +345,7 @@ fn quote(value: &str) -> String {
 fn hostname() -> String {
     let mut buffer = [0u8; 256];
     // SAFETY: the buffer is writable for its whole length.
-    if unsafe { libc::gethostname(buffer.as_mut_ptr().cast(), buffer.len()) } != 0 {
+    if unsafe { gethostname(buffer.as_mut_ptr().cast(), buffer.len()) } != 0 {
         return String::new();
     }
     let end = buffer.iter().position(|&byte| byte == 0).unwrap_or(buffer.len());
@@ -352,7 +355,7 @@ fn hostname() -> String {
 struct Control(ReqwestHttpClient);
 
 impl Control {
-    fn new(socket: &std::path::Path) -> Result<Self, String> {
+    fn new(socket: &Path) -> Result<Self, String> {
         Ok(Self(ReqwestHttpClient::local(socket)?))
     }
 
@@ -370,7 +373,7 @@ impl Control {
         request.headers_mut().insert(header::ACCEPT, header::HeaderValue::from_static("application/json"));
         if let Some(body) = body {
             request.headers_mut().insert(header::CONTENT_TYPE, header::HeaderValue::from_static("application/json"));
-            *request.body_mut() = Some(serde_json::to_vec(body).map_err(|error| error.to_string())?.into());
+            *request.body_mut() = Some(to_vec(body).map_err(|error| error.to_string())?.into());
         }
         let response = self
             .0
@@ -378,9 +381,9 @@ impl Control {
             .await
             .map_err(|error| format!("cannot reach the Tender daemon (is `tender serve` running?): {error}"))?;
         if response.status().is_success() {
-            serde_json::from_slice(response.body()).map_err(|error| format!("unexpected answer from the daemon: {error}"))
+            from_slice(response.body()).map_err(|error| format!("unexpected answer from the daemon: {error}"))
         } else {
-            let error: ErrorBody = serde_json::from_slice(response.body()).unwrap_or_else(|_| ErrorBody {
+            let error: ErrorBody = from_slice(response.body()).unwrap_or_else(|_| ErrorBody {
                 code: response.status().as_str().into(),
                 message: String::from_utf8_lossy(response.body()).into(),
             });
@@ -391,13 +394,15 @@ impl Control {
 
 #[cfg(test)]
 mod tests {
+    use std::process;
+
     use super::*;
 
     // Whatever a name holds, the far shell sees it as one literal word.
     #[test]
     fn quoted_values_stay_one_shell_word() {
         for value in ["plain", "with space", "it's", "$(touch /tmp/x)", "'; rm -rf ~; '", ""] {
-            let output = std::process::Command::new("sh").args(["-c", &format!("printf %s {}", quote(value))]).output().expect("sh");
+            let output = process::Command::new("sh").args(["-c", &format!("printf %s {}", quote(value))]).output().expect("sh");
             assert_eq!(String::from_utf8(output.stdout).expect("UTF-8"), value);
         }
     }

@@ -3,7 +3,7 @@
 //! an identity into its Binding's Local Endpoint. Consumers call the control
 //! API with their own HTTP client.
 
-use std::{collections::BTreeSet, fmt};
+use std::{collections::BTreeSet, fmt, str::from_utf8};
 
 use serde::{Deserialize, Serialize};
 
@@ -31,10 +31,8 @@ impl PublicKey {
         if bytes.len() != 64 {
             return None;
         }
-        let key: Vec<u8> = bytes
-            .chunks(2)
-            .map(|pair| std::str::from_utf8(pair).ok().and_then(|pair| u8::from_str_radix(pair, 16).ok()))
-            .collect::<Option<_>>()?;
+        let key: Vec<u8> =
+            bytes.chunks(2).map(|pair| from_utf8(pair).ok().and_then(|pair| u8::from_str_radix(pair, 16).ok())).collect::<Option<_>>()?;
         Some(Fingerprint(Sha256::digest(key).iter().map(|byte| format!("{byte:02x}")).collect()))
     }
 }

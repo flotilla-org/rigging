@@ -92,7 +92,7 @@ fn encode(text: &str, out: &mut String) {
 
 #[cfg(test)]
 mod tests {
-    use hegel::generators as gs;
+    use hegel::{TestCase, generators as gs};
 
     use super::*;
 
@@ -120,7 +120,7 @@ mod tests {
     // Bindings: one component below the Bindings directory, within the socket
     // limit, readable when it fits and then decoding back to the identity.
     #[hegel::test]
-    fn binding_paths_are_single_bounded_components(tc: hegel::TestCase) {
+    fn binding_paths_are_single_bounded_components(tc: TestCase) {
         let scope = tc.draw(gs::text().max_size(80));
         let name = tc.draw(gs::text().max_size(80));
         let depth = tc.draw(gs::integers::<usize>().min_value(1).max_value(65));
@@ -141,7 +141,7 @@ mod tests {
     // Identities that differ only in case keep distinct Binding paths where
     // the filesystem folds case.
     #[hegel::test]
-    fn binding_paths_differ_under_case_folding(tc: hegel::TestCase) {
+    fn binding_paths_differ_under_case_folding(tc: TestCase) {
         let runtime = Path::new("/run/user/1000/tender");
         let scope = tc.draw(gs::text().max_size(40));
         let name = tc.draw(gs::text().max_size(40));

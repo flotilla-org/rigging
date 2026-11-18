@@ -17,28 +17,31 @@ use std::{
 };
 
 use node::{Node, eventually};
+#[cfg(target_os = "linux")]
+use serde_json::from_slice;
 use tender::{
-    BindingState, Label, PublicationId, PublishRequest, Scope, Session, Tender, UnavailableReason,
+    BindingState, Label, PublicationId, PublishRequest, Route, Scope, Session, Tender, UnavailableReason,
     api::{self, BindingEntry, Diagnostics, PeerState},
     paths::{self, binding_path},
     ssh::{Identity, SshTender},
 };
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncReadExt, AsyncWriteExt, copy, split},
     net::{UnixListener, UnixStream},
     process::Command,
+    spawn,
     task::JoinHandle,
     time::timeout,
 };
 
 fn echo(path: &Path) -> JoinHandle<()> {
     let listener = UnixListener::bind(path).expect("echo listener");
-    tokio::spawn(async move {
+    spawn(async move {
         loop {
             let Ok((mut stream, _)) = listener.accept().await else { break };
-            tokio::spawn(async move {
+            spawn(async move {
                 let (mut reader, mut writer) = stream.split();
-                let _ = tokio::io::copy(&mut reader, &mut writer).await;
+                let _ = copy(&mut reader, &mut writer).await;
             });
         }
     })
@@ -93,13 +96,13 @@ async fn bindings_follow_publications_between_paired_daemons() {
     .await;
     let binding = b.binding(&id).await.expect("binding");
     assert_eq!((binding.local_endpoint.as_path(), &binding.label), (path.as_path(), &Label("echo".into())));
-    assert_eq!(binding.state, BindingState::Available { route: tender::Route { instance: a.instance.fingerprint.clone(), via: None } });
+    assert_eq!(binding.state, BindingState::Available { route: Route { instance: a.instance.fingerprint.clone(), via: None } });
     assert!(round_trip(&path, b"through the binding").await, "the echo service answers through B's Binding");
 
     // On its own machine the Binding is a link to the socket itself.
     let own = paths::binding_path(&a.runtime(), &id);
-    eventually("A binds its own publication", || async { std::fs::read_link(&own).ok() == Some(service.clone()) }).await;
-    let inode = std::fs::symlink_metadata(&path).expect("binding socket").ino();
+    eventually("A binds its own publication", || async { fs::read_link(&own).ok() == Some(service.clone()) }).await;
+    let inode = fs::symlink_metadata(&path).expect("binding socket").ino();
 
     // Withdrawal turns the Binding unavailable, and connects fail promptly.
     a.cli(&["withdraw", "vessel/7", "echo/main"]).await;
@@ -111,7 +114,7 @@ async fn bindings_follow_publications_between_paired_daemons() {
     .await;
     assert!(refused_promptly(&path).await, "an unavailable Binding refuses or closes at once");
     eventually("A's own link gives way to a refusing listener", || async {
-        std::fs::symlink_metadata(&own).is_ok_and(|metadata| metadata.file_type().is_socket())
+        fs::symlink_metadata(&own).is_ok_and(|metadata| metadata.file_type().is_socket())
     })
     .await;
     assert!(refused_promptly(&own).await, "the withdrawn service is not reachable through its old link");
@@ -121,11 +124,11 @@ async fn bindings_follow_publications_between_paired_daemons() {
     let session = Session { caller: helper.fingerprint(), pinned_host: a.instance.fingerprint.clone(), via: None };
     let request = PublishRequest { id: id.clone(), label: Label("echo".into()), display: "Echo, taken over".into(), audience: None };
     let mut published = client.publish(&session, request).await.expect("granted takeover");
-    let serving = tokio::spawn(async move {
+    let serving = spawn(async move {
         while let Some(mut stream) = published.incoming.recv().await {
-            tokio::spawn(async move {
-                let (mut reader, mut writer) = tokio::io::split(&mut stream);
-                let _ = tokio::io::copy(&mut reader, &mut writer).await;
+            spawn(async move {
+                let (mut reader, mut writer) = split(&mut stream);
+                let _ = copy(&mut reader, &mut writer).await;
             });
         }
     });
@@ -135,7 +138,7 @@ async fn bindings_follow_publications_between_paired_daemons() {
             .is_some_and(|binding| matches!(binding.state, BindingState::Available { .. }) && binding.display == "Echo, taken over")
     })
     .await;
-    assert_eq!(std::fs::symlink_metadata(&path).expect("binding socket").ino(), inode, "the Binding is not recreated");
+    assert_eq!(fs::symlink_metadata(&path).expect("binding socket").ino(), inode, "the Binding is not recreated");
     assert!(round_trip(&path, b"to the new publisher").await);
     serving.abort();
 
@@ -186,11 +189,11 @@ async fn binding_moves_between_instances_publishing_one_identity() {
         }
     };
     eventually("viewer binds the first host's copy", || async { carried_by(&first)(viewer.binding(&id).await) }).await;
-    let inode = std::fs::symlink_metadata(&path).expect("binding").ino();
+    let inode = fs::symlink_metadata(&path).expect("binding").ino();
     publish(&second, &new).await;
     first.cli(&["withdraw", "vessel/9", "http/5173"]).await;
     eventually("viewer follows the identity to the second host", || async { carried_by(&second)(viewer.binding(&id).await) }).await;
-    assert_eq!(std::fs::symlink_metadata(&path).expect("binding").ino(), inode);
+    assert_eq!(fs::symlink_metadata(&path).expect("binding").ino(), inode);
     assert!(round_trip(&path, b"moved").await);
 }
 
@@ -220,7 +223,7 @@ async fn pairing_over_ssh_binds_through_a_forward() {
     }
     near.cli(&[&pair[..], &["--expect-fingerprint", &far.instance.fingerprint.0]].concat()).await;
     let far_members = far.cli(&["--json", "trust", "list"]).await;
-    let far_members: Vec<api::TrustedMember> = serde_json::from_slice(&far_members.stdout).expect("far's group");
+    let far_members: Vec<api::TrustedMember> = from_slice(&far_members.stdout).expect("far's group");
     assert_eq!(
         (far_members.len(), &far_members[0].fingerprint, far_members[0].instance.name.as_str()),
         (1, &near.instance.fingerprint, "near")

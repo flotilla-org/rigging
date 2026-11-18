@@ -1,7 +1,19 @@
 //! `tender serve` processes for end-to-end tests, and an SSH destination
 //! name for a test sshd.
 
-use std::{os::unix::fs::PermissionsExt, path::PathBuf, process::Output, time::Duration};
+use std::{
+    env,
+    fs::{self, Permissions},
+    os::unix::fs::PermissionsExt,
+    path::PathBuf,
+    process::{self, Output},
+    thread,
+    time::Duration,
+};
+
+use libc::{SIGTERM, kill};
+use rigging_ssh::Target;
+use tempfile::{Builder, TempDir};
 
 use tender::{
     PublicationId,
@@ -11,14 +23,14 @@ use tender::{
 use tokio::{
     net::UnixStream,
     process::{Child, Command},
-    time::timeout,
+    time::{self, timeout},
 };
 
 use super::{control::Control, ssh_fixture::Sshd};
 
 /// A `tender serve` process under its own TENDER_ROOT.
 pub struct Node {
-    pub root: tempfile::TempDir,
+    pub root: TempDir,
     env: Vec<(String, String)>,
     child: Child,
     pub instance: Instance,
@@ -31,9 +43,9 @@ impl Node {
     }
 
     pub async fn start_with(config: &str, env: Vec<(String, String)>) -> Self {
-        let root = tempfile::Builder::new().prefix("tb-").permissions(std::fs::Permissions::from_mode(0o700)).tempdir().expect("root");
-        std::fs::create_dir(root.path().join("config")).expect("config directory");
-        std::fs::write(root.path().join("config/config.toml"), config).expect("config");
+        let root = Builder::new().prefix("tb-").permissions(Permissions::from_mode(0o700)).tempdir().expect("root");
+        fs::create_dir(root.path().join("config")).expect("config directory");
+        fs::write(root.path().join("config/config.toml"), config).expect("config");
         let child = Command::new(env!("CARGO_BIN_EXE_tender"))
             .arg("serve")
             .env("TENDER_ROOT", root.path())
@@ -88,12 +100,12 @@ impl Drop for Node {
     fn drop(&mut self) {
         let Some(pid) = self.child.id() else { return };
         // SAFETY: the child has not been reaped, so its pid is still its own.
-        unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+        unsafe { kill(pid as i32, SIGTERM) };
         for _ in 0..100 {
             if self.child.try_wait().ok().flatten().is_some() {
                 return;
             }
-            std::thread::sleep(Duration::from_millis(50));
+            thread::sleep(Duration::from_millis(50));
         }
     }
 }
@@ -101,7 +113,7 @@ impl Drop for Node {
 pub async fn eventually<F: Future<Output = bool>>(what: &str, mut check: impl FnMut() -> F) {
     timeout(Duration::from_secs(15), async {
         while !check().await {
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            time::sleep(Duration::from_millis(50)).await;
         }
     })
     .await
@@ -119,10 +131,10 @@ pub struct SshAlias {
 
 impl SshAlias {
     pub fn new(sshd: &Sshd) -> Self {
-        let rigging_ssh::Target::Pinned { port, user, host_key, identity_file, .. } = &sshd.target else { panic!("pinned fixture") };
+        let Target::Pinned { port, user, host_key, identity_file, .. } = &sshd.target else { panic!("pinned fixture") };
         let directory = sshd.directory.path();
-        std::fs::write(directory.join("known_hosts"), format!("[127.0.0.1]:{port} {host_key}\n")).expect("known hosts");
-        std::fs::write(
+        fs::write(directory.join("known_hosts"), format!("[127.0.0.1]:{port} {host_key}\n")).expect("known hosts");
+        fs::write(
             directory.join("ssh_config"),
             format!(
                 "Host tender-peer\n  HostName 127.0.0.1\n  Port {port}\n  User {user}\n  IdentityFile {}\n  IdentitiesOnly yes\n  IdentityAgent none\n  UserKnownHostsFile {}\n  StrictHostKeyChecking yes\n",
@@ -132,17 +144,17 @@ impl SshAlias {
         )
         .expect("ssh config");
         let wrappers = directory.join("bin");
-        std::fs::create_dir(&wrappers).expect("wrapper directory");
-        let real = std::process::Command::new("sh").args(["-c", "command -v ssh"]).output().expect("which ssh");
+        fs::create_dir(&wrappers).expect("wrapper directory");
+        let real = process::Command::new("sh").args(["-c", "command -v ssh"]).output().expect("which ssh");
         let real = String::from_utf8(real.stdout).expect("ssh path").trim().to_owned();
         let wrapper = format!(
             "#!/bin/sh\n[ -e {} ] && exit 255\nexec {real} -F {} \"$@\"\n",
             directory.join("block").display(),
             directory.join("ssh_config").display()
         );
-        std::fs::write(wrappers.join("ssh"), wrapper).expect("wrapper");
-        std::fs::set_permissions(wrappers.join("ssh"), std::fs::Permissions::from_mode(0o755)).expect("executable wrapper");
-        let path = format!("{}:{}", wrappers.display(), std::env::var("PATH").unwrap_or_default());
+        fs::write(wrappers.join("ssh"), wrapper).expect("wrapper");
+        fs::set_permissions(wrappers.join("ssh"), Permissions::from_mode(0o755)).expect("executable wrapper");
+        let path = format!("{}:{}", wrappers.display(), env::var("PATH").unwrap_or_default());
         let env = vec![("PATH".to_owned(), path)];
         Self { env, block: directory.join("block"), config: directory.join("ssh_config") }
     }
@@ -150,19 +162,19 @@ impl SshAlias {
     /// Refuse new connections and end every session using this alias.
     #[cfg(target_os = "linux")]
     pub fn sever(&self) {
-        std::fs::write(&self.block, b"").expect("block new connections");
+        fs::write(&self.block, b"").expect("block new connections");
         let config = self.config.to_str().expect("config path").as_bytes().to_vec();
-        for entry in std::fs::read_dir("/proc").expect("processes").flatten() {
+        for entry in fs::read_dir("/proc").expect("processes").flatten() {
             let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() else { continue };
-            let Ok(command) = std::fs::read(entry.path().join("cmdline")) else { continue };
+            let Ok(command) = fs::read(entry.path().join("cmdline")) else { continue };
             if command.split(|&byte| byte == 0).any(|argument| argument == config.as_slice()) {
                 // SAFETY: signalling a process this test's daemon started.
-                unsafe { libc::kill(pid, libc::SIGTERM) };
+                unsafe { kill(pid, SIGTERM) };
             }
         }
     }
 
     pub fn restore(&self) {
-        std::fs::remove_file(&self.block).expect("allow new connections");
+        fs::remove_file(&self.block).expect("allow new connections");
     }
 }
