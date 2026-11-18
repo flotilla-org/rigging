@@ -146,33 +146,44 @@ asks for a Binding, and binding never starts anything on either side.
   is restored with backoff, through a fresh forward, and meanwhile its
   Bindings report `RouteUnavailable`.
 - **Which carrier.** One identity may be published by several instances, as
-  when a vessel moves host. A Binding keeps its current carrier while that
-  carrier's copy is live; otherwise it moves to a live copy, this instance's
-  own first, keeping its Local Endpoint. Streams already open stay on the old
-  route. A Binding whose identity no member offers any more is `Revoked`, and
-  its endpoint closes connections.
+  when a vessel moves host; each viewer chooses for itself. A Binding takes
+  this instance's own copy while it is live, else keeps its current carrier
+  while that copy is live, else moves to another live copy, keeping its Local
+  Endpoint. Streams already open stay on the old route. A
+  `tender/<fingerprint>` publication is followed from that instance alone,
+  never from another instance that lists it.
+- **Ending.** A Binding whose identity is withdrawn everywhere, or that no
+  member offers any more (`Revoked`), closes connections for a grace period,
+  `binding_grace_seconds` in `config.toml` (a minute by default, which covers
+  a move), and is then removed. Publishing the identity again brings it back
+  at the same computed path.
 - Bindings belong to a running daemon: it clears `runtime/b` at start.
 
 ### The `tender` command
 
 `tender serve` runs the daemon; the other commands are clients of its control
-API, found through `TENDER_ROOT` or `XDG_RUNTIME_DIR` as the daemon does.
+API, found through the runtime directory exactly as the daemon finds it.
 `--json` prints JSON for scripts.
 
 ```text
 tender identity | publications | bindings | diagnostics
 tender publish <scope> <name> --label L --endpoint SOCKET [--display D] [--audience FP]...
+                                               # SOCKET relative to this shell's directory
 tender withdraw <scope> <name>
-tender path <scope> <name>                     # computed, no daemon needed
+tender path <scope> <name>                     # computed, no daemon needed; warns if too long
 tender trust list | add <key> [--socket S [--ssh DEST]] | remove <fingerprint>
-tender trust pair <ssh-destination> [--remote-tender CMD]
+tender trust pair <ssh-destination> [--return DEST] [--expect-fingerprint FP] [--remote-tender CMD]
 ```
 
-`tender trust pair` exchanges keys over a working SSH destination: it runs
-`tender trust accept <own key>` there, which trusts this instance and prints
-the far instance. This instance then trusts the far key and follows it over
-SSH. The far side trusts this one without a route, since it may have none
-back. SSH carries the exchange; each side's trust is the other's key.
+`tender trust pair` pairs the two instances over a working SSH destination,
+so each trusts the other's key and follows the other. It first asks the far
+side for its identity and shows its fingerprint, which a person confirms at
+the prompt or a script names with `--expect-fingerprint`; nothing is trusted
+on either side before that. It then runs `tender trust accept <own key>
+--socket <own peer socket> --ssh <return>` there, the return destination
+being how the far side reaches this one (`--return`, default this host's
+name), and trusts the far key, following it at the destination it paired
+with. SSH carries the exchange; each side's trust is the other's key.
 
 Cleat needs no layout from Tender: `cleat attach --socket "$(tender path vessel/<id> cleat/default)"`.
 

@@ -194,26 +194,39 @@ async fn binding_moves_between_instances_publishing_one_identity() {
     assert!(round_trip(&path, b"moved").await);
 }
 
-// Pairing exchanges keys over a working SSH destination: each side trusts the
-// other's key, and the side that paired follows the other through an SSH
-// forward to its peer socket. A wrapper on PATH stands in for the operator's
-// ssh_config, pointing the destination at a loopback sshd.
+// Pairing exchanges keys over a working SSH destination once the far
+// instance's fingerprint is confirmed: each side trusts the other's key and
+// follows the other through an SSH forward to its peer socket. A wrapper on
+// PATH stands in for the operator's ssh_config, pointing the destination at a
+// loopback sshd, which both sides use to reach each other.
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn pairing_over_ssh_binds_through_a_forward() {
     let sshd = ssh_fixture::Sshd::start().await;
     let alias = node::SshAlias::new(&sshd);
-    let far = Node::start("").await;
+    let far = Node::start_with("", alias.env.clone()).await;
     let near = Node::start_with("", alias.env.clone()).await;
     let remote = format!("env TENDER_ROOT={} {}", far.root.path().display(), env!("CARGO_BIN_EXE_tender"));
-    near.cli(&["trust", "pair", "tender-peer", "--name", "far", "--as-name", "near", "--remote-tender", &remote]).await;
+    let pair =
+        ["trust", "pair", "tender-peer", "--name", "far", "--as-name", "near", "--return", "tender-peer", "--remote-tender", &remote];
+    let unconfirmed = near.run(&pair).await;
+    assert!(!unconfirmed.status.success(), "no terminal and no expected fingerprint");
+    assert!(String::from_utf8_lossy(&unconfirmed.stderr).contains(&far.instance.fingerprint.0), "the fingerprint is shown");
+    let wrong = near.run(&[&pair[..], &["--expect-fingerprint", &near.instance.fingerprint.0]].concat()).await;
+    assert!(!wrong.status.success(), "a different instance answered");
+    for node in [&far, &near] {
+        let members: Vec<api::TrustedMember> = node.control.get(api::TRUSTED).await.expect("group");
+        assert!(members.is_empty(), "nothing trusted unconfirmed");
+    }
+    near.cli(&[&pair[..], &["--expect-fingerprint", &far.instance.fingerprint.0]].concat()).await;
     let far_members = far.cli(&["--json", "trust", "list"]).await;
     let far_members: Vec<api::TrustedMember> = serde_json::from_slice(&far_members.stdout).expect("far's group");
     assert_eq!(
         (far_members.len(), &far_members[0].fingerprint, far_members[0].instance.name.as_str()),
         (1, &near.instance.fingerprint, "near")
     );
-    assert_eq!(far_members[0].instance.route, None, "the far side trusts but cannot reach the near side");
+    let back = far_members[0].instance.route.clone().expect("a route back");
+    assert_eq!((back.ssh.as_deref(), back.socket.as_path()), (Some("tender-peer"), near.instance.peer_socket.as_path()));
     let near_members: Vec<api::TrustedMember> = near.control.get(api::TRUSTED).await.expect("near's group");
     let route = near_members[0].instance.route.clone().expect("route to far");
     assert_eq!((route.ssh.as_deref(), route.socket.as_path()), (Some("tender-peer"), far.instance.peer_socket.as_path()));
@@ -228,6 +241,14 @@ async fn pairing_over_ssh_binds_through_a_forward() {
     .await;
     let path = paths::binding_path(&near.runtime(), &id);
     assert!(round_trip(&path, b"over ssh").await);
+    let near_service = near.root.path().join("echo.sock");
+    let _near_echo = echo(&near_service);
+    near.cli(&["publish", "vessel/3", "http", "--label", "http", "--endpoint", near_service.to_str().expect("path")]).await;
+    let back = PublicationId::new("vessel/3", "http");
+    eventually("far binds near's publication over SSH too", || async {
+        round_trip(&paths::binding_path(&far.runtime(), &back), b"the other way").await
+    })
+    .await;
 
     // Losing SSH makes the Binding unavailable in place; a fresh forward
     // restores it once SSH works again.
@@ -361,4 +382,37 @@ async fn own_copy_is_chosen_first() {
     eventually("the viewer binds the host's copy", || async { round_trip(&path, b"remote").await }).await;
     viewer.cli(&["publish", "vessel/5", "http", "--label", "http", "--endpoint", local.to_str().expect("path")]).await;
     eventually("the viewer's own copy carries it", || async { fs::read_link(&path).ok() == Some(local.clone()) }).await;
+}
+
+// A relative --endpoint is the caller's: the CLI makes it absolute, so the
+// own Binding's link reaches the socket rather than dangling.
+#[tokio::test]
+async fn relative_endpoint_is_the_callers() {
+    let node = Node::start("").await;
+    let service = node.root.path().join("echo.sock");
+    let _echo = echo(&service);
+    let published = Command::new(env!("CARGO_BIN_EXE_tender"))
+        .args(["publish", "vessel/6", "echo", "--label", "echo", "--endpoint", "echo.sock"])
+        .env("TENDER_ROOT", node.root.path())
+        .current_dir(node.root.path())
+        .output()
+        .await
+        .expect("CLI");
+    assert!(published.status.success(), "{}", String::from_utf8_lossy(&published.stderr));
+    let path = binding_path(&node.runtime(), &PublicationId::new("vessel/6", "echo"));
+    eventually("the own Binding links to the socket", || async { fs::read_link(&path).ok() == Some(service.clone()) }).await;
+    assert!(round_trip(&path, b"relative").await);
+}
+
+// `tender path` warns when the computed path cannot be a Unix socket path.
+#[tokio::test]
+async fn path_warns_when_too_long_for_a_socket() {
+    let path = |root: String| async move {
+        Command::new(env!("CARGO_BIN_EXE_tender")).args(["path", "vessel/1", "x"]).env("TENDER_ROOT", root).output().await.expect("CLI")
+    };
+    let short = path("/r".into()).await;
+    assert!(short.status.success() && short.stderr.is_empty());
+    let deep = path(format!("/{}", "d".repeat(80))).await;
+    assert!(deep.status.success());
+    assert!(String::from_utf8_lossy(&deep.stderr).contains("longer than a Unix socket path"));
 }

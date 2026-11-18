@@ -53,16 +53,21 @@ impl Node {
     }
 
     /// Run the `tender` CLI against this node.
+    /// The CLI against this node, which must succeed.
     pub async fn cli(&self, args: &[&str]) -> Output {
-        let output = Command::new(env!("CARGO_BIN_EXE_tender"))
+        let output = self.run(args).await;
+        assert!(output.status.success(), "tender {args:?}: {}", String::from_utf8_lossy(&output.stderr));
+        output
+    }
+
+    pub async fn run(&self, args: &[&str]) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_tender"))
             .args(args)
             .env("TENDER_ROOT", self.root.path())
             .envs(self.env.iter().cloned())
             .output()
             .await
-            .expect("tender CLI");
-        assert!(output.status.success(), "tender {args:?}: {}", String::from_utf8_lossy(&output.stderr));
-        output
+            .expect("tender CLI")
     }
 
     /// This node trusts `other` and follows it at its peer socket.

@@ -1,7 +1,11 @@
 //! The `tender` command: the daemon, and a client of its control API for
 //! people and scripts.
 
-use std::{collections::BTreeSet, path::PathBuf};
+use std::{
+    collections::BTreeSet,
+    io::{IsTerminal, stdin},
+    path::{PathBuf, absolute},
+};
 
 use clap::{Args, Parser, Subcommand};
 use reqwest::{Method, Request, Url, header};
@@ -89,10 +93,10 @@ enum Trust {
     Remove {
         fingerprint: String,
     },
-    /// Exchange keys with the instance at an SSH destination, so each trusts
-    /// the other and this one follows it over SSH. This trusts whatever key
-    /// the instance there presents: the SSH destination's own authentication
-    /// is all that vouches for it.
+    /// Pair with the instance at an SSH destination: each trusts the other's
+    /// key and follows the other over SSH. The far instance's fingerprint is
+    /// shown and must be confirmed, or match --expect-fingerprint, before
+    /// either side trusts anything.
     Pair {
         destination: String,
         /// What this instance calls the other one. Default: the destination.
@@ -101,15 +105,27 @@ enum Trust {
         /// What the other one calls this instance. Default: this host's name.
         #[arg(long)]
         as_name: Option<String>,
+        /// The SSH destination the other one reaches this instance at.
+        /// Default: this host's name.
+        #[arg(long = "return")]
+        return_destination: Option<String>,
+        /// Pair without asking, if the far instance has this fingerprint.
+        #[arg(long)]
+        expect_fingerprint: Option<String>,
         /// How to run `tender` on the far side.
         #[arg(long, default_value = "tender")]
         remote_tender: String,
     },
-    /// The far side of `pair`: trust the key and print this instance as JSON.
+    /// The far side of `pair`: trust the key, following it at the given
+    /// route, or at the route it already has; print this instance as JSON.
     Accept {
         key: String,
         #[arg(long, default_value = "")]
         name: String,
+        #[arg(long)]
+        socket: Option<PathBuf>,
+        #[arg(long, requires = "socket")]
+        ssh: Option<String>,
     },
 }
 
@@ -135,7 +151,8 @@ pub async fn main() -> Result<(), String> {
                 id: PublicationId::new(publish.scope, publish.name),
                 label: Label(publish.label),
                 display: publish.display,
-                endpoint: publish.endpoint,
+                // The daemon resolves nothing against this shell's directory.
+                endpoint: absolute(&publish.endpoint).map_err(|error| format!("{}: {error}", publish.endpoint.display()))?,
                 audience,
             };
             let publication: crate::Publication = control.post(api::PUBLISH, &request).await?;
@@ -172,6 +189,13 @@ pub async fn main() -> Result<(), String> {
         }
         Command::Path(identity) => {
             let path = paths::binding_path(&runtime, &PublicationId::new(identity.scope, identity.name));
+            if path.as_os_str().len() > paths::MAX_SOCKET_PATH {
+                eprintln!(
+                    "warning: {} is longer than a Unix socket path may be ({} bytes); the runtime directory is too deep",
+                    path.display(),
+                    paths::MAX_SOCKET_PATH
+                );
+            }
             show(json, &path, || path.display().to_string())
         }
         Command::Trust(trust) => self::trust(&control, json, trust).await,
@@ -213,31 +237,41 @@ async fn trust(control: &Control, json: bool, trust: Trust) -> Result<(), String
             let () = control.post(api::UNTRUST, &Untrust { fingerprint: Fingerprint(fingerprint) }).await?;
             Ok(())
         }
-        Trust::Accept { key, name } => {
+        Trust::Accept { key, name, socket, ssh } => {
             let key = PublicKey(key);
-            // A member this side already reaches keeps its route; only a new
-            // member is trusted without one.
+            // Without a route given, a member this side already reaches keeps
+            // its route.
             let members: Vec<TrustedMember> = control.get(api::TRUSTED).await?;
-            let route = members.into_iter().find(|member| member.instance.key == key).and_then(|member| member.instance.route);
+            let existing = members.into_iter().find(|member| member.instance.key == key).and_then(|member| member.instance.route);
+            let route = socket.map(|socket| PeerRoute { ssh, socket }).or(existing);
             let _: TrustedMember = control.post(api::TRUSTED, &TrustedInstance { key, name, route }).await?;
             let instance: Instance = control.get(api::IDENTITY).await?;
             println!("{}", serde_json::to_string(&instance).map_err(|error| error.to_string())?);
             Ok(())
         }
-        Trust::Pair { destination, name, as_name, remote_tender } => {
+        Trust::Pair { destination, name, as_name, return_destination, expect_fingerprint, remote_tender } => {
             let own: Instance = control.get(api::IDENTITY).await?;
-            let as_name = as_name.unwrap_or_else(hostname);
-            // SSH carries the exchange; each side's trust is the other's key.
             let session = OpenSsh::connect(Target::Ambient { destination: destination.clone() }, DEFAULT_CONNECT_TIMEOUT)
                 .await
                 .map_err(|error| format!("ssh {destination}: {error}"))?;
-            let command = format!("{remote_tender} trust accept {} --name {}", quote(&own.key.0), quote(&as_name));
-            let output = session.exec(&command).await.map_err(|error| format!("ssh {destination}: {error}"))?;
-            if !output.status.success() {
-                return Err(format!("{destination}: {}", String::from_utf8_lossy(&output.stderr).trim()));
-            }
-            let remote: Instance = serde_json::from_slice(&output.stdout)
-                .map_err(|error| format!("{destination} answered something other than an instance: {error}"))?;
+            let remote: Instance =
+                serde_json::from_slice(&remotely(&session, &destination, &format!("{remote_tender} --json identity")).await?)
+                    .map_err(|error| format!("{destination} answered something other than an instance: {error}"))?;
+            let fingerprint = remote
+                .key
+                .fingerprint()
+                .filter(|fingerprint| fingerprint == &remote.fingerprint)
+                .ok_or_else(|| format!("{destination} presented a fingerprint that is not its key's"))?;
+            confirm(&destination, &fingerprint, expect_fingerprint.as_deref())?;
+            // SSH carries the exchange; each side's trust is the other's key.
+            let accept = format!(
+                "{remote_tender} trust accept {} --name {} --socket {} --ssh {}",
+                quote(&own.key.0),
+                quote(&as_name.unwrap_or_else(hostname)),
+                quote(&own.peer_socket.to_string_lossy()),
+                quote(&return_destination.unwrap_or_else(hostname)),
+            );
+            remotely(&session, &destination, &accept).await?;
             let instance = TrustedInstance {
                 key: remote.key,
                 name: name.unwrap_or_else(|| destination.clone()),
@@ -247,6 +281,30 @@ async fn trust(control: &Control, json: bool, trust: Trust) -> Result<(), String
             show(json, &member, || format!("paired with {} ({})", member.instance.name, member.fingerprint.0))
         }
     }
+}
+
+async fn remotely(session: &OpenSsh, destination: &str, command: &str) -> Result<Vec<u8>, String> {
+    let output = session.exec(command).await.map_err(|error| format!("ssh {destination}: {error}"))?;
+    if !output.status.success() {
+        return Err(format!("{destination}: {}", String::from_utf8_lossy(&output.stderr).trim()));
+    }
+    Ok(output.stdout)
+}
+
+/// The far instance is trusted only once a person, or a script that knows
+/// its fingerprint, says so.
+fn confirm(destination: &str, fingerprint: &Fingerprint, expected: Option<&str>) -> Result<(), String> {
+    eprintln!("{destination} is instance {}", fingerprint.0);
+    if let Some(expected) = expected {
+        return if expected == fingerprint.0 { Ok(()) } else { Err(format!("{destination} is not instance {expected}")) };
+    }
+    if !stdin().is_terminal() {
+        return Err("nobody to confirm the fingerprint: pass --expect-fingerprint".into());
+    }
+    eprint!("Pair with it, so each trusts the other? [y/N] ");
+    let mut answer = String::new();
+    stdin().read_line(&mut answer).map_err(|error| error.to_string())?;
+    if matches!(answer.trim(), "y" | "Y" | "yes") { Ok(()) } else { Err("not paired".into()) }
 }
 
 fn show<T: Serialize>(json: bool, value: &T, text: impl FnOnce() -> String) -> Result<(), String> {

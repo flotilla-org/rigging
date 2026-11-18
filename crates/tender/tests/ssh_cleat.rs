@@ -155,7 +155,7 @@ async fn cleat_survives_ssh_loss_and_fresh_client_recovers() {
     .await;
     let near = Node::start_with("", alias.env.clone()).await;
     let remote = format!("env TENDER_ROOT={} {}", far.root.path().display(), env!("CARGO_BIN_EXE_tender"));
-    near.cli(&["trust", "pair", "tender-peer", "--remote-tender", &remote]).await;
+    near.cli(&["trust", "pair", "tender-peer", "--remote-tender", &remote, "--expect-fingerprint", &far.instance.fingerprint.0]).await;
     let id = PublicationId::new("vessel/proof", "cleat/default");
     let state = |binding: Option<tender::api::BindingEntry>| binding.map(|binding| binding.state);
     eventually("the near daemon binds the cleat publication", || async {
