@@ -8,6 +8,8 @@ use std::{
     io as std_io,
     sync::{Arc, Mutex, MutexGuard},
 };
+#[cfg(unix)]
+use tokio::time::Instant;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -236,15 +238,20 @@ impl MemoryTender {
         self.inner.lock().expect("state lock").lease_changes.subscribe()
     }
 
-    /// How long until `lease` expires on the hosting clock. Without a lease, the
-    /// next time the authority's state changes with time alone: the earliest
+    /// When `lease` expires on the hosting clock. Without a lease, the next
+    /// time the authority's state changes with time alone: the earliest
     /// publication not yet withdrawn reaching its expiry, or a withdrawn one
     /// reaching the end of [`WITHDRAWN_RETENTION`]. Reading the state then
     /// retires or forgets it and tells its watchers. `None` for a manually ticked
     /// authority, whose ticks tell lease holders themselves, or when no such
     /// deadline remains.
+    ///
+    /// The deadline is always in the future, so a loop waking at it cannot
+    /// spin: the state read here has already retired or forgotten everything
+    /// due by now. A caller re-reads it after each wake, so one that lands a
+    /// little late only acts a little late.
     #[cfg(unix)]
-    pub(crate) fn until_expiry(&self, lease: Option<&Lease>) -> Option<Duration> {
+    pub(crate) fn until_expiry(&self, lease: Option<&Lease>) -> Option<Instant> {
         let state = self.state().ok()?;
         state.runtime.as_ref()?;
         state
@@ -259,7 +266,8 @@ impl MemoryTender {
                 },
             })
             .min()
-            .map(|deadline| Duration::from_millis(deadline.saturating_sub(state.now)))
+            // The host's own publications never expire: past Instant's range is no deadline.
+            .and_then(|deadline| Instant::now().checked_add(Duration::from_millis(deadline.saturating_sub(state.now))))
     }
 
     #[cfg(unix)]

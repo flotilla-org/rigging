@@ -28,7 +28,7 @@ use tokio::{
     spawn,
     sync::{Mutex, mpsc, oneshot, watch},
     task::JoinHandle,
-    time::{Instant, sleep, sleep_until, timeout},
+    time::{Instant, sleep, timeout},
 };
 
 use self::bindings::{BINDING_GRACE, Bindings, Endpoints};
@@ -44,6 +44,7 @@ use crate::{
     paths,
     runtime::Clock,
     ssh::{Identity, Server},
+    until,
 };
 
 const ENDPOINT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -534,14 +535,6 @@ async fn maintain(maintained: Weak<Inner>, mut leases: watch::Receiver<()>, mut 
             probe = None;
             delay = RECOVERY_FIRST;
         }
-    }
-}
-
-/// Sleeps until `deadline`, or forever without one.
-async fn until(deadline: Option<Instant>) {
-    match deadline {
-        Some(deadline) => sleep_until(deadline).await,
-        None => std::future::pending().await,
     }
 }
 

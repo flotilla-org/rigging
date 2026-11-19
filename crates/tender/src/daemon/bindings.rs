@@ -20,7 +20,7 @@ use tokio::{
     select, spawn,
     sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
     task::JoinHandle,
-    time::{Instant, sleep, sleep_until},
+    time::{Instant, sleep},
 };
 
 use crate::{
@@ -29,6 +29,7 @@ use crate::{
     memory::MemoryTender,
     paths,
     ssh::{Forward, Identity, SshTender},
+    until,
 };
 
 /// How long a Binding outlives the last copy of its publication by default.
@@ -429,14 +430,6 @@ impl Binder {
         if let Err(error) = place(bound, id, link, target) {
             tracing::warn!(%id, path = %bound.path.display(), %error, "cannot place Binding");
         }
-    }
-}
-
-/// Sleeps until `deadline`, or forever without one.
-async fn until(deadline: Option<Instant>) {
-    match deadline {
-        Some(deadline) => sleep_until(deadline).await,
-        None => std::future::pending().await,
     }
 }
 

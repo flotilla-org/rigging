@@ -39,6 +39,7 @@ use crate::{
     memory::MemoryTender,
     paths::MAX_SOCKET_PATH,
     runtime::{Clock, FileStore},
+    until,
 };
 
 const OPEN_TIMEOUT: Duration = Duration::from_secs(10);
@@ -290,7 +291,7 @@ impl Server {
                     _ = lease_changes.changed() => {
                         registrations.lock().expect("registrations lock").retain(|_, registration| authority.lease_active(&registration.lease));
                     }
-                    () = expiry_wake(expiry) => {
+                    () = until(expiry) => {
                         registrations.lock().expect("registrations lock").retain(|_, registration| authority.lease_active(&registration.lease));
                     }
                 }
@@ -403,7 +404,7 @@ async fn serve(
                         tokio::select! {
                             result = stream.read(&mut byte) => { result?; break }
                             _ = lease_changes.changed() => {}
-                            () = expiry_wake(expiry) => {}
+                            () = until(expiry) => {}
                         }
                     }
                     Ok::<_, io::Error>(())
@@ -747,14 +748,6 @@ enum RetryPause {
     Cancelled,
 }
 
-/// Sleeps until an expiry deadline, or forever without one.
-async fn expiry_wake(expiry: Option<Duration>) {
-    match expiry {
-        Some(expiry) => sleep(expiry).await,
-        None => std::future::pending().await,
-    }
-}
-
 async fn pause_publisher_retry(
     sender: &mpsc::UnboundedSender<ByteStream>,
     registration: &mut (impl AsyncRead + Unpin),
@@ -889,6 +882,8 @@ impl Tender for SshTender {
                                         _ = routes.changed() => {}
                                         _ = sleep(delay) => {}
                                     }
+                                    // Marks the current route seen, so only a replacement
+                                    // during this attempt wakes the next one early.
                                     routes.borrow_and_update();
                                     delay = (delay * 2).min(RETRY_LONGEST);
                                     match adapter.request(&session, Request::Watch).await {

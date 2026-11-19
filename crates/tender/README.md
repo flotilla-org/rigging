@@ -101,8 +101,8 @@ publication unavailable. A local socket cannot say when it answers again, so
 the daemon probes an unavailable endpoint from the moment it becomes
 unavailable, backing off from 100 ms to eight seconds, and publishes again, at
 a new generation, once it answers. Nothing is probed while every own
-publication is live. A publication
-taken over by another publisher, or withdrawn, is no longer the daemon's.
+publication is live. A publication taken over by another publisher, or
+withdrawn, is no longer the daemon's.
 Shutting down leaves its publications unavailable. The next start publishes
 the `config.toml` entries again and withdraws every other publication this
 instance made, including all from the control API, which do not persist; the
