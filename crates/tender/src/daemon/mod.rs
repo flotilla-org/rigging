@@ -8,7 +8,7 @@ use std::{
     io, mem,
     os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Weak},
     time::Duration,
 };
 
@@ -20,14 +20,15 @@ use rigging_process::EnvVars;
 use tokio::{
     io::copy_bidirectional,
     net::UnixStream,
+    select,
     signal::{
         ctrl_c,
         unix::{SignalKind, signal},
     },
     spawn,
-    sync::{Mutex, mpsc, oneshot},
+    sync::{Mutex, mpsc, oneshot, watch},
     task::JoinHandle,
-    time::{interval, sleep, timeout},
+    time::{Instant, sleep, sleep_until, timeout},
 };
 
 use self::bindings::{BINDING_GRACE, Bindings, Endpoints};
@@ -46,7 +47,11 @@ use crate::{
 };
 
 const ENDPOINT_TIMEOUT: Duration = Duration::from_secs(10);
-const MAINTENANCE: Duration = Duration::from_secs(1);
+/// An unavailable own publication's endpoint is first probed again after
+/// this, doubling to [`RECOVERY_LONGEST`]: a local socket cannot tell the
+/// daemon it answers again.
+const RECOVERY_FIRST: Duration = Duration::from_millis(100);
+const RECOVERY_LONGEST: Duration = Duration::from_secs(8);
 /// Opens a stream tries before the endpoint counts as gone, so a service
 /// restarting or briefly slow does not make its publication flap.
 const OPEN_ATTEMPTS: u32 = 3;
@@ -122,6 +127,9 @@ pub(crate) struct Inner {
     state: Mutex<State>,
     endpoints: Endpoints,
     bindings: Bindings,
+    /// Told when a publication is reserved because its endpoint did not
+    /// answer, so maintenance starts probing it.
+    reserved: watch::Sender<()>,
 }
 
 struct State {
@@ -170,6 +178,10 @@ impl Daemon {
         bindings.trust(state.trusted.clone());
         let mut epoch = [0; 16];
         OsRng.fill_bytes(&mut epoch);
+        // Followed from before the configured publications go out, so
+        // maintenance hears of any that went out reserved.
+        let leases = server.policy.lease_changes();
+        let (reserving, reserved) = watch::channel(());
         let inner = Arc::new(Inner {
             paths,
             epoch: epoch.iter().map(|byte| format!("{byte:02x}")).collect(),
@@ -179,6 +191,7 @@ impl Daemon {
             state: Mutex::new(state),
             endpoints,
             bindings,
+            reserved: reserving,
         });
         let (configured, relative): (Vec<_>, Vec<_>) = config
             .publications
@@ -199,15 +212,7 @@ impl Daemon {
         let control = spawn(control.serve(router, Caller::<()>::Unix, async {
             let _ = stopped.await;
         }));
-        let maintained = Arc::downgrade(&inner);
-        let maintenance = spawn(async move {
-            let mut tick = interval(MAINTENANCE);
-            loop {
-                tick.tick().await;
-                let Some(inner) = maintained.upgrade() else { break };
-                inner.maintain().await;
-            }
-        });
+        let maintenance = spawn(maintain(Arc::downgrade(&inner), leases, reserved));
         Ok(Self { inner, stop_control: Some(stop_control), control, maintenance })
     }
 
@@ -338,6 +343,9 @@ impl Inner {
         // Replacing an earlier Local drops it, which stops its pump; its
         // streams already open keep running on their own tasks.
         state.local.insert(request.id.clone(), Local { lease: lease.clone(), request, pump });
+        if !live {
+            self.reserved.send_replace(());
+        }
         Ok(lease)
     }
 
@@ -454,8 +462,10 @@ impl Inner {
     /// Republish an own publication once its endpoint answers again, and
     /// forget one that another publisher has taken over or that has gone.
     /// The authority is read under the state lock, so a publish cannot land
-    /// between the two; endpoints are probed outside it.
-    async fn maintain(&self) {
+    /// between the two; endpoints are probed outside it. True while an own
+    /// publication is still waiting for its endpoint.
+    async fn maintain(&self) -> bool {
+        let mut waiting = false;
         let mut recovering = Vec::new();
         {
             let mut state = self.state.lock().await;
@@ -477,6 +487,7 @@ impl Inner {
         }
         for (lease, request) in recovering {
             if !reachable(&request.endpoint).await {
+                waiting = true;
                 continue;
             }
             let mut state = self.state.lock().await;
@@ -486,8 +497,10 @@ impl Inner {
             let id = request.id.clone();
             if let Err(error) = self.publish_locked(&mut state, request, true).await {
                 tracing::warn!(%id, %error, "republishing a recovered endpoint failed");
+                waiting = true;
             }
         }
+        waiting
     }
 }
 
@@ -498,6 +511,38 @@ pub(crate) enum TrustError {
     NotMember,
     Storage(io::Error),
     Tender(Error),
+}
+
+/// Maintains when the authority's live leases change, which is how an own
+/// publication becomes unavailable, is withdrawn or is taken over, and when
+/// one is reserved without a live endpoint. While an own publication waits
+/// for its endpoint, it probes the endpoint again with backoff.
+async fn maintain(maintained: Weak<Inner>, mut leases: watch::Receiver<()>, mut reserved: watch::Receiver<()>) {
+    let mut delay = RECOVERY_FIRST;
+    let mut probe = None;
+    loop {
+        select! {
+            changed = leases.changed() => if changed.is_err() { break },
+            changed = reserved.changed() => if changed.is_err() { break },
+            () = until(probe) => {}
+        }
+        let Some(inner) = maintained.upgrade() else { break };
+        if inner.maintain().await {
+            probe = Some(Instant::now() + delay);
+            delay = (delay * 2).min(RECOVERY_LONGEST);
+        } else {
+            probe = None;
+            delay = RECOVERY_FIRST;
+        }
+    }
+}
+
+/// Sleeps until `deadline`, or forever without one.
+async fn until(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => sleep_until(deadline).await,
+        None => std::future::pending().await,
+    }
 }
 
 async fn reachable(endpoint: &Path) -> bool {
@@ -580,6 +625,41 @@ mod tests {
         drop(state);
         maintaining.await.expect("maintain");
         assert!(inner.state.lock().await.local.contains_key(&id), "maintenance dropped a publish it raced");
+        daemon.shutdown().await;
+    }
+
+    // A publication reserved because its endpoint did not answer goes live
+    // once the endpoint answers, with nothing else happening, within the
+    // longest probe backoff.
+    #[tokio::test(start_paused = true)]
+    async fn reserved_publication_goes_live_once_its_endpoint_answers() {
+        let root = Builder::new().prefix("td-").permissions(Permissions::from_mode(0o700)).tempdir().expect("root");
+        let paths = Paths { config: root.path().join("config"), state: root.path().join("state"), runtime: root.path().join("runtime") };
+        let daemon = Daemon::start(paths).await.expect("start");
+        let endpoint = root.path().join("service");
+        let id = PublicationId::new("vessel/scope", "service");
+        let request = PublishEndpoint {
+            id: id.clone(),
+            label: Label("echo".into()),
+            display: String::new(),
+            endpoint: endpoint.clone(),
+            audience: None,
+        };
+        let reserved = daemon.inner.publish(request).await.expect("reserve");
+        assert_eq!(reserved.availability, Availability::Unavailable);
+        let mut watch = daemon.inner.policy().watch(&daemon.inner.session).await.expect("watch");
+
+        // Probes that find nothing back off to the longest delay.
+        sleep(RECOVERY_LONGEST * 4).await;
+        let _listener = UnixListener::bind(&endpoint).expect("service");
+        let answered = Instant::now();
+        let live = |snapshot: &[Publication]| {
+            snapshot.iter().any(|publication| publication.id == id && publication.availability == Availability::Available)
+        };
+        timeout(RECOVERY_LONGEST * 2, async { while !live(&watch.recv().await.expect("watch open")) {} })
+            .await
+            .expect("published again once the endpoint answers");
+        assert!(answered.elapsed() <= RECOVERY_LONGEST, "probed within the longest backoff, after {:?}", answered.elapsed());
         daemon.shutdown().await;
     }
 }

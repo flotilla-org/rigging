@@ -20,7 +20,7 @@ use tokio::{
     select, spawn,
     sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
     task::JoinHandle,
-    time::{Instant, interval, sleep},
+    time::{Instant, sleep, sleep_until},
 };
 
 use crate::{
@@ -247,11 +247,11 @@ impl Drop for Bound {
 }
 
 impl Binder {
-    /// Rebinds after every batch of events, and once a second so that
-    /// ending Bindings go when their grace runs out.
+    /// Rebinds after every batch of events, and when the earliest ending
+    /// Binding's grace runs out.
     async fn run(mut self, mut events: UnboundedReceiver<Event>) {
-        let mut tick = interval(Duration::from_secs(1));
         loop {
+            let graces_end = self.bound.values().filter_map(|bound| bound.ending).min().map(|ending| ending + self.grace);
             select! {
                 event = events.recv() => {
                     let Some(event) = event else { break };
@@ -260,11 +260,7 @@ impl Binder {
                         self.apply(event);
                     }
                 }
-                _ = tick.tick() => {
-                    if !self.bound.values().any(|bound| bound.ending.is_some()) {
-                        continue;
-                    }
-                }
+                () = until(graces_end) => {}
             }
             self.rebind();
         }
@@ -436,6 +432,14 @@ impl Binder {
     }
 }
 
+/// Sleeps until `deadline`, or forever without one.
+async fn until(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => sleep_until(deadline).await,
+        None => std::future::pending().await,
+    }
+}
+
 /// Make the Binding's path a link to `link`, or a listener serving `target`.
 /// A listener already in place keeps serving, now toward `target`.
 fn place(bound: &mut Bound, id: &PublicationId, link: Option<PathBuf>, target: Target) -> io::Result<()> {
@@ -566,6 +570,39 @@ mod tests {
             generation: 1,
             availability,
         }
+    }
+
+    /// Lets the Binder run until `done`, without moving the paused clock.
+    async fn settled(what: &str, done: impl Fn() -> bool) {
+        for _ in 0..1000 {
+            if done() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("{what}");
+    }
+
+    // A withdrawn publication's Binding stays for its grace and goes when the
+    // grace runs out, with nothing else happening.
+    #[tokio::test(start_paused = true)]
+    async fn an_ending_binding_goes_when_its_grace_runs_out() {
+        let runtime = tempfile::Builder::new().prefix("tb-").permissions(Permissions::from_mode(0o700)).tempdir().expect("runtime");
+        let identity = Identity::from_secret([1; 32]);
+        let policy = MemoryTender::new(identity.fingerprint());
+        let (local, own) = unbounded_channel();
+        let grace = Duration::from_secs(60);
+        let bindings = Bindings::start(runtime.path(), identity, policy, Endpoints::default(), own, grace).expect("bindings");
+        local.send(vec![publication(Availability::Available)]).expect("binder follows");
+        settled("the publication is bound", || bindings.bindings().len() == 1).await;
+        local.send(vec![publication(Availability::Withdrawn)]).expect("binder follows");
+        let withdrawn = |entries: Vec<BindingEntry>| matches!(entries.as_slice(), [entry] if matches!(entry.state, BindingState::Unavailable { reason: UnavailableReason::Withdrawn, .. }));
+        settled("the Binding shows the withdrawal", || withdrawn(bindings.bindings())).await;
+
+        sleep(grace - Duration::from_millis(1)).await;
+        assert!(withdrawn(bindings.bindings()), "the Binding stays for its grace");
+        sleep(Duration::from_millis(1)).await;
+        settled("the grace ends the Binding", || bindings.bindings().is_empty()).await;
     }
 
     // Over any set of carriers and any current carrier: this instance's own

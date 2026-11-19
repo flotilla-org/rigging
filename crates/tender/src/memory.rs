@@ -1,6 +1,8 @@
 //! In-memory host and byte transport. Policy mutation models host authority;
 //! none of these controls is available to a publisher through [`Tender`].
 
+#[cfg(unix)]
+use std::time::Duration;
 use std::{
     collections::{BTreeMap, BTreeSet},
     io as std_io,
@@ -9,7 +11,11 @@ use std::{
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use tokio::{io, sync::mpsc, task::JoinHandle};
+use tokio::{
+    io,
+    sync::{mpsc, watch},
+    task::JoinHandle,
+};
 
 use crate::{
     Availability, Binding, BindingState, ByteStream, Error, Fingerprint, Grant, Label, Lease, Publication, PublicationId, PublishRequest,
@@ -69,6 +75,10 @@ struct State {
     runtime: Option<Hosting>,
     failed: bool,
     watchers: Vec<(Fingerprint, mpsc::UnboundedSender<Vec<Publication>>)>,
+    /// Which leases are live, as last told to lease holders.
+    leases: Vec<(PublicationId, u64, Fingerprint)>,
+    /// Told whenever the live leases change, so a lease holder wakes when its lease ends.
+    lease_changes: watch::Sender<()>,
 }
 
 impl MemoryTender {
@@ -91,6 +101,8 @@ impl MemoryTender {
                 runtime: None,
                 failed: false,
                 watchers: Vec::new(),
+                leases: Vec::new(),
+                lease_changes: watch::channel(()).0,
             })),
         }
     }
@@ -215,6 +227,39 @@ impl MemoryTender {
             return Err(Error::UntrustedIntermediary);
         }
         Ok(())
+    }
+
+    /// Changes whenever a lease ends or begins, but not as time passes; pair it with
+    /// [`Self::until_expiry`] for the expiry deadline.
+    #[cfg(unix)]
+    pub(crate) fn lease_changes(&self) -> watch::Receiver<()> {
+        self.inner.lock().expect("state lock").lease_changes.subscribe()
+    }
+
+    /// How long until `lease` expires on the hosting clock. Without a lease, the
+    /// next time the authority's state changes with time alone: the earliest
+    /// publication not yet withdrawn reaching its expiry, or a withdrawn one
+    /// reaching the end of [`WITHDRAWN_RETENTION`]. Reading the state then
+    /// retires or forgets it and tells its watchers. `None` for a manually ticked
+    /// authority, whose ticks tell lease holders themselves, or when no such
+    /// deadline remains.
+    #[cfg(unix)]
+    pub(crate) fn until_expiry(&self, lease: Option<&Lease>) -> Option<Duration> {
+        let state = self.state().ok()?;
+        state.runtime.as_ref()?;
+        state
+            .records
+            .values()
+            .filter_map(|record| match lease {
+                Some(lease) => (record.publication.id == lease.id && record.publication.availability == Availability::Available)
+                    .then_some(record.expires_at),
+                None => match record.withdrawn_at {
+                    Some(withdrawn) => withdrawn.checked_add(WITHDRAWN_RETENTION),
+                    None => Some(record.expires_at),
+                },
+            })
+            .min()
+            .map(|deadline| Duration::from_millis(deadline.saturating_sub(state.now)))
     }
 
     #[cfg(unix)]
@@ -709,6 +754,16 @@ impl State {
     }
 
     fn send_snapshots(&mut self) {
+        let leases: Vec<_> = self
+            .records
+            .values()
+            .filter(|record| record.publication.availability == Availability::Available)
+            .map(|record| (record.publication.id.clone(), record.publication.generation, record.publication.publisher.clone()))
+            .collect();
+        if leases != self.leases {
+            self.leases = leases;
+            self.lease_changes.send_replace(());
+        }
         let snapshots: Vec<_> = self.watchers.iter().map(|(caller, _)| self.visible(caller)).collect();
         self.watchers = self
             .watchers
@@ -857,10 +912,15 @@ impl Tender for MemoryTender {
         let mut state = self.state()?;
         state.check_lease(session, lease)?;
         let record = state.records.get_mut(&lease.id).expect("validated lease");
+        // A second disconnect of the same lease (the publisher's own, then its
+        // control stream's end) changes nothing, and watchers hear nothing.
+        let changed = record.publication.availability != Availability::Unavailable || record.sender.is_some();
         record.publication.availability = Availability::Unavailable;
         record.sender = None;
         abort_streams(record);
-        state.notify()?;
+        if changed {
+            state.notify()?;
+        }
         Ok(())
     }
 

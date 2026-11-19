@@ -28,7 +28,7 @@ use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{UnixListener, UnixStream},
-    sync::{Mutex as AsyncMutex, Semaphore, mpsc},
+    sync::{Mutex as AsyncMutex, Semaphore, mpsc, watch},
     task::JoinHandle,
     time::{sleep, timeout},
 };
@@ -48,6 +48,10 @@ const MAX_CHANNELS: usize = 256;
 const MAX_RELAY_HOPS: u8 = 8;
 /// A Binding listener's name, its number in hex.
 const MAX_BINDING_NAME: usize = 16;
+/// A lost watch, or a publisher whose host refused an accept, first retries
+/// after this, doubling to [`RETRY_LONGEST`].
+const RETRY_FIRST: Duration = Duration::from_millis(100);
+const RETRY_LONGEST: Duration = Duration::from_secs(8);
 
 /// Persist this key independently of SSH keys, account names, and routes.
 #[derive(Clone)]
@@ -259,9 +263,13 @@ impl Server {
         let relays = router.clone();
         let task = tokio::spawn(async move {
             let permits = Arc::new(Semaphore::new(MAX_CHANNELS));
-            let mut cleanup = tokio::time::interval(Duration::from_secs(1));
+            // Registrations end with their leases: on a lease change, and at the
+            // earliest expiry, whose read of the authority also retires the
+            // expired publication and tells its watchers.
+            let mut lease_changes = authority.lease_changes();
             let mut connections = tokio::task::JoinSet::new();
             loop {
+                let expiry = authority.until_expiry(None);
                 tokio::select! {
                     accepted = listener.accept() => {
                         let Ok((stream, _)) = accepted else { break };
@@ -279,7 +287,10 @@ impl Server {
                         });
                     }
                     _ = connections.join_next(), if !connections.is_empty() => {}
-                    _ = cleanup.tick() => {
+                    _ = lease_changes.changed() => {
+                        registrations.lock().expect("registrations lock").retain(|_, registration| authority.lease_active(&registration.lease));
+                    }
+                    () = expiry_wake(expiry) => {
                         registrations.lock().expect("registrations lock").retain(|_, registration| authority.lease_active(&registration.lease));
                     }
                 }
@@ -385,11 +396,14 @@ async fn serve(
                 let control = async {
                     write_control(&mut stream, &Response::Lease(lease.clone())).await?;
                     let mut byte = [0];
-                    let mut health = tokio::time::interval(Duration::from_secs(1));
-                    loop {
+                    // The lease ends on a change of the authority's leases or at its expiry.
+                    let mut lease_changes = policy.lease_changes();
+                    while policy.lease_active(&lease) {
+                        let expiry = policy.until_expiry(Some(&lease));
                         tokio::select! {
                             result = stream.read(&mut byte) => { result?; break }
-                            _ = health.tick() => { if !policy.lease_active(&lease) { break } }
+                            _ = lease_changes.changed() => {}
+                            () = expiry_wake(expiry) => {}
                         }
                     }
                     Ok::<_, io::Error>(())
@@ -589,6 +603,8 @@ impl Dial for UnixDial {
 #[derive(Clone)]
 pub struct SshTender {
     route: Arc<Mutex<Arc<dyn Dial>>>,
+    /// Told when the route is replaced, so a lost watch retries on it at once.
+    route_changes: Arc<watch::Sender<()>>,
     credentials: Arc<BTreeMap<Fingerprint, Identity>>,
     pin: Fingerprint,
     bindings: Bindings,
@@ -637,6 +653,7 @@ impl SshTender {
         Ok(Self {
             snapshots: Arc::new(Mutex::new(BTreeMap::new())),
             route: Arc::new(Mutex::new(dial)),
+            route_changes: Arc::new(watch::channel(()).0),
             credentials: Arc::new(identities.into_iter().map(|identity| (identity.fingerprint(), identity)).collect()),
             pin,
             bindings: Arc::new(Mutex::new(BTreeMap::new())),
@@ -654,6 +671,7 @@ impl SshTender {
     /// As [`Self::replace_route`], for any dialer.
     pub fn replace_dial(&self, dial: Arc<dyn Dial>) {
         *self.route.lock().expect("route lock") = dial;
+        self.route_changes.send_replace(());
     }
 
     async fn request(&self, session: &Session, request: Request) -> Result<ByteStream, Error> {
@@ -729,6 +747,14 @@ enum RetryPause {
     Cancelled,
 }
 
+/// Sleeps until an expiry deadline, or forever without one.
+async fn expiry_wake(expiry: Option<Duration>) {
+    match expiry {
+        Some(expiry) => sleep(expiry).await,
+        None => std::future::pending().await,
+    }
+}
+
 async fn pause_publisher_retry(
     sender: &mpsc::UnboundedSender<ByteStream>,
     registration: &mut (impl AsyncRead + Unpin),
@@ -761,7 +787,7 @@ impl Tender for SshTender {
         let held_lease = lease.clone();
         tokio::spawn(async move {
             let mut byte = [0];
-            let mut retry_delay = Duration::from_millis(100);
+            let mut retry_delay = RETRY_FIRST;
             'publisher: loop {
                 let accept = async {
                     let mut stream = adapter.request(&session, Request::Accept(held_lease.clone())).await?;
@@ -777,7 +803,7 @@ impl Tender for SshTender {
                     stream = accept => {
                         match stream {
                             Ok(stream) => {
-                                retry_delay = Duration::from_millis(100);
+                                retry_delay = RETRY_FIRST;
                                 if sender.send(stream).is_err() { break }
                             }
                             Err(Error::Unavailable | Error::Deadline) => {
@@ -785,7 +811,7 @@ impl Tender for SshTender {
                                 if pause_publisher_retry(&sender, &mut registration_stream, retry_delay).await == RetryPause::Cancelled {
                                     break 'publisher;
                                 }
-                                retry_delay = (retry_delay * 2).min(Duration::from_secs(8));
+                                retry_delay = (retry_delay * 2).min(RETRY_LONGEST);
                             },
                             Err(_) => break,
                         }
@@ -835,6 +861,7 @@ impl Tender for SshTender {
         let session = session.clone();
         tokio::spawn(async move {
             let mut remembered = first;
+            let mut routes = adapter.route_changes.subscribe();
             loop {
                 tokio::select! {
                     _ = sender.closed() => break,
@@ -852,11 +879,18 @@ impl Tender for SshTender {
                                     }
                                 }
                                 if sender.send(remembered.clone()).is_err() { break }
+                                // The host cannot tell this client it is back, so
+                                // the route is probed with backoff, and at once when
+                                // it is replaced.
+                                let mut delay = RETRY_FIRST;
                                 loop {
                                     tokio::select! {
                                         _ = sender.closed() => return,
-                                        _ = sleep(Duration::from_millis(100)) => {}
+                                        _ = routes.changed() => {}
+                                        _ = sleep(delay) => {}
                                     }
+                                    routes.borrow_and_update();
+                                    delay = (delay * 2).min(RETRY_LONGEST);
                                     match adapter.request(&session, Request::Watch).await {
                                         Ok(reconnected) => { stream = reconnected; break }
                                         Err(Error::IdentityMismatch | Error::Denied | Error::UntrustedIntermediary) => return,
@@ -957,7 +991,7 @@ mod tests {
     use std::{collections::BTreeSet, fs, io::Write};
 
     use tempfile::{TempDir, tempdir};
-    use tokio::spawn;
+    use tokio::{spawn, time::Instant};
 
     use super::*;
     use crate::{Availability, Grant, Label, Scope};
@@ -1065,6 +1099,34 @@ mod tests {
             drop(client);
             let _ = timeout(Duration::from_secs(1), pending).await.expect("host closes");
         }
+    }
+
+    // A watch whose route is lost retries with backoff, and at once when the
+    // route is replaced, without waiting out the longest backoff.
+    #[tokio::test(start_paused = true)]
+    async fn lost_watch_retries_at_once_on_a_replaced_route() {
+        let directory = tempfile::Builder::new().permissions(std::fs::Permissions::from_mode(0o700)).tempdir().expect("directory");
+        let host = Identity::from_secret([1; 32]);
+        let caller = Identity::from_secret([2; 32]);
+        let session = Session { caller: caller.fingerprint(), pinned_host: host.fingerprint(), via: None };
+        let policy = MemoryTender::new(host.fingerprint());
+        policy.allow_browse(caller.fingerprint()).expect("host policy");
+        let first = directory.path().join("first");
+        let server = Server::bind(first.clone(), host.clone(), policy.clone()).expect("first listener");
+        let client = SshTender::new(first, host.fingerprint(), vec![caller]).expect("client");
+        let mut watch = client.watch(&session).await.expect("watch");
+        assert!(watch.recv().await.expect("first snapshot").is_empty());
+
+        drop(server);
+        assert!(watch.recv().await.expect("route lost").is_empty());
+        // Failed retries back the watch off to its longest delay.
+        sleep(RETRY_LONGEST * 4).await;
+        let second = directory.path().join("second");
+        let _server = Server::bind(second.clone(), host, policy).expect("second listener");
+        client.replace_route(second);
+        let replaced = Instant::now();
+        timeout(RETRY_LONGEST / 2, watch.recv()).await.expect("retried on the new route").expect("watch open");
+        assert!(replaced.elapsed() < RETRY_FIRST, "retried at once, after {:?}", replaced.elapsed());
     }
 
     // Both cancellation sources interrupt even the maximum outage backoff;

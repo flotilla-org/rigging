@@ -17,6 +17,8 @@ use hegel::TestCase;
 use serde_json::{Value, from_slice, to_vec};
 #[cfg(unix)]
 use tempfile::{Builder, TempDir};
+#[cfg(unix)]
+use tender::memory::WITHDRAWN_RETENTION;
 use tender::{
     Availability, Error, Fingerprint, Grant, Label, PublicationId, PublishRequest, Scope, Session, Tender,
     memory::MemoryTender,
@@ -27,13 +29,13 @@ use tender::{
     runtime::FileStore,
     ssh::{Identity, Server, SshTender},
 };
-#[cfg(unix)]
-use tokio::task::yield_now;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     runtime,
     time::timeout,
 };
+#[cfg(unix)]
+use tokio::{task::yield_now, time::Instant};
 
 struct ManualClock(Mutex<ClockReading>, AtomicBool);
 impl ManualClock {
@@ -198,6 +200,100 @@ async fn restart(mut rig: Rig) {
     rig.reload();
     assert!(rig.client.browse(&rig.session).await.unwrap().iter().all(|record| record.availability == Availability::Withdrawn));
     assert!(matches!(rig.client.publish(&rig.session, rig.request("service")).await, Err(Error::GrantExpired)));
+}
+
+/// The hosting clock in milliseconds of Tokio's clock, so paused test time
+/// moves it as it would a deployed host's.
+#[cfg(unix)]
+struct TokioClock(Instant);
+#[cfg(unix)]
+impl Clock for TokioClock {
+    fn read(&self) -> io::Result<ClockReading> {
+        Ok(ClockReading { epoch: "tokio".into(), tick: self.0.elapsed().as_millis().try_into().unwrap() })
+    }
+}
+
+/// A socket host on [`TokioClock`] whose caller holds a grant expiring after
+/// `grant` milliseconds, with a client for that caller.
+#[cfg(unix)]
+fn idle_host(directory: &TempDir, grant: u64) -> (Server, SshTender, Session) {
+    let identity = Identity::from_secret([1; 32]);
+    let caller = Identity::from_secret([2; 32]);
+    let session = Session { caller: caller.fingerprint(), pinned_host: identity.fingerprint(), via: None };
+    let clock = Arc::new(TokioClock(Instant::now()));
+    let authority = MemoryTender::hosted(session.pinned_host.clone(), clock.clone(), Arc::new(MemoryStore::default())).unwrap();
+    authority.allow_browse(session.caller.clone()).unwrap();
+    authority
+        .grant(Grant {
+            grantee: session.caller.clone(),
+            scope: Scope("n".into()),
+            audience_ceiling: BTreeSet::from([session.caller.clone()]),
+            expires_at: clock.read().unwrap().tick + grant,
+        })
+        .unwrap();
+    let path = directory.path().join("listener");
+    let server = Server::bind(path.clone(), identity, authority).unwrap();
+    let client = SshTender::new(path, session.pinned_host.clone(), vec![caller]).unwrap();
+    (server, client, session)
+}
+
+#[cfg(unix)]
+fn expiring_request(session: &Session) -> PublishRequest {
+    PublishRequest {
+        id: PublicationId::new("n", "expiring"),
+        label: Label("echo".into()),
+        display: String::new(),
+        audience: Some(BTreeSet::from([session.caller.clone()])),
+    }
+}
+
+// With nobody touching the authority, a socket publication ends at its expiry:
+// the server wakes at the deadline, withdraws it, tells its watchers and
+// closes the publisher's lease.
+#[cfg(unix)]
+#[tokio::test(start_paused = true)]
+async fn socket_publication_ends_at_its_expiry_without_activity() {
+    let directory = Builder::new().permissions(Permissions::from_mode(0o700)).tempdir().unwrap();
+    let (_server, client, session) = idle_host(&directory, 300);
+    let mut published = client.publish(&session, expiring_request(&session)).await.unwrap();
+    let mut watch = client.watch(&session).await.unwrap();
+    assert_eq!(watch.recv().await.unwrap()[0].availability, Availability::Available);
+
+    let started = Instant::now();
+    let withdrawn = timeout(Duration::from_secs(3), async {
+        loop {
+            let publications = watch.recv().await.expect("watch open");
+            if publications[0].availability == Availability::Withdrawn {
+                return;
+            }
+        }
+    });
+    withdrawn.await.expect("watchers hear the expiry");
+    assert!(started.elapsed() <= Duration::from_millis(300), "withdrawn at the expiry, not on a later sweep");
+    assert!(timeout(Duration::from_secs(3), published.incoming.recv()).await.expect("lease closes").is_none());
+}
+
+// With nobody touching the authority, a withdrawn publication is forgotten at
+// the end of its retention, and watchers hear it go.
+#[cfg(unix)]
+#[tokio::test(start_paused = true)]
+async fn socket_withdrawal_is_forgotten_at_its_retention_without_activity() {
+    let directory = Builder::new().permissions(Permissions::from_mode(0o700)).tempdir().unwrap();
+    let (_server, client, session) = idle_host(&directory, u64::MAX / 2);
+    let published = client.publish(&session, expiring_request(&session)).await.unwrap();
+    let mut watch = client.watch(&session).await.unwrap();
+    assert_eq!(watch.recv().await.unwrap()[0].availability, Availability::Available);
+    client.withdraw(&session, &published.lease).await.unwrap();
+    let withdrawn = Instant::now();
+
+    let forgotten =
+        timeout(Duration::from_millis(WITHDRAWN_RETENTION + 3_000), async { while !watch.recv().await.expect("watch open").is_empty() {} });
+    forgotten.await.expect("watchers hear it forgotten");
+    let held = withdrawn.elapsed();
+    assert!(
+        held >= Duration::from_millis(WITHDRAWN_RETENTION) && held <= Duration::from_millis(WITHDRAWN_RETENTION + 100),
+        "forgotten at the end of its retention, after {held:?}"
+    );
 }
 
 macro_rules! contract {
