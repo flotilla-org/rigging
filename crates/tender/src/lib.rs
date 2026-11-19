@@ -29,6 +29,16 @@ pub mod runtime;
 #[cfg(unix)]
 pub mod ssh;
 
+/// Sleeps until `deadline`, or forever without one: the one timer a loop
+/// that wakes on events also waits on.
+#[cfg(unix)]
+pub(crate) async fn until(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
+    }
+}
+
 /// The host enforces this grant, including its audience ceiling and expiry.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Grant {

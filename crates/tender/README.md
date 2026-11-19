@@ -97,9 +97,12 @@ The daemon publishes a local socket as itself and never starts or stops the
 service behind it. It probes the endpoint first: one that does not answer is
 published unavailable, never announced as available. A connection that cannot
 open the endpoint after a few tries over about half a second makes the
-publication unavailable; the daemon checks unavailable endpoints once a second
-and publishes again, at a new generation, once one answers. A publication
-taken over by another publisher, or withdrawn, is no longer the daemon's.
+publication unavailable. A local socket cannot say when it answers again, so
+the daemon probes an unavailable endpoint from the moment it becomes
+unavailable, backing off from 100 ms to eight seconds, and publishes again, at
+a new generation, once it answers. Nothing is probed while every own
+publication is live. A publication taken over by another publisher, or
+withdrawn, is no longer the daemon's.
 Shutting down leaves its publications unavailable. The next start publishes
 the `config.toml` entries again and withdraws every other publication this
 instance made, including all from the control API, which do not persist; the
@@ -235,8 +238,9 @@ Consumer restart-persistent binding configuration remains the hosting
 application's responsibility.
 
 After SSH loss, retained browse/watch metadata becomes Unavailable rather than
-Withdrawn. `replace_route` supplies a restored forward; watch re-establishes its
-control subscription and fresh connects use that route. Existing application
+Withdrawn. Watch retries its control subscription with backoff from 100 ms to
+eight seconds, and at once when `replace_route` supplies a restored forward;
+fresh connects use that route. Existing application
 streams are never migrated or replayed. A remote publisher holds a separate
 registration control channel: transient Accept failures retry with backoff from
 100 ms to eight seconds while that lease is healthy, but losing it reserves the identity and closes its Published
@@ -282,8 +286,11 @@ using checked addition for the desired lifetime. `Clock::read` is fallible;
 a clock error refuses work and closes streams without poisoning the authority
 lock. Restore the clock and reopen the host to resume. Every publish, connect and
 Binding open samples the clock under the authority lock, without publisher or
-operator activity. Browse/watch and the server's maintenance loop also observe
-expiry. Mere expiry retires the identity and refuses new work while established
+operator activity. Browse/watch also observe expiry, and the socket server
+wakes at the earliest deadline, a publication's expiry or the end of a
+withdrawn one's retention, so watchers and the publisher's lease hear of it
+without any activity. A manually ticked authority has no deadline;
+`advance_to` tells them itself. Mere expiry retires the identity and refuses new work while established
 streams finish. Explicit revocation closes even streams grandfathered by expiry.
 
 On Linux use `runtime::BootClock::new()`: its boot ID and `CLOCK_BOOTTIME` ticks
