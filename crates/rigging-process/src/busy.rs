@@ -6,26 +6,34 @@
 //! below is a blocking-pool job that waits for the guard's end, and tokio counts a blocking-pool
 //! job as running work, so no timer comes due while a child the guard covers runs. A
 //! multi-thread runtime never pauses its time, so there the guard holds nothing.
+//!
+//! A deadline set around a guarded child, such as `run_with_timeout`'s, runs on the runtime's
+//! clock, which a paused runtime does not move while the child runs: there it lapses only once
+//! the child is done or other work moves the clock, so a paused-time test of a hung child waits
+//! for the child. Test a timeout's own path with a fake runner, or on unpaused time.
 
 /// Holds the current runtime busy while the returned guard lives: hold one from a child's spawn
 /// until its result is back. See the [module docs](self).
 pub fn busy() -> Busy {
-    let Ok(runtime) = tokio::runtime::Handle::try_current() else { return Busy(None) };
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else { return Busy { _held: None } };
     if runtime.runtime_flavor() != tokio::runtime::RuntimeFlavor::CurrentThread {
-        return Busy(None);
+        return Busy { _held: None };
     }
     let (held, ended) = std::sync::mpsc::channel::<()>();
     drop(runtime.spawn_blocking(move || {
         // Returns once the guard drops its sender.
         let _ = ended.recv();
     }));
-    Busy(Some(held))
+    Busy { _held: Some(held) }
 }
 
 /// Holds the runtime busy while it lives: see [`busy`].
 #[must_use = "the runtime is busy only while the guard lives"]
 #[derive(Debug)]
-pub struct Busy(#[allow(dead_code)] Option<std::sync::mpsc::Sender<()>>);
+pub struct Busy {
+    /// Ends the blocking-pool job when dropped; none where nothing is held.
+    _held: Option<std::sync::mpsc::Sender<()>>,
+}
 
 // The child is a Unix `sleep`; the process scenarios run on Linux.
 #[cfg(all(test, unix))]
@@ -66,5 +74,16 @@ mod tests {
             .await,
         ];
         assert_eq!(runs, [(true, Duration::from_millis(1)); 4], "each timer fired after its child, at +1 ms virtual");
+    }
+
+    // Behaviour: the guard holds nothing outside a runtime or on a multi-thread one, whose time
+    // never pauses.
+    #[test]
+    fn the_guard_holds_nothing_where_time_cannot_pause() {
+        assert!(super::busy()._held.is_none(), "outside a runtime");
+        let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(1).build().expect("runtime");
+        assert!(runtime.block_on(async { super::busy()._held.is_none() }), "on a multi-thread runtime");
+        let runtime = tokio::runtime::Builder::new_current_thread().build().expect("runtime");
+        assert!(runtime.block_on(async { super::busy()._held.is_some() }), "on a current-thread runtime");
     }
 }
