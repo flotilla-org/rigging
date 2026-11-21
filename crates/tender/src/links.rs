@@ -174,8 +174,10 @@ impl Links {
         .await
         .map_err(|_| Error::Deadline)??;
         let id = self.register(peer.clone(), Some(dial), stream);
+        // Subscribed after `register` releases the lock, so the link's tasks
+        // may already have closed it and removed its entry: a link that
+        // closed as soon as it opened reads as already ended.
         let ended = self.shared.table.lock().expect("links lock").links.get(&id).map(|entry| entry.ended.subscribe());
-        // A link that closed as soon as it opened is already gone.
         let ended = ended.unwrap_or_else(|| watch::channel(true).1);
         Ok(Link { links: Arc::downgrade(&self.shared), id, ended })
     }
@@ -263,13 +265,18 @@ impl Links {
         let mut table = self.shared.table.lock().expect("links lock");
         let Some(entry) = table.links.get_mut(&id) else { return Ok(()) };
         let mut learned = BTreeMap::new();
+        let mut listed = BTreeSet::new();
         for reach in reaches {
             let distinct: BTreeSet<_> = reach.path.iter().collect();
-            if reach.path.last() != Some(&reach.instance) || distinct.len() != reach.path.len() || distinct.contains(&entry.peer) {
+            if reach.path.last() != Some(&reach.instance)
+                || distinct.len() != reach.path.len()
+                || distinct.contains(&entry.peer)
+                || !listed.insert(reach.instance.clone())
+            {
                 return Err(());
             }
-            if reach.path.len() < MAX_PATH && !distinct.contains(&self.shared.own) && learned.insert(reach.instance, reach.path).is_some() {
-                return Err(());
+            if reach.path.len() < MAX_PATH && !distinct.contains(&self.shared.own) {
+                learned.insert(reach.instance, reach.path);
             }
         }
         if entry.learned != learned {
@@ -559,7 +566,8 @@ mod tests {
     // A peer's path is a route only if it neither loops back through this
     // instance nor runs past the hop bound; a table that names a path not
     // ending at its instance, repeats a hop, names the peer itself or lists
-    // an instance twice is malformed, and closes the link.
+    // an instance twice, even in an entry that is not a route, is malformed,
+    // and closes the link.
     #[tokio::test]
     async fn only_loop_free_bounded_paths_are_learned() {
         let (links, _far) = linked("b");
@@ -574,6 +582,7 @@ mod tests {
             vec![reach(&["c", "c"])],
             vec![reach(&["b", "c"])],
             vec![reach(&["c"]), reach(&["d", "c"])],
+            vec![reach(&[&own, "c"]), reach(&["c"])],
         ] {
             assert!(links.learn(0, malformed).is_err());
         }
