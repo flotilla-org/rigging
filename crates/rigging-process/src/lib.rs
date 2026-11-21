@@ -10,6 +10,7 @@ pub const COMMAND_TERMINATION_GRACE: Duration = Duration::from_secs(5);
 pub const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub mod available_space;
+pub mod busy;
 pub mod lines;
 pub mod probe;
 pub mod scan_cache;
@@ -415,6 +416,8 @@ impl<G: CommandGuard> ProcessRunner<G> {
     }
 
     async fn command_output(&self, cmd: &str, args: &[&str], cwd: &Path) -> Result<std::process::Output, String> {
+        // The guard's checks and the child are work the runtime cannot see.
+        let _busy = busy::busy();
         let child = self
             .checked_command(cmd, args, cwd)
             .await?
@@ -560,6 +563,9 @@ impl<G: CommandGuard> CommandRunner for ProcessRunner<G> {
     ) -> Result<String, String> {
         use tokio::io::AsyncReadExt;
 
+        // The guard's checks and the child are work the runtime cannot see; the deadline still
+        // runs on the runtime's clock.
+        let _busy = busy::busy();
         let mut child = self
             .checked_command(cmd, args, cwd)
             .await?
@@ -669,6 +675,8 @@ impl<G: CommandGuard> CommandRunner for ProcessRunner<G> {
     ) -> Result<CommandOutput, String> {
         use tokio::io::AsyncReadExt;
 
+        // The guard's checks and the child are work the runtime cannot see.
+        let _busy = busy::busy();
         // Not kill_on_drop: the termination guard owns the child's shutdown.
         let mut child = self
             .checked_command(cmd, args, cwd)
