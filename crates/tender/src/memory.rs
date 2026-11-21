@@ -352,6 +352,14 @@ impl MemoryTender {
         state.notify()
     }
 
+    /// Replace the relays trusted to deliver callers. A relayed stream
+    /// already open keeps running: a relay is checked as each stream opens.
+    pub fn set_intermediaries(&self, relays: BTreeSet<Fingerprint>) -> Result<(), Error> {
+        let mut state = self.state()?;
+        state.intermediaries = relays;
+        state.notify()
+    }
+
     /// Revocation stops new connections and forcibly closes established streams.
     pub fn revoke(&self, grantee: &Fingerprint, scope: &Scope) -> Result<(), Error> {
         let mut state = self.state()?;

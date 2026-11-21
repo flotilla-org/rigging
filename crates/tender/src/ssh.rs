@@ -36,17 +36,18 @@ use tokio::{
 use crate::{
     Binding, BindingState, ByteStream, Dial, Error, Fingerprint, Lease, PublicKey, Publication, PublicationId, PublishRequest, Published,
     Router, Session, Tender, UnavailableReason, Watch,
+    links::Links,
     memory::MemoryTender,
     paths::MAX_SOCKET_PATH,
     runtime::{Clock, FileStore},
     until,
 };
 
-const OPEN_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const OPEN_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_CONTROL: usize = 64 * 1024;
 const MAX_CHANNELS: usize = 256;
 /// Bounds a relay chain, so a routing loop between relays fails promptly.
-const MAX_RELAY_HOPS: u8 = 8;
+pub(crate) const MAX_RELAY_HOPS: u8 = 8;
 /// A Binding listener's name, its number in hex.
 const MAX_BINDING_NAME: usize = 16;
 /// A lost watch, or a publisher whose host refused an accept, first retries
@@ -109,7 +110,7 @@ fn fingerprint(key: &[u8; 32]) -> Fingerprint {
     Fingerprint(Sha256::digest(key).iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
-async fn write_control<T: Serialize>(stream: &mut (impl AsyncWrite + Unpin), value: &T) -> io::Result<()> {
+pub(crate) async fn write_control<T: Serialize>(stream: &mut (impl AsyncWrite + Unpin), value: &T) -> io::Result<()> {
     let bytes = serde_json::to_vec(value).map_err(io::Error::other)?;
     if bytes.len() > MAX_CONTROL {
         return Err(io::Error::other("control frame too large"));
@@ -118,7 +119,7 @@ async fn write_control<T: Serialize>(stream: &mut (impl AsyncWrite + Unpin), val
     stream.write_all(&bytes).await
 }
 
-async fn read_control<T: DeserializeOwned>(stream: &mut (impl AsyncRead + Unpin)) -> io::Result<T> {
+pub(crate) async fn read_control<T: DeserializeOwned>(stream: &mut (impl AsyncRead + Unpin)) -> io::Result<T> {
     let length = stream.read_u32().await? as usize;
     if length > MAX_CONTROL {
         return Err(io::Error::other("control frame too large"));
@@ -139,7 +140,11 @@ fn transcript(client_nonce: &[u8; 32], server_nonce: &[u8; 32], server_key: &[u8
     [b"tender-ssh-v1".as_slice(), client_nonce, server_nonce, server_key].concat()
 }
 
-async fn client_handshake(stream: &mut (impl AsyncRead + AsyncWrite + Unpin), identity: &Identity, pin: &Fingerprint) -> Result<(), Error> {
+pub(crate) async fn client_handshake(
+    stream: &mut (impl AsyncRead + AsyncWrite + Unpin),
+    identity: &Identity,
+    pin: &Fingerprint,
+) -> Result<(), Error> {
     let mut nonce = [0; 32];
     OsRng.fill_bytes(&mut nonce);
     write_control(stream, &nonce).await.map_err(|_| Error::Unavailable)?;
@@ -174,7 +179,7 @@ async fn server_handshake(stream: &mut (impl AsyncRead + AsyncWrite + Unpin), id
 }
 
 #[derive(Serialize, Deserialize)]
-enum Request {
+pub(crate) enum Request {
     Publish(PublishRequest),
     Accept(Lease),
     Browse,
@@ -189,10 +194,17 @@ enum Request {
         host: Fingerprint,
         hops: u8,
     },
+    /// Hold this stream as a link (`crate::links`): after `Open` both ends
+    /// write link frames on it.
+    Link,
+    /// The stream the end that accepted a link asked its dialer for with this
+    /// token. After `Open` the requester serves it, and the end that asked
+    /// is the client.
+    Adopt(u64),
 }
 
 #[derive(Serialize, Deserialize)]
-enum Response {
+pub(crate) enum Response {
     Lease(Lease),
     Publications(Vec<Publication>),
     Binding(Binding),
@@ -214,11 +226,37 @@ pub struct Server {
     pub policy: MemoryTender,
     identity: Identity,
     task: JoinHandle<()>,
-    path: PathBuf,
+    path: Option<PathBuf>,
     router: Relays,
+    links: Links,
+    incoming: mpsc::UnboundedSender<ByteStream>,
 }
 
 type Relays = Arc<Mutex<Option<Arc<dyn Router>>>>;
+
+/// Buffers each direction of an in-process stream, as a socket buffer would.
+const IN_PROCESS_BUFFER: usize = 64 * 1024;
+
+/// Dials a server within this process, whichever instance is named: each
+/// stream is one end of an in-memory pipe whose other end the server accepts.
+struct InProcess(mpsc::UnboundedSender<ByteStream>);
+
+#[async_trait]
+impl Dial for InProcess {
+    async fn dial(&self, _: &Fingerprint) -> io::Result<ByteStream> {
+        let (near, far) = tokio::io::duplex(IN_PROCESS_BUFFER);
+        self.0.send(Box::new(far)).map_err(|_| io::Error::from(io::ErrorKind::ConnectionRefused))?;
+        Ok(Box::new(near))
+    }
+}
+
+/// The listener's next connection, or none ever without a listener.
+async fn accept(listener: Option<&UnixListener>) -> io::Result<UnixStream> {
+    match listener {
+        Some(listener) => listener.accept().await.map(|(stream, _)| stream),
+        None => std::future::pending().await,
+    }
+}
 
 impl Server {
     /// Host a durable Tender authority. The private state directory owns both
@@ -257,11 +295,27 @@ impl Server {
         }
         let listener = UnixListener::bind(&path)?;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-        let registrations = Arc::new(Mutex::new(BTreeMap::new()));
+        Ok(Self::start(identity, policy, Some(listener), Some(path)))
+    }
+
+    /// Serve an authority with no listener, reached only through
+    /// [`Self::dialer`] and its links: the in-memory byte transport.
+    pub fn in_process(identity: Identity, policy: MemoryTender) -> io::Result<Self> {
+        if identity.fingerprint() != policy.host() {
+            return Err(io::Error::other("policy host does not match instance key"));
+        }
+        Ok(Self::start(identity, policy, None, None))
+    }
+
+    fn start(identity: Identity, policy: MemoryTender, listener: Option<UnixListener>, path: Option<PathBuf>) -> Self {
+        let registrations: Registrations = Arc::new(Mutex::new(BTreeMap::new()));
         let authority = policy.clone();
         let own = identity.clone();
         let router: Relays = Arc::new(Mutex::new(None));
         let relays = router.clone();
+        let (incoming, mut streams) = mpsc::unbounded_channel::<ByteStream>();
+        let links = Links::new(identity.clone(), incoming.clone());
+        let held = links.clone();
         let task = tokio::spawn(async move {
             let permits = Arc::new(Semaphore::new(MAX_CHANNELS));
             // Registrations end with their leases: on a lease change, and at the
@@ -271,42 +325,64 @@ impl Server {
             let mut connections = tokio::task::JoinSet::new();
             loop {
                 let expiry = authority.until_expiry(None);
-                tokio::select! {
-                    accepted = listener.accept() => {
-                        let Ok((stream, _)) = accepted else { break };
-                        let Ok(permit) = permits.clone().try_acquire_owned() else {
-                            tracing::debug!(max_channels = MAX_CHANNELS, "Tender channel admission limit reached");
-                            continue
-                        };
-                        let policy = authority.clone();
-                        let identity = identity.clone();
-                        let registrations = registrations.clone();
-                        let router = relays.lock().expect("router lock").clone();
-                        connections.spawn(async move {
-                            let _permit = permit;
-                            let _ = serve(stream, identity, policy, registrations, router).await;
-                        });
+                let stream: ByteStream = tokio::select! {
+                    accepted = accept(listener.as_ref()) => {
+                        let Ok(stream) = accepted else { break };
+                        Box::new(stream)
                     }
-                    _ = connections.join_next(), if !connections.is_empty() => {}
+                    // In-process streams, and those this instance opened back
+                    // over a link for the end that accepted it.
+                    stream = streams.recv() => {
+                        let Some(stream) = stream else { break };
+                        stream
+                    }
+                    _ = connections.join_next(), if !connections.is_empty() => continue,
                     _ = lease_changes.changed() => {
                         registrations.lock().expect("registrations lock").retain(|_, registration| authority.lease_active(&registration.lease));
+                        continue
                     }
                     () = until(expiry) => {
                         registrations.lock().expect("registrations lock").retain(|_, registration| authority.lease_active(&registration.lease));
+                        continue
                     }
-                }
+                };
+                let Ok(permit) = permits.clone().try_acquire_owned() else {
+                    tracing::debug!(max_channels = MAX_CHANNELS, "Tender channel admission limit reached");
+                    continue;
+                };
+                let links = held.clone();
+                let policy = authority.clone();
+                let identity = identity.clone();
+                let registrations = registrations.clone();
+                let router = relays.lock().expect("router lock").clone();
+                connections.spawn(async move {
+                    let _permit = permit;
+                    let _ = serve(stream, identity, policy, registrations, router, links).await;
+                });
             }
         });
-        Ok(Self { policy, identity: own, task, path, router })
+        Self { policy, identity: own, task, path, router, links, incoming }
     }
 
     pub fn identity(&self) -> &Identity {
         &self.identity
     }
 
+    /// Opens streams to this server from within the process, whatever
+    /// instance is named, as its listener would accept them.
+    pub fn dialer(&self) -> Arc<dyn Dial> {
+        Arc::new(InProcess(self.incoming.clone()))
+    }
+
+    /// This instance's links and the routes learned over them. Relays follow
+    /// these routes unless [`Self::route_relays`] supplies others.
+    pub fn links(&self) -> &Links {
+        &self.links
+    }
+
     /// Forward relay requests for other hosts along the hosting application's
-    /// routes. Without a router this instance only terminates relays addressed
-    /// to it. Established relayed streams keep the route they opened on.
+    /// routes instead of the learned ones. Established relayed streams keep
+    /// the route they opened on.
     pub fn route_relays(&self, router: Arc<dyn Router>) {
         *self.router.lock().expect("router lock") = Some(router);
     }
@@ -342,17 +418,21 @@ impl Server {
 impl Drop for Server {
     fn drop(&mut self) {
         self.task.abort();
+        self.links.retain(|_| false);
         let _ = self.policy.restart();
-        let _ = std::fs::remove_file(&self.path);
+        if let Some(path) = &self.path {
+            let _ = std::fs::remove_file(path);
+        }
     }
 }
 
 async fn serve(
-    mut stream: impl AsyncRead + AsyncWrite + Unpin + Send,
+    mut stream: ByteStream,
     identity: Identity,
     policy: MemoryTender,
     registrations: Registrations,
     router: Option<Arc<dyn Router>>,
+    links: Links,
 ) -> io::Result<()> {
     let (session, request) = timeout(OPEN_TIMEOUT, async {
         let session = server_handshake(&mut stream, &identity).await?;
@@ -381,7 +461,10 @@ async fn serve(
             }
             (Session { via: Some(session.caller), ..caller }, request)
         }
-        Request::Relay { host, hops } => return forward(stream, &identity, &policy, router, &session, host, hops).await,
+        Request::Relay { host, hops } => {
+            let router = router.unwrap_or_else(|| Arc::new(links.clone()));
+            return forward(stream, &identity, &policy, router, &session, host, hops).await;
+        }
         request => (session, request),
     };
     let response = match request {
@@ -497,6 +580,25 @@ async fn serve(
             Err(error) => Response::Error(error),
         },
         Request::Relay { .. } => Response::Error(Error::UntrustedIntermediary),
+        // A link joins two instances directly: neither request may arrive through a relay.
+        Request::Link | Request::Adopt(_) if session.via.is_some() => Response::Error(Error::Denied),
+        // Admitted as a relay admits its upstream: the caller may connect here.
+        Request::Link => match policy.check_forward(&session) {
+            Ok(()) => {
+                write_control(&mut stream, &Response::Open).await?;
+                links.accept(session.caller, stream);
+                return Ok(());
+            }
+            Err(error) => Response::Error(error),
+        },
+        Request::Adopt(token) => match links.adopt(&session.caller, token) {
+            Some(waiting) => {
+                write_control(&mut stream, &Response::Open).await?;
+                let _ = waiting.send(stream);
+                return Ok(());
+            }
+            None => Response::Error(Error::Denied),
+        },
     };
     write_control(&mut stream, &response).await
 }
@@ -511,7 +613,7 @@ async fn forward(
     mut upstream: impl AsyncRead + AsyncWrite + Unpin,
     identity: &Identity,
     policy: &MemoryTender,
-    router: Option<Arc<dyn Router>>,
+    router: Arc<dyn Router>,
     session: &Session,
     host: Fingerprint,
     hops: u8,
@@ -519,7 +621,6 @@ async fn forward(
     let opened = async {
         policy.check_forward(session)?;
         let remaining = hops.checked_sub(1).ok_or(Error::Unavailable)?;
-        let router = router.ok_or(Error::Unavailable)?;
         let hop = router.next_hop(&host).ok_or(Error::Unavailable)?;
         if hop == identity.fingerprint() {
             return Err(Error::Unavailable);
@@ -1059,7 +1160,8 @@ mod tests {
         let (mut client, server) = UnixStream::pair().expect("transport pair");
         let authority = policy.clone();
         let server_identity = host.clone();
-        let pending = spawn(async move { serve(server, server_identity, authority, registrations, None).await });
+        let links = Links::new(server_identity.clone(), mpsc::unbounded_channel().0);
+        let pending = spawn(async move { serve(Box::new(server), server_identity, authority, registrations, None, links).await });
         client_handshake(&mut client, &publisher, &host.fingerprint()).await.expect("authenticate publisher");
         write_control(&mut client, &Request::Accept(lease)).await.expect("duplicate accept request");
         drop(client);
@@ -1083,7 +1185,8 @@ mod tests {
         policy.trust_intermediary(trusted.fingerprint()).expect("host policy");
         for (relay, admitted) in [(trusted, true), (Identity::generate(), false)] {
             let (mut client, server) = UnixStream::pair().expect("transport pair");
-            let pending = spawn(serve(server, host.clone(), policy.clone(), Arc::new(Mutex::new(BTreeMap::new())), None));
+            let links = Links::new(host.clone(), mpsc::unbounded_channel().0);
+            let pending = spawn(serve(Box::new(server), host.clone(), policy.clone(), Arc::new(Mutex::new(BTreeMap::new())), None, links));
             client_handshake(&mut client, &relay, &host.fingerprint()).await.expect("authenticate relay");
             write_control(&mut client, &Request::Relay { host: host.fingerprint(), hops: 1 }).await.expect("relay request");
             match read_control(&mut client).await.expect("admission") {

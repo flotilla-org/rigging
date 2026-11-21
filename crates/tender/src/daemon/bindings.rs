@@ -1,6 +1,8 @@
 //! Eager Bindings: this instance follows the publication lists of its Trusted
 //! Group and keeps a Binding, at the identity's fixed path, for every
-//! publication that admits it, its own included.
+//! publication that admits it, its own included. Each member with a
+//! configured route is dialed and its link held; every member is followed
+//! over whatever route the links have learned to it.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -24,11 +26,12 @@ use tokio::{
 };
 
 use crate::{
-    Availability, BindingState, Fingerprint, Publication, PublicationId, Route, Session, Tender, UnavailableReason, Watch,
+    Availability, BindingState, Dial, Fingerprint, Publication, PublicationId, Route, Session, Tender, UnavailableReason, Watch,
     api::{BindingEntry, PeerRoute, PeerState, PeerStatus, TrustedInstance},
+    links::Links,
     memory::MemoryTender,
     paths,
-    ssh::{Forward, Identity, SshTender},
+    ssh::{Forward, Identity, SshTender, UnixDial},
     until,
 };
 
@@ -47,10 +50,21 @@ pub(super) enum Event {
 }
 
 pub(super) enum PeerUpdate {
+    /// No live link leads to the member.
+    NoRoute,
     Connecting,
-    Connected(SshTender),
+    Connected(SshTender, Route),
     Snapshot(Vec<Publication>),
     Lost(String),
+    /// How the link this instance dials to the member stands.
+    Link(LinkState),
+}
+
+#[derive(Clone)]
+pub(super) enum LinkState {
+    Dialing,
+    Up,
+    Failed(String),
 }
 
 #[derive(Default)]
@@ -85,6 +99,7 @@ impl Bindings {
         runtime: &Path,
         identity: Identity,
         policy: MemoryTender,
+        links: Links,
         endpoints: Endpoints,
         local: Watch,
         grace: Duration,
@@ -110,6 +125,7 @@ impl Bindings {
             own: own.clone(),
             identity,
             policy,
+            links,
             endpoints,
             grace,
             local: Vec::new(),
@@ -153,6 +169,7 @@ struct Binder {
     own: Fingerprint,
     identity: Identity,
     policy: MemoryTender,
+    links: Links,
     endpoints: Endpoints,
     grace: Duration,
     local: Vec<Publication>,
@@ -164,17 +181,33 @@ struct Binder {
 
 struct Peer {
     name: String,
+    /// The configured route, which this instance dials and holds a link over.
     route: Option<PeerRoute>,
     state: PeerState,
-    adapter: Option<SshTender>,
+    link: Option<LinkState>,
+    /// The follower's adapter, and the route it follows over.
+    adapter: Option<(SshTender, Route)>,
     publications: Vec<Publication>,
-    follower: Option<JoinHandle<()>>,
+    follower: JoinHandle<()>,
+    linker: Option<JoinHandle<()>>,
+}
+
+impl Peer {
+    /// While no route leads to the member, how its configured link stands.
+    fn status(&self) -> PeerState {
+        match (&self.state, &self.link) {
+            (PeerState::NoRoute, Some(LinkState::Failed(reason))) => PeerState::Unreachable { reason: reason.clone() },
+            (PeerState::NoRoute, Some(LinkState::Dialing)) => PeerState::Connecting,
+            (state, _) => state.clone(),
+        }
+    }
 }
 
 impl Drop for Peer {
     fn drop(&mut self) {
-        if let Some(follower) = &self.follower {
-            follower.abort();
+        self.follower.abort();
+        if let Some(linker) = &self.linker {
+            linker.abort();
         }
     }
 }
@@ -275,8 +308,12 @@ impl Binder {
             Event::Peer(fingerprint, update) => {
                 let Some(peer) = self.peers.get_mut(&fingerprint) else { return };
                 match update {
+                    PeerUpdate::NoRoute => {
+                        peer.adapter = None;
+                        peer.state = PeerState::NoRoute;
+                    }
                     PeerUpdate::Connecting => peer.state = PeerState::Connecting,
-                    PeerUpdate::Connected(adapter) => peer.adapter = Some(adapter),
+                    PeerUpdate::Connected(adapter, route) => peer.adapter = Some((adapter, route)),
                     PeerUpdate::Snapshot(publications) => {
                         peer.state = PeerState::Following { publications: publications.len() };
                         peer.publications = publications;
@@ -285,30 +322,46 @@ impl Binder {
                         peer.adapter = None;
                         peer.state = PeerState::Unreachable { reason };
                     }
+                    PeerUpdate::Link(state) => peer.link = Some(state),
                 }
             }
         }
     }
 
-    /// Follow each member with a route; a changed route restarts its follower.
+    /// Follow each member, and hold a link to each with a configured route;
+    /// a changed route redials its link.
     fn trust(&mut self, members: Vec<TrustedInstance>) {
         let members: BTreeMap<_, _> =
             members.into_iter().filter_map(|member| Some((member.key.fingerprint()?, member))).filter(|(fp, _)| fp != &self.own).collect();
-        self.peers.retain(|fingerprint, peer| members.get(fingerprint).is_some_and(|member| member.route == peer.route));
+        self.peers.retain(|fingerprint, _| members.contains_key(fingerprint));
         for (fingerprint, member) in members {
+            let linker = |route: &PeerRoute| spawn(link(fingerprint.clone(), route.clone(), self.links.clone(), self.events.clone()));
             if let Some(peer) = self.peers.get_mut(&fingerprint) {
                 peer.name = member.name;
+                if peer.route != member.route {
+                    if let Some(linker) = peer.linker.take() {
+                        linker.abort();
+                    }
+                    peer.linker = member.route.as_ref().map(linker);
+                    peer.link = None;
+                    peer.route = member.route;
+                }
                 continue;
             }
-            let follower = member
-                .route
-                .clone()
-                .map(|route| spawn(follow(fingerprint.clone(), route, self.identity.clone(), self.own.clone(), self.events.clone())));
-            let state = if follower.is_some() { PeerState::Connecting } else { PeerState::NoRoute };
-            self.peers.insert(
-                fingerprint,
-                Peer { name: member.name, route: member.route, state, adapter: None, publications: Vec::new(), follower },
-            );
+            let linker = member.route.as_ref().map(linker);
+            let follower =
+                spawn(follow(fingerprint.clone(), self.identity.clone(), self.own.clone(), self.links.clone(), self.events.clone()));
+            let peer = Peer {
+                name: member.name,
+                route: member.route,
+                state: PeerState::NoRoute,
+                link: None,
+                adapter: None,
+                publications: Vec::new(),
+                follower,
+                linker,
+            };
+            self.peers.insert(fingerprint, peer);
         }
     }
 
@@ -326,11 +379,7 @@ impl Binder {
             peers: self
                 .peers
                 .iter()
-                .map(|(fingerprint, peer)| PeerStatus {
-                    fingerprint: fingerprint.clone(),
-                    name: peer.name.clone(),
-                    state: peer.state.clone(),
-                })
+                .map(|(fingerprint, peer)| PeerStatus { fingerprint: fingerprint.clone(), name: peer.name.clone(), state: peer.status() })
                 .collect(),
         };
         *self.view.lock().expect("view lock") = view;
@@ -370,11 +419,14 @@ impl Binder {
         let (state, target, link, carrier) = match chosen {
             None => (BindingState::Revoked, Target::Refuse, None, None),
             Some(candidate) => {
-                let instance = match &candidate.carrier {
-                    Carrier::Local => self.own.clone(),
-                    Carrier::Peer(fingerprint) => fingerprint.clone(),
+                let route = match &candidate.carrier {
+                    Carrier::Local => Route { instance: self.own.clone(), via: None },
+                    Carrier::Peer(fingerprint) => match &self.peers[fingerprint].adapter {
+                        Some((_, route)) => route.clone(),
+                        None => Route { instance: fingerprint.clone(), via: None },
+                    },
                 };
-                let route = Route { instance: instance.clone(), via: None };
+                let session = Session { caller: self.own.clone(), pinned_host: route.instance.clone(), via: route.via.clone() };
                 let state = match (candidate.reachable, candidate.publication.availability) {
                     (false, _) => BindingState::Unavailable { reason: UnavailableReason::RouteUnavailable, route: Some(route) },
                     (true, Availability::Available) => BindingState::Available { route },
@@ -385,12 +437,11 @@ impl Binder {
                         BindingState::Unavailable { reason: UnavailableReason::Withdrawn, route: Some(route) }
                     }
                 };
-                let session = Session { caller: self.own.clone(), pinned_host: instance, via: None };
                 let target = match (&candidate.carrier, candidate.live()) {
                     (_, false) => Target::Refuse,
                     (Carrier::Local, true) => Target::Authority { policy: self.policy.clone(), session },
                     (Carrier::Peer(fingerprint), true) => match &self.peers[fingerprint].adapter {
-                        Some(adapter) => Target::Peer { adapter: adapter.clone(), session },
+                        Some((adapter, _)) => Target::Peer { adapter: adapter.clone(), session },
                         None => Target::Refuse,
                     },
                 };
@@ -491,14 +542,13 @@ async fn serve(listener: UnixListener, id: PublicationId, target: Arc<Mutex<Targ
     }
 }
 
-/// Follow one member's publications over its route, restoring the route,
-/// through a fresh SSH forward where it has one, whenever it fails.
-async fn follow(fingerprint: Fingerprint, route: PeerRoute, identity: Identity, own: Fingerprint, events: UnboundedSender<Event>) {
-    let session = Session { caller: own, pinned_host: fingerprint.clone(), via: None };
-    let send = |update| events.send(Event::Peer(fingerprint.clone(), update)).is_ok();
+/// Hold a link to one member over its configured route, restoring it with
+/// backoff, through a fresh SSH forward where it has one, whenever it fails.
+async fn link(fingerprint: Fingerprint, route: PeerRoute, links: Links, events: UnboundedSender<Event>) {
+    let send = |state| events.send(Event::Peer(fingerprint.clone(), PeerUpdate::Link(state))).is_ok();
     let mut delay = RETRY_FIRST;
     loop {
-        if !send(PeerUpdate::Connecting) {
+        if !send(LinkState::Dialing) {
             return;
         }
         let attempt = async {
@@ -511,15 +561,68 @@ async fn follow(fingerprint: Fingerprint, route: PeerRoute, identity: Identity, 
                     (forward.socket().to_owned(), Some(forward))
                 }
             };
-            let adapter = SshTender::new(socket, fingerprint.clone(), vec![identity.clone()]).map_err(|error| error.to_string())?;
-            let watch = adapter.subscribe(&session).await.map_err(|error| format!("{error:?}"))?;
-            Ok::<_, String>((adapter, watch, forward))
+            let dial: Arc<dyn Dial> = Arc::new(UnixDial(socket));
+            let link = links.connect(dial, &fingerprint).await.map_err(|error| format!("{error:?}"))?;
+            Ok::<_, String>((link, forward))
         }
         .await;
         match attempt {
-            Ok((adapter, mut watch, _forward)) => {
+            Ok((mut link, _forward)) => {
                 let connected = Instant::now();
-                if !send(PeerUpdate::Connected(adapter)) {
+                if !send(LinkState::Up) {
+                    return;
+                }
+                link.closed().await;
+                if !send(LinkState::Failed("the link closed".into())) {
+                    return;
+                }
+                // Only a link that stayed up earns a quick retry; one that
+                // drops as soon as it opens backs off like a failure, so a
+                // link that keeps flapping is retried at the longest delay.
+                delay = if connected.elapsed() >= ROUTE_SETTLED { RETRY_FIRST } else { (delay * 2).min(RETRY_LONGEST) };
+            }
+            Err(reason) => {
+                if !send(LinkState::Failed(reason)) {
+                    return;
+                }
+                delay = (delay * 2).min(RETRY_LONGEST);
+            }
+        }
+        sleep(delay).await;
+    }
+}
+
+/// Follow one member's publications over the route the links have learned
+/// to it: a direct link whoever dialed it, or a next hop that relays. While
+/// none leads there it waits for one; a route that fails, or a member that
+/// refuses, is retried when the routes change, or with backoff.
+async fn follow(fingerprint: Fingerprint, identity: Identity, own: Fingerprint, links: Links, events: UnboundedSender<Event>) {
+    let send = |update| events.send(Event::Peer(fingerprint.clone(), update)).is_ok();
+    let mut changes = links.changes();
+    let mut delay = RETRY_FIRST;
+    loop {
+        changes.borrow_and_update();
+        let Some(route) = links.route(&fingerprint) else {
+            if !send(PeerUpdate::NoRoute) || changes.changed().await.is_err() {
+                return;
+            }
+            continue;
+        };
+        if !send(PeerUpdate::Connecting) {
+            return;
+        }
+        let session = Session { caller: own.clone(), pinned_host: fingerprint.clone(), via: route.via.clone() };
+        let attempt = async {
+            let dial: Arc<dyn Dial> = Arc::new(links.clone());
+            let adapter = SshTender::with_dial(dial, fingerprint.clone(), vec![identity.clone()]).map_err(|error| error.to_string())?;
+            let watch = adapter.subscribe(&session).await.map_err(|error| format!("{error:?}"))?;
+            Ok::<_, String>((adapter, watch))
+        }
+        .await;
+        match attempt {
+            Ok((adapter, mut watch)) => {
+                let connected = Instant::now();
+                if !send(PeerUpdate::Connected(adapter, route)) {
                     return;
                 }
                 while let Some(snapshot) = watch.recv().await {
@@ -530,9 +633,6 @@ async fn follow(fingerprint: Fingerprint, route: PeerRoute, identity: Identity, 
                 if !send(PeerUpdate::Lost("the route closed".into())) {
                     return;
                 }
-                // Only a route that stayed up earns a quick retry; one that
-                // drops as soon as it opens backs off like a failure, so a
-                // route that keeps flapping is retried at the longest delay.
                 delay = if connected.elapsed() >= ROUTE_SETTLED { RETRY_FIRST } else { (delay * 2).min(RETRY_LONGEST) };
             }
             Err(reason) => {
@@ -542,7 +642,10 @@ async fn follow(fingerprint: Fingerprint, route: PeerRoute, identity: Identity, 
                 delay = (delay * 2).min(RETRY_LONGEST);
             }
         }
-        sleep(delay).await;
+        select! {
+            changed = changes.changed() => if changed.is_err() { return },
+            () = sleep(delay) => {}
+        }
     }
 }
 
@@ -585,7 +688,9 @@ mod tests {
         let policy = MemoryTender::new(identity.fingerprint());
         let (local, own) = unbounded_channel();
         let grace = Duration::from_secs(60);
-        let bindings = Bindings::start(runtime.path(), identity, policy, Endpoints::default(), own, grace).expect("bindings");
+        let server = crate::ssh::Server::in_process(identity.clone(), policy.clone()).expect("server");
+        let bindings =
+            Bindings::start(runtime.path(), identity, policy, server.links().clone(), Endpoints::default(), own, grace).expect("bindings");
         local.send(vec![publication(Availability::Available)]).expect("binder follows");
         settled("the publication is bound", || bindings.bindings().len() == 1).await;
         local.send(vec![publication(Availability::Withdrawn)]).expect("binder follows");
