@@ -9,7 +9,10 @@ use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     fs::Permissions,
     os::unix::fs::PermissionsExt,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -275,6 +278,36 @@ async fn relay_rules_hold(transport: Transport) {
     assert!(outsider.links().routes().is_empty() && b.links().route(&outsider.fp()).is_none());
 }
 
+/// Dials through `inner` once, for the link, and refuses every later dial,
+/// as a forward does once its far socket has gone.
+struct Once {
+    inner: Arc<dyn Dial>,
+    used: AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl Dial for Once {
+    async fn dial(&self, instance: &Fingerprint) -> std::io::Result<ByteStream> {
+        if self.used.swap(true, Ordering::SeqCst) {
+            return Err(std::io::ErrorKind::ConnectionRefused.into());
+        }
+        self.inner.dial(instance).await
+    }
+}
+
+// The end that accepted a link learns at once when the dialer cannot open
+// the stream it asked for: the open fails as Unavailable, not at its deadline.
+async fn a_failed_reverse_open_is_refused(transport: Transport) {
+    let net = Net::new(transport);
+    let (a, b) = (net.instance("a"), net.instance("b"));
+    befriend(&[&a, &b]);
+    let dial: Arc<dyn Dial> = Arc::new(Once { inner: b.dial.clone(), used: AtomicBool::new(false) });
+    let _link = a.links().connect(dial, &b.fp()).await.expect("link");
+    route_is(b.links(), &a, direct(&a)).await;
+    let (client, session) = b.client(&a);
+    assert_eq!(client.browse(&session).await.err(), Some(Error::Unavailable));
+}
+
 macro_rules! contract {
     ($name:ident) => {
         mod $name {
@@ -294,6 +327,7 @@ contract!(a_link_is_symmetric);
 contract!(routes_reach_through_a_hub);
 contract!(fallbacks_take_over);
 contract!(relay_rules_hold);
+contract!(a_failed_reverse_open_is_refused);
 
 /// Hops from `from` to every instance it reaches over `edges`.
 fn distances(count: usize, edges: &BTreeSet<(usize, usize)>, from: usize) -> BTreeMap<usize, usize> {

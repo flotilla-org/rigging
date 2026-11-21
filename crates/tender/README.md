@@ -300,12 +300,14 @@ over Unix sockets.
   The dialer opens a stream as it opened the link; the end that accepted sends
   `Open(token)` on the link, and the dialer opens a fresh stream to it,
   authenticates, and hands it over as `Request::Adopt(token)`, then serves it
-  as its own listener's. Every stream still authenticates end to end and keeps
+  as its own listener's; one it cannot open it answers with `Refused(token)`,
+  so the open fails at once. Every stream still authenticates end to end and keeps
   its own channel and flow control. A stream opened over a link ends when the
   link closes, as an SSH session's channels end with it.
 - **Routes are learned from live links.** Each end sends the other, on the
   link, its whole table of the instances it reaches and the path to each
-  (`Routes`); a new table replaces the last, so leaving one out withdraws it,
+  (`Routes`; only the latest is written to a slow peer); a new table
+  replaces the last, so leaving one out withdraws it,
   and a link that closes withdraws everything learned over it. A path that
   passes back through the receiver, or would run past eight hops, is not a
   route; a malformed table closes the link. For each instance the primary
@@ -318,7 +320,7 @@ over Unix sockets.
   relay needs the caller to hold connect authority, and the host accepts only
   a relay it trusts (`trust_intermediary`, `set_intermediaries`).
 - A `Routes` table is one control frame, so it is bounded at 64 KiB: some
-  hundreds of instances.
+  hundreds of instances. A table past that closes the link, logged as a warning.
 
 ## Hosting clocks and storage
 

@@ -28,7 +28,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf, ReadHalf, WriteHalf, split},
-    spawn,
+    select, spawn,
     sync::{mpsc, oneshot, watch},
     task::AbortHandle,
     time::timeout,
@@ -61,6 +61,9 @@ pub(crate) enum Frame {
     /// From the end that accepted the link: open a stream to me, and hand it
     /// over as `Adopt` with this token.
     Open(u64),
+    /// From the dialer: the stream asked for with this token could not be
+    /// opened, so the end that asked fails now rather than at its deadline.
+    Refused(u64),
 }
 
 /// This instance's live links and the routes learned over them. Clones share
@@ -80,6 +83,9 @@ struct Shared {
     serve: mpsc::UnboundedSender<ByteStream>,
 }
 
+/// Held only for bookkeeping: whatever runs under it, including an
+/// [`Entry`]'s drop, must not block or await. Frames go out through channels
+/// whose sends return at once.
 #[derive(Default)]
 struct Table {
     next_link: u64,
@@ -94,10 +100,13 @@ struct Entry {
     peer: Fingerprint,
     /// How this end opens streams to the peer: present when it dialed the link.
     dial: Option<Arc<dyn Dial>>,
-    frames: mpsc::UnboundedSender<Frame>,
+    /// The table to tell the peer. Only the latest is written, however many
+    /// changes a slow peer has not yet read.
+    advertised: watch::Sender<Option<Vec<Reach>>>,
+    /// `Open` and `Refused` frames, one per stream asked for.
+    requests: mpsc::UnboundedSender<Frame>,
     /// The peer's latest table: each instance it reaches, with its path.
     learned: BTreeMap<Fingerprint, Vec<Fingerprint>>,
-    advertised: Option<Vec<Reach>>,
     /// Streams asked of the dialer and not yet handed over.
     pending: BTreeMap<u64, oneshot::Sender<ByteStream>>,
     ended: watch::Sender<bool>,
@@ -222,18 +231,20 @@ impl Links {
     }
 
     fn register(&self, peer: Fingerprint, dial: Option<Arc<dyn Dial>>, stream: ByteStream) -> u64 {
-        let (frames, outgoing) = mpsc::unbounded_channel();
+        let (requests, asked) = mpsc::unbounded_channel();
+        let advertised = watch::channel(None).0;
+        let tables = advertised.subscribe();
         let (reader, writer) = split(stream);
         let mut table = self.shared.table.lock().expect("links lock");
         let id = table.next_link;
         table.next_link += 1;
         let weak = Arc::downgrade(&self.shared);
         let tasks = vec![
-            spawn(write_frames(writer, outgoing, weak.clone(), id)).abort_handle(),
+            spawn(write_frames(writer, tables, asked, weak.clone(), id)).abort_handle(),
             spawn(read_frames(reader, weak, id)).abort_handle(),
         ];
         let ended = watch::channel(false).0;
-        let entry = Entry { peer, dial, frames, learned: BTreeMap::new(), advertised: None, pending: BTreeMap::new(), ended, tasks };
+        let entry = Entry { peer, dial, advertised, requests, learned: BTreeMap::new(), pending: BTreeMap::new(), ended, tasks };
         table.links.insert(id, entry);
         self.changed(&mut table);
         id
@@ -272,14 +283,13 @@ impl Links {
     /// the link's dialer and hand it over, then serve it. Only the end that
     /// accepted a link may ask.
     fn reverse(&self, id: u64, token: u64) -> Result<(), ()> {
-        let (peer, dial, ended) = {
+        let (peer, dial, ended, requests) = {
             let table = self.shared.table.lock().expect("links lock");
             let Some(entry) = table.links.get(&id) else { return Ok(()) };
-            (entry.peer.clone(), entry.dial.clone().ok_or(())?, entry.ended.subscribe())
+            (entry.peer.clone(), entry.dial.clone().ok_or(())?, entry.ended.subscribe(), entry.requests.clone())
         };
         let identity = self.shared.identity.clone();
         let serve = self.shared.serve.clone();
-        // A failed open reaches the asking end as its own open deadline.
         spawn(async move {
             let opened = timeout(OPEN_TIMEOUT, async {
                 let mut stream = dial.dial(&peer).await.ok()?;
@@ -288,10 +298,27 @@ impl Links {
                 matches!(read_control(&mut stream).await, Ok(Response::Open)).then_some(stream)
             })
             .await;
-            if let Ok(Some(stream)) = opened {
-                let _ = serve.send(Tied::stream(stream, ended));
+            match opened {
+                Ok(Some(stream)) => {
+                    let _ = serve.send(Tied::stream(stream, ended));
+                }
+                _ => {
+                    let _ = requests.send(Frame::Refused(token));
+                }
             }
         });
+        Ok(())
+    }
+
+    /// The dialer could not open the stream asked for with `token`: fail its
+    /// wait now. Only the dialer may say so.
+    fn refused(&self, id: u64, token: u64) -> Result<(), ()> {
+        let mut table = self.shared.table.lock().expect("links lock");
+        let Some(entry) = table.links.get_mut(&id) else { return Ok(()) };
+        if entry.dial.is_some() {
+            return Err(());
+        }
+        entry.pending.remove(&token);
         Ok(())
     }
 
@@ -303,11 +330,13 @@ impl Links {
         table.routes = routes;
         for entry in table.links.values_mut() {
             let reaches = advertised(&table.routes, &entry.peer);
-            if entry.advertised.as_ref() != Some(&reaches) {
-                // A closed writer means the link is closing; its reader removes it.
-                let _ = entry.frames.send(Frame::Routes(reaches.clone()));
-                entry.advertised = Some(reaches);
-            }
+            entry.advertised.send_if_modified(|current| {
+                let changed = current.as_ref() != Some(&reaches);
+                if changed {
+                    *current = Some(reaches);
+                }
+                changed
+            });
         }
         if changed {
             self.shared.changes.send_replace(());
@@ -353,10 +382,33 @@ fn advertised(routes: &BTreeMap<Fingerprint, Vec<Vec<Fingerprint>>>, peer: &Fing
         .collect()
 }
 
-async fn write_frames(mut writer: WriteHalf<ByteStream>, mut outgoing: mpsc::UnboundedReceiver<Frame>, links: Weak<Shared>, id: u64) {
-    while let Some(frame) = outgoing.recv().await {
+async fn write_frames(
+    mut writer: WriteHalf<ByteStream>,
+    mut tables: watch::Receiver<Option<Vec<Reach>>>,
+    mut requests: mpsc::UnboundedReceiver<Frame>,
+    links: Weak<Shared>,
+    id: u64,
+) {
+    loop {
+        let frame = select! {
+            changed = tables.changed() => {
+                if changed.is_err() { break }
+                let Some(reaches) = tables.borrow_and_update().clone() else { continue };
+                Frame::Routes(reaches)
+            }
+            request = requests.recv() => {
+                let Some(request) = request else { break };
+                request
+            }
+        };
         if let Err(error) = write_control(&mut writer, &frame).await {
-            tracing::debug!(%error, "link closed while writing");
+            // A frame over the control bound, such as a table of too many
+            // instances, closes the link: say so where it can be seen.
+            if error.kind() == io::ErrorKind::Other {
+                tracing::warn!(%error, "link closed: a frame could not be written");
+            } else {
+                tracing::debug!(%error, "link closed while writing");
+            }
             break;
         }
     }
@@ -373,6 +425,7 @@ async fn read_frames(mut reader: ReadHalf<ByteStream>, links: Weak<Shared>, id: 
         let handled = match frame {
             Frame::Routes(reaches) => links.learn(id, reaches),
             Frame::Open(token) => links.reverse(id, token),
+            Frame::Refused(token) => links.refused(id, token),
         };
         if handled.is_err() {
             tracing::debug!("link closed on a frame its peer may not send");
@@ -410,7 +463,7 @@ impl Dial for Links {
                     let (sender, handed) = oneshot::channel();
                     entry.pending.retain(|_, waiting| !waiting.is_closed());
                     entry.pending.insert(token, sender);
-                    entry.frames.send(Frame::Open(token)).map_err(|_| io::Error::from(io::ErrorKind::ConnectionAborted))?;
+                    entry.requests.send(Frame::Open(token)).map_err(|_| io::Error::from(io::ErrorKind::ConnectionAborted))?;
                     Ok((handed, entry.ended.subscribe()))
                 }
             }
