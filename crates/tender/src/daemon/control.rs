@@ -87,6 +87,7 @@ async fn diagnostics(State(inner): Daemon, encoding: Encoding) -> Response {
             trusted: inner.trusted_count().await,
             bindings: inner.bindings().len(),
             peers: inner.peers(),
+            routes: inner.routes(),
         })
         .into_response()
 }

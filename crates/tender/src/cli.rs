@@ -83,7 +83,8 @@ struct Publish {
 #[derive(Subcommand)]
 enum Trust {
     List,
-    /// Trust an instance's public key, and follow it if a route is given.
+    /// Trust an instance's public key, and hold a link to it if a route is given;
+    /// it is followed over whatever route reaches it.
     Add {
         key: String,
         #[arg(long, default_value = "")]
@@ -98,9 +99,10 @@ enum Trust {
         fingerprint: String,
     },
     /// Pair with the instance at an SSH destination: each trusts the other's
-    /// key and follows the other over SSH. The far instance's fingerprint is
-    /// shown and must be confirmed, or match --expect-fingerprint, before
-    /// either side trusts anything.
+    /// key, and this one holds a link to the other over SSH, which both
+    /// follow over. The far instance's fingerprint is shown and must be
+    /// confirmed, or match --expect-fingerprint, before either side trusts
+    /// anything.
     Pair {
         destination: String,
         /// What this instance calls the other one. Default: the destination.
@@ -109,8 +111,8 @@ enum Trust {
         /// What the other one calls this instance. Default: this host's name.
         #[arg(long)]
         as_name: Option<String>,
-        /// The SSH destination the other one reaches this instance at.
-        /// Default: this host's name.
+        /// An SSH destination the other one dials this instance at too.
+        /// Default: none, so it reaches this one over the link this one holds.
         #[arg(long = "return")]
         return_destination: Option<String>,
         /// Pair without asking, if the far instance has this fingerprint.
@@ -120,8 +122,8 @@ enum Trust {
         #[arg(long, default_value = "tender")]
         remote_tender: String,
     },
-    /// The far side of `pair`: trust the key, following it at the given
-    /// route, or at the route it already has; print this instance as JSON.
+    /// The far side of `pair`: trust the key, dialing it at the given route,
+    /// or at the route it already has, if any; print this instance as JSON.
     Accept {
         key: String,
         #[arg(long, default_value = "")]
@@ -214,6 +216,16 @@ pub async fn main() -> Result<(), String> {
                     ),
                 ];
                 lines.extend(diagnostics.peers.iter().map(|peer| format!("peer {} {}: {:?}", peer.fingerprint.0, peer.name, peer.state)));
+                lines.extend(diagnostics.routes.iter().map(|route| {
+                    let fallbacks: Vec<_> = route.fallbacks.iter().map(|hop| hop.0.as_str()).collect();
+                    format!(
+                        "route {} via {} ({} hops), fallbacks [{}]",
+                        route.instance.0,
+                        route.next_hop.0,
+                        route.hops,
+                        fallbacks.join(", ")
+                    )
+                }));
                 lines.join("\n")
             })
         }
@@ -267,13 +279,11 @@ async fn trust(control: &Control, json: bool, trust: Trust) -> Result<(), String
                 .ok_or_else(|| format!("{destination} presented a fingerprint that is not its key's"))?;
             confirm(&destination, &fingerprint, expect_fingerprint.as_deref())?;
             // SSH carries the exchange; each side's trust is the other's key.
-            let accept = format!(
-                "{remote_tender} trust accept {} --name {} --socket {} --ssh {}",
-                quote(&own.key.0),
-                quote(&as_name.unwrap_or_else(hostname)),
-                quote(&own.peer_socket.to_string_lossy()),
-                quote(&return_destination.unwrap_or_else(hostname)),
-            );
+            let mut accept =
+                format!("{remote_tender} trust accept {} --name {}", quote(&own.key.0), quote(&as_name.unwrap_or_else(hostname)));
+            if let Some(back) = return_destination {
+                accept.push_str(&format!(" --socket {} --ssh {}", quote(&own.peer_socket.to_string_lossy()), quote(&back)));
+            }
             // This side first, so a failure on either leaves neither changed:
             // a far refusal undoes this side's new trust.
             let members: Vec<TrustedMember> = control.get(api::TRUSTED).await?;

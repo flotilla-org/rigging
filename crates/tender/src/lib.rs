@@ -24,6 +24,8 @@ use tokio::sync::mpsc;
 pub mod cli;
 #[cfg(unix)]
 pub mod daemon;
+#[cfg(unix)]
+pub mod links;
 pub mod memory;
 pub mod runtime;
 #[cfg(unix)]
@@ -86,9 +88,10 @@ pub trait Dial: Send + Sync {
     async fn dial(&self, instance: &Fingerprint) -> io::Result<ByteStream>;
 }
 
-/// Routes supplied by the hosting application, which owns its links. The next
-/// hop toward `host` is either `host` itself or a relay that forwards onward
-/// under its own identity. Tender never stores or learns routes.
+/// Routes for relaying. The next hop toward `host` is either `host` itself or
+/// a relay that forwards onward under its own identity. A server relays along
+/// the routes its links learn (`links::Links`) unless the hosting application
+/// supplies its own. Routes are never stored.
 pub trait Router: Dial {
     fn next_hop(&self, host: &Fingerprint) -> Option<Fingerprint>;
 }

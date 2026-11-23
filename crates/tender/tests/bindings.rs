@@ -200,10 +200,11 @@ async fn binding_moves_between_instances_publishing_one_identity() {
 }
 
 // Pairing exchanges keys over a working SSH destination once the far
-// instance's fingerprint is confirmed: each side trusts the other's key and
-// follows the other through an SSH forward to its peer socket. A wrapper on
-// PATH stands in for the operator's ssh_config, pointing the destination at a
-// loopback sshd, which both sides use to reach each other.
+// instance's fingerprint is confirmed: each side trusts the other's key. Only
+// the near side can dial: it holds a link through an SSH forward to the far
+// peer socket, and each side follows the other over that one link, with no
+// route back. A wrapper on PATH stands in for the operator's ssh_config,
+// pointing the destination at a loopback sshd.
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn pairing_over_ssh_binds_through_a_forward() {
@@ -212,8 +213,7 @@ async fn pairing_over_ssh_binds_through_a_forward() {
     let far = Node::start_with("", alias.env.clone()).await;
     let near = Node::start_with("", alias.env.clone()).await;
     let remote = format!("env TENDER_ROOT={} {}", far.root.path().display(), env!("CARGO_BIN_EXE_tender"));
-    let pair =
-        ["trust", "pair", "tender-peer", "--name", "far", "--as-name", "near", "--return", "tender-peer", "--remote-tender", &remote];
+    let pair = ["trust", "pair", "tender-peer", "--name", "far", "--as-name", "near", "--remote-tender", &remote];
     let unconfirmed = near.run(&pair).await;
     assert!(!unconfirmed.status.success(), "no terminal and no expected fingerprint");
     assert!(String::from_utf8_lossy(&unconfirmed.stderr).contains(&far.instance.fingerprint.0), "the fingerprint is shown");
@@ -239,8 +239,7 @@ async fn pairing_over_ssh_binds_through_a_forward() {
         (far_members.len(), &far_members[0].fingerprint, far_members[0].instance.name.as_str()),
         (1, &near.instance.fingerprint, "near")
     );
-    let back = far_members[0].instance.route.clone().expect("a route back");
-    assert_eq!((back.ssh.as_deref(), back.socket.as_path()), (Some("tender-peer"), near.instance.peer_socket.as_path()));
+    assert_eq!(far_members[0].instance.route, None, "no route back");
     let near_members: Vec<api::TrustedMember> = near.control.get(api::TRUSTED).await.expect("near's group");
     let route = near_members[0].instance.route.clone().expect("route to far");
     assert_eq!((route.ssh.as_deref(), route.socket.as_path()), (Some("tender-peer"), far.instance.peer_socket.as_path()));
@@ -259,7 +258,7 @@ async fn pairing_over_ssh_binds_through_a_forward() {
     let _near_echo = echo(&near_service);
     near.cli(&["publish", "vessel/3", "http", "--label", "http", "--endpoint", near_service.to_str().expect("path")]).await;
     let back = PublicationId::new("vessel/3", "http");
-    eventually("far binds near's publication over SSH too", || async {
+    eventually("far binds near's publication over the link near dialed", || async {
         round_trip(&paths::binding_path(&far.runtime(), &back), b"the other way").await
     })
     .await;
@@ -280,6 +279,44 @@ async fn pairing_over_ssh_binds_through_a_forward() {
     })
     .await;
     assert!(round_trip(&path, b"after the outage").await);
+}
+
+// Instances with no link between them follow and connect to each other
+// through one both link to, which nothing configures as a hub: A and C each
+// trust B with a route, B trusts both with none, and A and C trust each
+// other with none. Untrusting C closes its link at B.
+#[tokio::test]
+async fn bindings_reach_through_an_instance_both_link_to() {
+    let (a, b, c) = (Node::start("").await, Node::start("").await, Node::start("").await);
+    for (node, other) in [(&a, &c), (&c, &a)] {
+        node.cli(&["trust", "add", &other.instance.key.0, "--name", "far"]).await;
+    }
+    for spoke in [&a, &c] {
+        b.cli(&["trust", "add", &spoke.instance.key.0, "--name", "spoke"]).await;
+        spoke.trust(&b).await;
+    }
+    let service = c.root.path().join("echo.sock");
+    let _echo = echo(&service);
+    let id = PublicationId::new("vessel/8", "echo");
+    c.cli(&["publish", "vessel/8", "echo", "--label", "echo", "--endpoint", service.to_str().expect("path")]).await;
+    let through_b = Route { instance: c.instance.fingerprint.clone(), via: Some(b.instance.fingerprint.clone()) };
+    eventually("A binds C's publication through B", || async {
+        a.binding(&id).await.is_some_and(|binding| binding.state == BindingState::Available { route: through_b.clone() })
+    })
+    .await;
+    assert!(round_trip(&binding_path(&a.runtime(), &id), b"through the hub").await);
+    let back = a.root.path().join("echo.sock");
+    let _back = echo(&back);
+    let reply = PublicationId::new("vessel/8", "reply");
+    a.cli(&["publish", "vessel/8", "reply", "--label", "echo", "--endpoint", back.to_str().expect("path")]).await;
+    eventually("C binds A's publication through B", || async { round_trip(&binding_path(&c.runtime(), &reply), b"back").await }).await;
+
+    b.cli(&["trust", "remove", &c.instance.fingerprint.0]).await;
+    eventually("A's route to C goes with C's link to B", || async {
+        let diagnostics: Diagnostics = a.control.get(api::DIAGNOSTICS).await.expect("diagnostics");
+        !diagnostics.routes.iter().any(|route| route.instance == c.instance.fingerprint)
+    })
+    .await;
 }
 
 // Accepting a key already trusted with a route keeps the route, so pairing

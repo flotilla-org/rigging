@@ -39,7 +39,9 @@ use crate::runtime::BootClock;
 use crate::runtime::ProcessClock;
 use crate::{
     Availability, ByteStream, Error, Fingerprint, Grant, Label, Lease, Publication, PublicationId, PublishRequest, Scope, Session, Tender,
-    api::{BindingEntry, Instance, PeerStatus, PublicationEntry, PublicationList, PublishEndpoint, TrustedInstance, TrustedMember},
+    api::{
+        BindingEntry, Instance, PeerStatus, PublicationEntry, PublicationList, PublishEndpoint, RouteStatus, TrustedInstance, TrustedMember,
+    },
     memory::MemoryTender,
     paths,
     runtime::Clock,
@@ -175,7 +177,15 @@ impl Daemon {
         let endpoints = Endpoints::default();
         let own = server.policy.watch(&session).await.map_err(io::Error::other)?;
         let grace = config.binding_grace_seconds.map_or(BINDING_GRACE, Duration::from_secs);
-        let bindings = Bindings::start(&paths.runtime, identity.clone(), server.policy.clone(), endpoints.clone(), own, grace)?;
+        let bindings = Bindings::start(
+            &paths.runtime,
+            identity.clone(),
+            server.policy.clone(),
+            server.links().clone(),
+            endpoints.clone(),
+            own,
+            grace,
+        )?;
         bindings.trust(state.trusted.clone());
         let mut epoch = [0; 16];
         OsRng.fill_bytes(&mut epoch);
@@ -250,12 +260,15 @@ fn clock() -> io::Result<Arc<dyn Clock>> {
     Ok(Arc::new(ProcessClock::default()))
 }
 
-/// Trusted Group members may browse and connect, and a request naming no
-/// audience reaches them and this instance itself, whose Bindings include its
-/// own publications. Configured grants admit their grantees for the same
-/// group; grants no longer configured are revoked.
+/// Trusted Group members may browse and connect, hold links here and relay
+/// callers to this instance, and a request naming no audience reaches them
+/// and this instance itself, whose Bindings include its own publications.
+/// Configured grants admit their grantees for the same group; grants no
+/// longer configured are revoked.
 fn apply_trust(policy: &MemoryTender, own: &Fingerprint, state: &State) -> Result<(), Error> {
-    let mut group: BTreeSet<Fingerprint> = state.trusted.iter().filter_map(|member| member.key.fingerprint()).collect();
+    let members: BTreeSet<Fingerprint> = state.trusted.iter().filter_map(|member| member.key.fingerprint()).collect();
+    policy.set_intermediaries(members.clone())?;
+    let mut group = members;
     group.insert(own.clone());
     policy.set_access(group.clone())?;
     policy.set_trusted_group(group.clone())?;
@@ -278,8 +291,14 @@ fn apply_trust(policy: &MemoryTender, own: &Fingerprint, state: &State) -> Resul
 impl Inner {
     fn apply_trust(&self, state: &State) -> Result<(), Error> {
         apply_trust(self.policy(), self.fingerprint(), state)?;
+        let members: BTreeSet<_> = state.trusted.iter().filter_map(|member| member.key.fingerprint()).collect();
+        self.server.links().retain(|peer| members.contains(peer));
         self.bindings.trust(state.trusted.clone());
         Ok(())
+    }
+
+    pub(crate) fn routes(&self) -> Vec<RouteStatus> {
+        self.server.links().routes()
     }
 
     pub(crate) fn bindings(&self) -> Vec<BindingEntry> {

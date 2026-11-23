@@ -66,8 +66,8 @@ a cron job or a `sudo -u` shell finds the same daemon. All three are created
   `ssh::Server::open`. The key is the instance's identity for as long as the
   state directory lasts.
 - **`runtime/peer`:** the Tender protocol socket other instances reach, over
-  SSH or on this machine. Trusted Group members may browse and connect;
-  anyone else is refused.
+  SSH or on this machine. Trusted Group members may browse and connect, hold
+  links, and relay callers to this instance; anyone else is refused.
 - **`runtime/control`:** the control API, HTTP over the Local Endpoint
   (`rigging-http-serve`), with JSON or CBOR bodies (`rigging-http-wire`). Its
   paths and bodies are in `api` (`tender_types::api`):
@@ -123,8 +123,8 @@ scope = "vessel/7"
 
 ### Eager Bindings
 
-The daemon follows the publication list of every Trusted Group member that
-has a `route`, and keeps a Binding for every publication that admits this
+The daemon follows the publication list of every Trusted Group member it
+has a route to, and keeps a Binding for every publication that admits this
 instance, its own included, for as long as the publication exists. Nothing
 asks for a Binding, and binding never starts anything on either side.
 
@@ -143,11 +143,18 @@ asks for a Binding, and binding never starts anything on either side.
   publisher as it arrives. While the publication is unavailable, withdrawn or
   revoked, connections are closed at once with no bytes; nothing is injected
   into the application's stream.
-- **Routes.** A member with `route.socket` alone is reached on this machine;
-  with `route.ssh` the daemon holds an SSH forward (`rigging-ssh`, the
-  operator's ssh_config) to that socket on the member's machine. A lost route
-  is restored with backoff, through a fresh forward, and meanwhile its
-  Bindings report `RouteUnavailable`.
+- **Links and routes.** A member's configured `route` is what this instance
+  dials: with `route.socket` alone it is on this machine; with `route.ssh` the
+  daemon holds an SSH forward (`rigging-ssh`, the operator's ssh_config) to
+  that socket on the member's machine. Either way the daemon holds a link
+  there (see [Links and routes](#links-and-routes)), restored with backoff
+  through a fresh forward. A member is followed over whatever route the
+  links have learned to it: a link either end dialed, or a next hop that
+  relays, so a member with no configured route, such as a laptop that only
+  dials out, is followed over its own link. While no route leads to a member
+  it shows `no_route` (or why its configured link fails), and its Bindings
+  report `RouteUnavailable`. `GET /v1/diagnostics` lists each learned route
+  as a `RouteStatus`: next hop, hops and fallbacks.
 - **Which carrier.** One identity may be published by several instances, as
   when a vessel moves host; each viewer chooses for itself. A Binding takes
   this instance's own copy while it is live, else keeps its current carrier
@@ -182,11 +189,11 @@ tender trust pair <ssh-destination> [--return DEST] [--expect-fingerprint FP] [-
 so each trusts the other's key and follows the other. It first asks the far
 side for its identity and shows its fingerprint, which a person confirms at
 the prompt or a script names with `--expect-fingerprint`; nothing is trusted
-on either side before that. It then runs `tender trust accept <own key>
---socket <own peer socket> --ssh <return>` there, the return destination
-being how the far side reaches this one (`--return`, default this host's
-name), and trusts the far key, following it at the destination it paired
-with. SSH carries the exchange; each side's trust is the other's key.
+on either side before that. It then runs `tender trust accept <own key>`
+there and trusts the far key, dialing it at the destination it paired with.
+The destination need only be reachable one way: both follow each other over
+the link this side holds. `--return DEST` also gives the far side a route
+to dial back. SSH carries the exchange; each side's trust is the other's key.
 
 Cleat needs no layout from Tender: `cleat attach --socket "$(tender path vessel/<id> cleat/default)"`.
 
@@ -254,10 +261,11 @@ not withdraw a healthy host-side publication.
 A session naming a relay in `Session::via` dials that relay, pins it with the
 caller's own handshake, and asks it to carry the stream to the pinned host.
 The relay admits callers holding connect authority in its own policy, then
-authenticates to the next instance as itself. `Server::route_relays` supplies
-the hosting application's `Router`, which names each next hop and dials it;
-Tender never stores or learns routes. A single-path `UnixDial` cannot reach a
-distinct relay, so relayed sessions need a dialer that resolves instances.
+authenticates to the next instance as itself. A server relays along the routes
+its links learn; `Server::route_relays` may supply the hosting application's
+own `Router` instead, which names each next hop and dials it. Routes are never
+stored. A single-path `UnixDial` cannot reach a distinct relay, so relayed
+sessions need a dialer that resolves instances, such as `links::Links`.
 
 The host accepts only a relay it trusts (`trust_intermediary`), records it as
 the session's `via` from the relay's own handshake, and then authenticates the
@@ -276,6 +284,43 @@ through its connect-only `packets --socket` and `attach --socket` clients
 ([flotilla-org/cleat#303](https://github.com/flotilla-org/cleat/pull/303)). Its
 other commands select a daemon by runtime layout and may start one, so they
 cannot target an arbitrary socket. `ci/tender/README.md` describes the real-SSH proof.
+
+## Links and routes
+
+`links::Links` (`Server::links`) holds an instance's links and the routes
+learned over them, as flotilla's peer layer does with its peer connections and
+`RouteState`. The contract suite in `tests/link_contracts.rs` states each rule
+over the in-memory transport (`Server::in_process` and `Server::dialer`) and
+over Unix sockets.
+
+- **A link is symmetric.** `Links::connect` dials an instance, which admits
+  only a caller it lets connect, and holds the stream as the link's control
+  stream (`Request::Link`); a link never runs through a relay. Once up, either
+  end opens streams to the other over it, whoever dialed: `Links` is a `Dial`.
+  The dialer opens a stream as it opened the link; the end that accepted sends
+  `Open(token)` on the link, and the dialer opens a fresh stream to it,
+  authenticates, and hands it over as `Request::Adopt(token)`, then serves it
+  as its own listener's; one it cannot open it answers with `Refused(token)`,
+  so the open fails at once. Every stream still authenticates end to end and keeps
+  its own channel and flow control. A stream opened over a link ends when the
+  link closes, as an SSH session's channels end with it.
+- **Routes are learned from live links.** Each end sends the other, on the
+  link, its whole table of the instances it reaches and the path to each
+  (`Routes`; only the latest is written to a slow peer); a new table
+  replaces the last, so leaving one out withdraws it,
+  and a link that closes withdraws everything learned over it. A path that
+  passes back through the receiver, or would run past eight hops, is not a
+  route; a malformed table closes the link. For each instance the primary
+  route is the shortest path, ties keeping the current next hop; every other
+  next hop is a fallback, and takes over when the primary's link goes. Each
+  peer is told the best path that does not pass through it. An instance with
+  no route is unavailable: nothing is guessed or configured.
+- **Following and connecting** use `Links::route`: a direct link, or the
+  primary next hop as `Session::via`. Relay authentication is unchanged: the
+  relay needs the caller to hold connect authority, and the host accepts only
+  a relay it trusts (`trust_intermediary`, `set_intermediaries`).
+- A `Routes` table is one control frame, so it is bounded at 64 KiB: some
+  hundreds of instances. A table past that closes the link, logged as a warning.
 
 ## Hosting clocks and storage
 

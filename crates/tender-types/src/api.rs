@@ -118,6 +118,18 @@ pub struct PeerStatus {
     pub state: PeerState,
 }
 
+/// How this instance reaches another, learned from live links: the next hop
+/// of the primary route, which is the instance itself over a direct link, how
+/// many hops that route takes, and the other next hops it could fall back to,
+/// best first.
+#[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
+pub struct RouteStatus {
+    pub instance: Fingerprint,
+    pub next_hop: Fingerprint,
+    pub hops: usize,
+    pub fallbacks: Vec<Fingerprint>,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
 pub struct Diagnostics {
     pub instance: Instance,
@@ -125,6 +137,8 @@ pub struct Diagnostics {
     pub trusted: usize,
     pub bindings: usize,
     pub peers: Vec<PeerStatus>,
+    #[serde(default)]
+    pub routes: Vec<RouteStatus>,
 }
 
 /// The `{"code", "message"}` shape of every error body.
