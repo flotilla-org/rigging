@@ -36,6 +36,9 @@ pub struct OpenSsh {
     forwards: Mutex<HashMap<PathBuf, Arc<OnceCell<PathBuf>>>>,
 }
 impl OpenSsh {
+    /// On Linux the master dies with the thread that calls this (see
+    /// `rigging_process::dies_with_parent`): connect from a runtime worker,
+    /// not a `spawn_blocking` or other short-lived thread.
     pub async fn connect(target: Target, timeout: Duration) -> io::Result<Self> {
         if timeout.is_zero() {
             return Err(invalid("SSH timeout must be nonzero"));
