@@ -36,6 +36,9 @@ pub struct OpenSsh {
     forwards: Mutex<HashMap<PathBuf, Arc<OnceCell<PathBuf>>>>,
 }
 impl OpenSsh {
+    /// On Linux the master dies with the thread that calls this (see
+    /// `rigging_process::dies_with_parent`): connect from a runtime worker,
+    /// not a `spawn_blocking` or other short-lived thread.
     pub async fn connect(target: Target, timeout: Duration) -> io::Result<Self> {
         if timeout.is_zero() {
             return Err(invalid("SSH timeout must be nonzero"));
@@ -97,7 +100,7 @@ impl OpenSsh {
                 host
             }
         };
-        let mut child = command
+        command
             .args([
                 "-T",
                 "-n",
@@ -126,8 +129,10 @@ impl OpenSsh {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()?;
+            .kill_on_drop(true);
+        #[cfg(target_os = "linux")]
+        rigging_process::dies_with_parent(&mut command);
+        let mut child = command.spawn()?;
         let stderr = StderrTail::drain(child.stderr.take().unwrap());
         let mut setup = SetupGuard { child: Some(child), dir: Some(dir), stderr: Some(stderr) };
         tokio::time::timeout(timeout, async {

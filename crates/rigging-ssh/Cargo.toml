@@ -12,6 +12,9 @@ tokio = { workspace = true }
 async-trait = { workspace = true }
 tempfile = { workspace = true }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+rigging-process = { path = "../rigging-process" }
+
 [dev-dependencies]
 hegeltest.workspace = true
 

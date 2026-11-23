@@ -204,7 +204,10 @@ pub trait CommandRunner: Send + Sync {
     /// Spawn a supervised command that is expected to outlive this call.
     ///
     /// Implementations should ensure dropping the returned handle terminates
-    /// the command so cancellation cannot orphan a child process.
+    /// the command so cancellation cannot orphan a child process. On Linux,
+    /// `ProcessRunner` also ends it when the calling thread dies (see
+    /// [`dies_with_parent`]): call from a runtime worker, not a blocking or
+    /// short-lived thread.
     async fn spawn_long_lived(
         &self,
         _cmd: &str,
@@ -336,6 +339,31 @@ pub trait CommandRunner: Send + Sync {
     /// inherited ACLs and warns that the requested mode is not enforced.
     async fn write_file_with_mode(&self, _path: &Path, _content: &str, _mode: u32) -> Result<(), String> {
         Err("command runner does not support protected file writes".to_string())
+    }
+}
+
+/// Has the kernel kill the child when its owner dies, even by SIGKILL, when
+/// no drop or cleanup can run. The signal follows the spawning thread, not the
+/// process: spawn from a thread that lives as long as the child should, such
+/// as a multi-thread runtime worker, never a `spawn_blocking` or other
+/// short-lived thread. Only this child is covered: processes it starts need
+/// their own.
+#[cfg(target_os = "linux")]
+pub fn dies_with_parent(command: &mut tokio::process::Command) {
+    let parent = std::process::id();
+    // SAFETY: prctl and getppid are async-signal-safe.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // The parent may have died before the signal was armed; no one
+            // is left to read this error.
+            if libc::getppid() as u32 != parent {
+                return Err(std::io::Error::other("parent exited before the child could be tied to it"));
+            }
+            Ok(())
+        });
     }
 }
 
@@ -713,15 +741,15 @@ impl<G: CommandGuard> CommandRunner for ProcessRunner<G> {
         cwd: &Path,
         _label: &ChannelLabel,
     ) -> Result<Box<dyn CommandProcess>, String> {
-        let child = self
-            .checked_command(cmd, args, cwd)
-            .await?
+        let mut command = self.checked_command(cmd, args, cwd).await?;
+        command
             .kill_on_drop(true)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .map_err(|error| error.to_string())?;
+            .stderr(std::process::Stdio::null());
+        #[cfg(target_os = "linux")]
+        dies_with_parent(&mut command);
+        let child = command.spawn().map_err(|error| error.to_string())?;
         Ok(Box::new(TokioCommandProcess { child }))
     }
 
