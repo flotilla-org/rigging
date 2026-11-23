@@ -339,6 +339,27 @@ pub trait CommandRunner: Send + Sync {
     }
 }
 
+/// Has the kernel kill the child when its owner dies, even by SIGKILL, when
+/// no drop or cleanup can run. The signal follows the spawning thread, not the
+/// process: spawn from a thread that lives as long as the child should.
+#[cfg(target_os = "linux")]
+pub fn dies_with_parent(command: &mut tokio::process::Command) {
+    let parent = std::process::id();
+    // SAFETY: prctl and getppid are async-signal-safe.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // The parent may have died before the signal was armed.
+            if libc::getppid() as u32 != parent {
+                return Err(std::io::Error::other("parent exited"));
+            }
+            Ok(())
+        });
+    }
+}
+
 pub fn command_timeout_message(cmd: &str, timeout: Duration) -> String {
     format!("{cmd} timed out after {timeout:?}")
 }
@@ -713,15 +734,15 @@ impl<G: CommandGuard> CommandRunner for ProcessRunner<G> {
         cwd: &Path,
         _label: &ChannelLabel,
     ) -> Result<Box<dyn CommandProcess>, String> {
-        let child = self
-            .checked_command(cmd, args, cwd)
-            .await?
+        let mut command = self.checked_command(cmd, args, cwd).await?;
+        command
             .kill_on_drop(true)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .map_err(|error| error.to_string())?;
+            .stderr(std::process::Stdio::null());
+        #[cfg(target_os = "linux")]
+        dies_with_parent(&mut command);
+        let child = command.spawn().map_err(|error| error.to_string())?;
         Ok(Box::new(TokioCommandProcess { child }))
     }
 

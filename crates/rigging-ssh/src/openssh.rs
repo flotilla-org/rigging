@@ -97,7 +97,7 @@ impl OpenSsh {
                 host
             }
         };
-        let mut child = command
+        command
             .args([
                 "-T",
                 "-n",
@@ -126,8 +126,10 @@ impl OpenSsh {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()?;
+            .kill_on_drop(true);
+        #[cfg(target_os = "linux")]
+        rigging_process::dies_with_parent(&mut command);
+        let mut child = command.spawn()?;
         let stderr = StderrTail::drain(child.stderr.take().unwrap());
         let mut setup = SetupGuard { child: Some(child), dir: Some(dir), stderr: Some(stderr) };
         tokio::time::timeout(timeout, async {

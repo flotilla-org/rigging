@@ -1658,6 +1658,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "hegeltest",
+ "rigging-process",
  "rigging-stream",
  "tempfile",
  "tokio",
