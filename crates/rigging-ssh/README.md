@@ -11,7 +11,7 @@ The Unix `OpenSsh` backend requires OpenSSH 8.7 or newer
 `ForkAfterAuthentication=no` so ambient configuration cannot daemonize the owned
 master, and `ControlPersist=no` so it cannot survive session ownership. On
 Linux the master also dies with its owning process, even one killed by SIGKILL;
-elsewhere a killed owner leaves the master running until its server drops it.
+elsewhere a killed owner leaves the master running.
 
 The backend is seeded from drydock-transport at
 `b076dbea24883af99356410c14cff40f44b9fd8a` (drydock#12). It retains its private
